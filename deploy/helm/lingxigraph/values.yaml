@@ -1,0 +1,53 @@
+replicaCount:
+  api: 2
+  worker: 3
+
+image:
+  repository: ghcr.io/lingxigraph/lingxigraph
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8124
+
+resources:
+  api:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  worker:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {cpu: "2", memory: 2Gi}
+
+autoscaling:
+  enabled: true
+  api:
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  worker:
+    minReplicas: 3
+    maxReplicas: 30
+    targetCPUUtilizationPercentage: 70
+
+config:
+  manifest: lingxigraph.json
+  oidcIssuer: ""
+  oidcAudience: ""
+  oidcJwksUrl: ""
+  tenantClaim: tenant_id
+  rolesClaim: roles
+  otelEndpoint: ""
+  redisUrl: redis://redis:6379/0
+
+secrets:
+  # Prefer existingSecret in production. It must contain postgres-url.
+  existingSecret: lingxigraph-runtime
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

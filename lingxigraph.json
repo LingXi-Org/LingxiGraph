@@ -1,0 +1,9 @@
+{
+  "$schema": "https://lingxigraph.dev/schemas/manifest-v1.json",
+  "graphs": {
+    "production-support": {
+      "path": "examples.production_graph:graph",
+      "version": "1.0.0"
+    }
+  }
+}

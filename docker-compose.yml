@@ -1,0 +1,81 @@
+name: lingxigraph
+
+x-runtime: &runtime
+  build:
+    context: .
+  restart: unless-stopped
+  environment: &environment
+    LINGXIGRAPH_POSTGRES_URL: postgresql://lingxigraph:lingxigraph@postgres:5432/lingxigraph
+    LINGXIGRAPH_REDIS_URL: redis://redis:6379/0
+    LINGXIGRAPH_INSECURE_DEV_AUTH: "true"
+    OTEL_SERVICE_NAME: lingxigraph
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lingxigraph
+      POSTGRES_USER: lingxigraph
+      POSTGRES_PASSWORD: lingxigraph
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lingxigraph -d lingxigraph"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-data:/data
+
+  migrate:
+    <<: *runtime
+    restart: "no"
+    command: ["migrate"]
+
+  api:
+    <<: *runtime
+    command: ["server", "--host", "0.0.0.0", "--port", "8124"]
+    ports:
+      - "8124:8124"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *runtime
+    command: ["worker"]
+    deploy:
+      replicas: 2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
