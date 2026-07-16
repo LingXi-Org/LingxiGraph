@@ -1,0 +1,108 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lingxigraph"
+version = "1.0.0"
+description = "Enterprise, provider-neutral durable graph runtime for multi-agent systems."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "LingXi Team" }]
+license = "MIT"
+dependencies = []
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+server = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.8,<3",
+  "PyJWT[crypto]>=2.9,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+postgres = ["alembic>=1.13,<2", "psycopg[binary]>=3.2,<4"]
+redis = ["redis>=5.1,<7"]
+otel = [
+  "opentelemetry-api>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+  "opentelemetry-sdk>=1.27,<2",
+]
+sdk = ["httpx>=0.27,<1"]
+all = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "alembic>=1.13,<2",
+  "opentelemetry-api>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+  "opentelemetry-sdk>=1.27,<2",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic>=2.8,<3",
+  "PyJWT[crypto]>=2.9,<3",
+  "redis>=5.1,<7",
+  "uvicorn[standard]>=0.30,<1",
+]
+dev = [
+  "build>=1.2,<2",
+  "coverage[toml]>=7.6,<8",
+  "cyclonedx-bom>=7,<8",
+  "hypothesis>=6.112,<7",
+  "mypy>=1.11,<2",
+  "pip-audit>=2.7,<3",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.6,<1",
+  "testcontainers[postgres,redis]>=4.8,<5",
+]
+
+[project.scripts]
+lingxigraph = "lingxigraph.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lingxigraph = ["server/migrations/*.sql", "py.typed"]
+
+[tool.unittest]
+start-directory = "tests"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 96
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "ASYNC"]
+ignore = ["E501", "E402", "B008", "ASYNC109", "ASYNC110"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["lingxigraph"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80

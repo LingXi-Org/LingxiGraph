@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - uses: astral-sh/setup-uv@v6
+      - run: uv lock --check
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - run: python -m pip install --no-deps -e .
+      - run: ruff check src tests
+      - run: mypy --ignore-missing-imports src/lingxigraph
+      - run: coverage run --branch -m unittest discover -s tests -v
+      - run: coverage report --fail-under=80
+      - run: python -m build
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: lingxigraph
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d lingxigraph"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LINGXIGRAPH_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/lingxigraph
+      LINGXIGRAPH_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - run: python -m pip install --no-deps -e .
+      - run: python -m unittest discover -s tests -p test_postgres_integration.py -v
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - run: python -m pip install --no-deps .
+      - run: pip-audit
+      - run: cyclonedx-py environment --output-format json --output-file sbom-python.cdx.json
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: lingxigraph:ci
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: lingxigraph:ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-python.cdx.json
