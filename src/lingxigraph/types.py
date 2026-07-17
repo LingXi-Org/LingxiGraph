@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,6 +12,7 @@ from typing import Any, Generic, TypeVar
 from .errors import GraphInterrupt
 
 T = TypeVar("T")
+StreamWriter = Callable[[Any], None]
 
 
 class CommandScope(str, Enum):
@@ -40,6 +41,7 @@ class RunStatus(str, Enum):
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    DEAD_LETTER = "dead_letter"
 
 
 class MultitaskStrategy(str, Enum):
@@ -234,6 +236,7 @@ __all__ = [
     "RunStatus",
     "Send",
     "StateSnapshot",
+    "StreamWriter",
     "SubgraphPersistence",
     "TaskSnapshot",
     "interrupt",

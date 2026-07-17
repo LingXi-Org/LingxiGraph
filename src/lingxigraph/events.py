@@ -30,6 +30,7 @@ class EventKind(str, Enum):
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
     RUN_TIMED_OUT = "run_timed_out"
+    RUN_BUDGET_EXCEEDED = "run_budget_exceeded"
 
 
 @dataclass(frozen=True, slots=True)

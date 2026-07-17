@@ -405,7 +405,7 @@ class RepositoryWorkerTests(unittest.TestCase):
         def cancelled(_state):
             raise GraphCancelledError("cancelled")
 
-        asyncio.run(execute(failed, RunStatus.FAILED, "dead_letter"))
+        asyncio.run(execute(failed, RunStatus.DEAD_LETTER, "dead_letter"))
         asyncio.run(execute(timed_out, RunStatus.TIMED_OUT, "run_timed_out"))
         asyncio.run(execute(cancelled, RunStatus.CANCELLED, "run_cancelled"))
 

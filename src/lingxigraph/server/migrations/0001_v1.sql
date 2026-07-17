@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS {{schema}}.runs (
     assistant_id TEXT NOT NULL,
     graph_id TEXT NOT NULL,
     graph_version TEXT NOT NULL,
+    idempotency_key TEXT,
+    request_digest TEXT,
     status TEXT NOT NULL CHECK (status IN (
         'pending','running','paused','succeeded','failed',
         'cancelling','cancelled','timed_out','dead_letter'
@@ -61,6 +63,16 @@ CREATE TABLE IF NOT EXISTS {{schema}}.runs (
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ
 );
+ALTER TABLE {{schema}}.runs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE {{schema}}.runs ADD COLUMN IF NOT EXISTS request_digest TEXT;
+ALTER TABLE {{schema}}.runs DROP CONSTRAINT IF EXISTS runs_status_check;
+ALTER TABLE {{schema}}.runs ADD CONSTRAINT runs_status_check CHECK (status IN (
+    'pending','running','paused','succeeded','failed',
+    'cancelling','cancelled','timed_out','dead_letter'
+));
+CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency
+    ON {{schema}}.runs (tenant_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS runs_queue ON {{schema}}.runs (status, created_at);
 CREATE INDEX IF NOT EXISTS runs_thread ON {{schema}}.runs (tenant_id, thread_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_thread

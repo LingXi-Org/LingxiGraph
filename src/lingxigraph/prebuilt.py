@@ -19,7 +19,7 @@ from .messages import (
 )
 from .models import ChatModel
 from .runtime import Runtime
-from .tools import ToolNode, ToolSpec, as_tool_spec, tools_condition
+from .tools import ToolNode, ToolSpec, as_tool_spec, tools_condition, validate_json_schema
 from .types import interrupt
 
 
@@ -38,6 +38,9 @@ def create_agent(
     pre_model_hook: Callable[..., Any] | None = None,
     post_model_hook: Callable[..., Any] | None = None,
     interrupt_on: Sequence[str] | Mapping[str, bool] | None = None,
+    structured_retries: int = 2,
+    tool_authorize: Callable[..., Any] | None = None,
+    secret_resolver: Callable[[str], Any] | None = None,
     name: str | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
@@ -48,12 +51,16 @@ def create_agent(
     approvals = set(interrupt_on or ())
     if isinstance(interrupt_on, Mapping):
         approvals = {key for key, enabled in interrupt_on.items() if enabled}
+    approvals.update(spec.name for spec in specs if spec.requires_approval)
+    if structured_retries < 0:
+        raise ValueError("structured_retries must be non-negative")
 
     async def call_model(state: Mapping[str, Any], runtime: Runtime[Any]) -> Mapping[str, Any]:
         messages = list(state.get("messages", ()))
         if system_prompt is not None:
             prompt = system_prompt if isinstance(system_prompt, SystemMessage) else SystemMessage(system_prompt)
             messages = [prompt, *messages]
+        runtime.consume_model_call()
         stream = getattr(model, "astream", None)
         if callable(stream):
             chunks = []
@@ -64,6 +71,7 @@ def create_agent(
         else:
             response = await model.agenerate(messages, tools=specs)
             runtime.emit_message(response, {"node": "agent"})
+        runtime.consume_model_usage(response.usage)
         if runtime.remaining_steps is not None and runtime.remaining_steps < 2 and response.tool_calls:
             response = AIMessage(
                 "Unable to complete tool calls within the remaining graph steps.",
@@ -121,24 +129,51 @@ def create_agent(
     if approvals:
         graph.add_node("approve_tools", approve_tools)
     if specs:
-        graph.add_node("tools", ToolNode(specs))
+        graph.add_node(
+            "tools",
+            ToolNode(specs, authorize=tool_authorize, secret_resolver=secret_resolver),
+        )
     if response_format is not None:
-        async def structured_response(state: Mapping[str, Any]) -> Mapping[str, Any]:
-            response = await model.agenerate(
-                list(state.get("messages", ())),
-                tools=None,
-                response_format=response_format,
-            )
-            value = response.content
-            if isinstance(value, str):
+        async def structured_response(
+            state: Mapping[str, Any], runtime: Runtime[Any]
+        ) -> Mapping[str, Any]:
+            messages = list(state.get("messages", ()))
+            error: Exception | None = None
+            for attempt in range(structured_retries + 1):
+                runtime.consume_model_call()
+                response = await model.agenerate(
+                    messages,
+                    tools=None,
+                    response_format=response_format,
+                )
+                runtime.consume_model_usage(response.usage)
+                value = response.content
                 try:
-                    value = json.loads(value)
-                except json.JSONDecodeError:
-                    pass
-            validate = getattr(response_format, "model_validate", None)
-            if callable(validate):
-                value = validate(value)
-            return {"structured_response": value}
+                    if isinstance(value, str):
+                        value = json.loads(value)
+                    validate = getattr(response_format, "model_validate", None)
+                    if callable(validate):
+                        value = validate(value)
+                    elif isinstance(response_format, Mapping):
+                        validate_json_schema(value, response_format, path="structured_response")
+                    return {"structured_response": value}
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    error = exc
+                    if attempt >= structured_retries:
+                        break
+                    messages = [
+                        *messages,
+                        response,
+                        SystemMessage(
+                            "The structured response was invalid. Return only data that satisfies "
+                            f"the requested schema. Validation error: {exc}"
+                        ),
+                    ]
+            assert error is not None
+            raise ValueError(
+                f"structured response remained invalid after {structured_retries + 1} attempt(s): "
+                f"{error}"
+            ) from error
 
         graph.add_node("structured_response", structured_response)
 

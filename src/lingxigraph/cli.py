@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = commands.add_parser("worker", help="run queue worker")
     worker.add_argument("--manifest", default="lingxigraph.json")
+    worker.add_argument("--health-host", default="0.0.0.0")
+    worker.add_argument("--health-port", type=int, default=8125)
+    worker.add_argument("--drain-timeout", type=float, default=60.0)
 
     commands.add_parser("migrate", help="create or upgrade PostgreSQL schema")
     commands.add_parser("doctor", help="validate runtime configuration")
@@ -50,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _server(args) -> int:
+    _configure_observability()
     try:
         import uvicorn
     except ImportError as exc:
@@ -97,6 +103,7 @@ def _server(args) -> int:
 
 
 async def _worker(args) -> int:
+    _configure_observability()
     from .checkpoint.postgres import PostgresSaver
     from .server import GraphRegistry, PostgresRepository, Worker
     from .store.postgres import PostgresStore
@@ -123,11 +130,46 @@ async def _worker(args) -> int:
         cache=cache,
         event_bus=bus,
     )
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, worker.stop)
+        except (NotImplementedError, RuntimeError):
+            pass
+    health_server = await asyncio.start_server(
+        lambda reader, writer: _worker_health(reader, writer, worker),
+        args.health_host,
+        args.health_port,
+    )
     try:
         await worker.run_forever()
     except (KeyboardInterrupt, asyncio.CancelledError):
         worker.stop()
+    finally:
+        drained = worker.drain(timeout=args.drain_timeout)
+        if inspect.isawaitable(drained):
+            await drained
+        health_server.close()
+        await health_server.wait_closed()
     return 0
+
+
+async def _worker_health(reader, writer, worker) -> None:
+    try:
+        first = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        path = first.decode("ascii", "ignore").split(" ")[1] if b" " in first else "/health"
+        healthy = worker.live if path == "/health" else worker.ready
+        status = "200 OK" if healthy else "503 Service Unavailable"
+        body = b'{"status":"ok"}' if healthy else b'{"status":"unavailable"}'
+        writer.write(
+            f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+            + body
+        )
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 async def _migrate() -> int:
@@ -178,6 +220,14 @@ def _required(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required")
     return value
+
+
+def _configure_observability() -> None:
+    from .observability import configure_logging, configure_telemetry
+
+    configure_logging()
+    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        configure_telemetry()
 
 
 if __name__ == "__main__":

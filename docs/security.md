@@ -53,3 +53,12 @@ password、api_key 和 cookie 字段。
 按 tenant 限制 active/queued runs、SSE、请求速率、state 大小和长期存储。超限返回稳定
 429 problem code。节点层同时设置超时、并发上限、递归限制和最大重试次数，避免图循环或
 故障下游放大资源消耗。
+
+工具按最小 capability 配置 `permissions`，并在 run config 中仅授予本次工作所需权限；高风险
+调用设置 `requires_approval=True`，需要资源级判断时使用 `tool_authorize`。凭据参数通过
+`secret_refs`/resolver 注入，模型生成的参数不能覆盖 secret。模型调用、工具调用、token 和
+成本预算应视为租户配额的第二道边界。
+
+API 对 `Idempotency-Key` 做 tenant 级唯一约束和请求摘要冲突检测，避免客户端重试重复创建
+run。provider adapter 在每次逻辑操作内复用下游幂等 key；业务副作用仍必须在最终服务端实现
+去重，因为 checkpoint 提交前崩溃采用至少一次交付。

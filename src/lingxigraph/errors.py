@@ -33,8 +33,16 @@ class PersistenceError(LingxiGraphError):
     """Raised when a durable write cannot be completed safely."""
 
 
+class BudgetExceededError(LingxiGraphError):
+    """Raised when a run exceeds a configured tool, token, or cost budget."""
+
+
 class ConcurrentRunError(LingxiGraphError):
     """Raised when a thread concurrency strategy rejects a new run."""
+
+
+class IdempotencyConflictError(LingxiGraphError):
+    """Raised when an idempotency key is reused with a different request."""
 
 
 class GraphInterrupt(BaseException):
@@ -47,6 +55,7 @@ class GraphInterrupt(BaseException):
 
 __all__ = [
     "ConcurrentRunError",
+    "BudgetExceededError",
     "EmptyInputError",
     "GraphCancelledError",
     "GraphInterrupt",
@@ -54,6 +63,7 @@ __all__ = [
     "GraphTimeoutError",
     "GraphValidationError",
     "InvalidUpdateError",
+    "IdempotencyConflictError",
     "LingxiGraphError",
     "PersistenceError",
 ]

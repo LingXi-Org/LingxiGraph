@@ -20,6 +20,7 @@ from ..channels import Channel, ReplaceValue, merge_updates
 from ..checkpoint import Checkpoint, Checkpointer, PendingWrite
 from ..constants import END, START
 from ..errors import (
+    BudgetExceededError,
     EmptyInputError,
     GraphCancelledError,
     GraphInterrupt,
@@ -27,15 +28,18 @@ from ..errors import (
     GraphTimeoutError,
     GraphValidationError,
     InvalidUpdateError,
+    PersistenceError,
 )
 from ..events import Event, EventKind
 from ..observability import start_span
 from ..runtime import (
     CancellationToken,
+    ExecutionBudget,
     Runtime,
     _reset_runtime_context,
     _RuntimeContext,
     _set_runtime_context,
+    get_runtime,
 )
 from ..schema import SchemaAdapter
 from ..serialization import JsonSerializer, Serializer
@@ -181,8 +185,10 @@ class CompiledStateGraph:
         self.state_schema = state_schema
         self.input_schema = input_schema or state_schema
         self.output_schema = output_schema or state_schema
-        state_keys = frozenset(SchemaAdapter(state_schema).fields)
-        output_keys = frozenset(SchemaAdapter(self.output_schema).fields)
+        self._state_adapter = SchemaAdapter(state_schema)
+        self._output_adapter = SchemaAdapter(self.output_schema)
+        state_keys = frozenset(self._state_adapter.fields)
+        output_keys = frozenset(self._output_adapter.fields)
         self._output_keys = None if output_keys == state_keys else output_keys
         self.context_schema = context_schema
         self.graph_name = str(graph_name or getattr(state_schema, "__name__", "graph"))
@@ -223,6 +229,7 @@ class CompiledStateGraph:
         }
         self._active_runs: dict[str, CancellationToken] = {}
         self._event_sequences: dict[str, int] = {}
+        self._run_budgets: dict[str, ExecutionBudget] = {}
         self.response_format: Mapping[str, Any] | type | None = None
 
     def _child_runtime(
@@ -294,7 +301,9 @@ class CompiledStateGraph:
         ):
             last = value
         if last is not None:
-            return last
+            if "__interrupt__" in last:
+                return last
+            return self._validate_output(last)
         if self.checkpointer is not None and config is not None:
             return dict((await self.aget_state(config)).values)
         return {}
@@ -386,7 +395,9 @@ class CompiledStateGraph:
                             }
                         yield ("values", value)
                 elif event.kind is EventKind.CUSTOM and "custom" in modes:
-                    yield ("custom", {event.data.get("channel", "custom"): event.data.get("value")})
+                    channel = event.data.get("channel", "custom")
+                    value = event.data.get("value")
+                    yield ("custom", value if channel == "custom" else {channel: value})
                 elif event.kind is EventKind.MESSAGE and "messages" in modes:
                     yield ("messages", event.data.get("value"))
             return
@@ -714,6 +725,23 @@ class CompiledStateGraph:
         cancellation = cancellation or CancellationToken()
         self._active_runs[run_id] = cancellation
         self._event_sequences[run_id] = 0
+        try:
+            parent_budget = get_runtime().budget
+        except RuntimeError:
+            parent_budget = None
+        limits = {**dict(config.get("configurable", {})), **config}
+        self._run_budgets[run_id] = parent_budget or ExecutionBudget(
+            max_tool_calls=(
+                int(limits["max_tool_calls"]) if limits.get("max_tool_calls") is not None else None
+            ),
+            max_model_calls=(
+                int(limits["max_model_calls"])
+                if limits.get("max_model_calls") is not None
+                else None
+            ),
+            max_tokens=(int(limits["max_tokens"]) if limits.get("max_tokens") is not None else None),
+            max_cost=(float(limits["max_cost"]) if limits.get("max_cost") is not None else None),
+        )
         node_semaphores = {
             name: asyncio.Semaphore(limit)
             for name, limit in self._concurrency_limits.items()
@@ -788,7 +816,11 @@ class CompiledStateGraph:
             if latest is None:
                 raise EmptyInputError("Command requires an existing checkpoint")
             if input.update:
-                state = merge_updates(state, [("__input__", input.update)], self.channels)
+                state = merge_updates(
+                    state,
+                    [("__input__", self._state_adapter.validate_partial(input.update))],
+                    self.channels,
+                )
             if input.goto is not None:
                 names, new_sends = self._split_targets(self._as_targets(input.goto))
                 active = self._normalize_targets(names)
@@ -869,7 +901,10 @@ class CompiledStateGraph:
                     step=step,
                     namespace=namespace,
                     thread_id=thread_id,
-                    data={"state": state},
+                    data={
+                        "state": self._validate_output(state),
+                        "budget": self._run_budgets[run_id].snapshot(),
+                    },
                 )
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
@@ -996,10 +1031,16 @@ class CompiledStateGraph:
                     _loop: asyncio.AbstractEventLoop = loop,
                     _queue: asyncio.Queue[tuple[str, Any, str]] = event_queue,
                 ) -> None:
-                    _loop.call_soon_threadsafe(
-                        _queue.put_nowait,
-                        (channel, copy.deepcopy(value), task_id),
-                    )
+                    if _loop.is_closed():
+                        return
+                    try:
+                        _loop.call_soon_threadsafe(
+                            _queue.put_nowait,
+                            (channel, copy.deepcopy(value), task_id),
+                        )
+                    except RuntimeError:
+                        if not _loop.is_closed():
+                            raise
 
                 persisted = {
                     write.task_id: write
@@ -1043,6 +1084,7 @@ class CompiledStateGraph:
                         )
                     )
                 gather = asyncio.gather(*futures, return_exceptions=True)
+                next_event: asyncio.Task[tuple[str, Any, str]] | None = None
                 try:
                     async with asyncio.timeout(self.step_timeout):
                         while not gather.done():
@@ -1056,8 +1098,11 @@ class CompiledStateGraph:
                                 channel, value, task_id_value = next_event.result()
                                 if channel == "__subgraph__" and subgraphs:
                                     yield value
-                                elif stream_mode == "custom" and channel != "__retry__":
-                                    yield {channel: value}
+                                elif stream_mode == "custom" and channel not in {
+                                    "__retry__",
+                                    "messages",
+                                }:
+                                    yield value if channel == "custom" else {channel: value}
                                 elif stream_mode == "messages" and channel == "messages":
                                     yield value
                                 elif stream_mode == "events":
@@ -1082,8 +1127,11 @@ class CompiledStateGraph:
                             channel, value, task_id_value = event_queue.get_nowait()
                             if channel == "__subgraph__" and subgraphs:
                                 yield value
-                            elif stream_mode == "custom" and channel != "__retry__":
-                                yield {channel: value}
+                            elif stream_mode == "custom" and channel not in {
+                                "__retry__",
+                                "messages",
+                            }:
+                                yield value if channel == "custom" else {channel: value}
                             elif stream_mode == "messages" and channel == "messages":
                                 yield value
                             elif stream_mode == "events":
@@ -1102,11 +1150,21 @@ class CompiledStateGraph:
                                     data={"channel": channel, "value": value},
                                 )
                 except TimeoutError as exc:
+                    cancellation.cancel()
                     for future in futures:
                         future.cancel()
+                    await asyncio.gather(*futures, return_exceptions=True)
                     raise GraphTimeoutError(
                         f"superstep {step} exceeded timeout={self.step_timeout}"
                     ) from exc
+                except BaseException:
+                    cancellation.cancel()
+                    if next_event is not None and not next_event.done():
+                        next_event.cancel()
+                    for future in futures:
+                        future.cancel()
+                    await asyncio.gather(*futures, return_exceptions=True)
+                    raise
                 for task, outcome in zip(pending_tasks, completed_outcomes, strict=True):
                     outcomes_by_id[task.id] = outcome
                 outcomes = [outcomes_by_id[task.id] for task in tasks]
@@ -1416,7 +1474,10 @@ class CompiledStateGraph:
                     namespace=namespace,
                     checkpoint_id=parent_checkpoint_id,
                     thread_id=thread_id,
-                    data={"state": state},
+                    data={
+                        "state": self._validate_output(state),
+                        "budget": self._run_budgets[run_id].snapshot(),
+                    },
                 )
         except GraphCancelledError:
             if stream_mode == "events":
@@ -1438,6 +1499,17 @@ class CompiledStateGraph:
                     thread_id=thread_id,
                 )
             raise
+        except BudgetExceededError as exc:
+            if stream_mode == "events":
+                yield self._event(
+                    EventKind.RUN_BUDGET_EXCEEDED,
+                    run_id,
+                    step=step,
+                    namespace=namespace,
+                    thread_id=thread_id,
+                    data={"error": str(exc)},
+                )
+            raise
         except Exception as exc:
             if stream_mode == "events":
                 yield self._event(
@@ -1454,6 +1526,7 @@ class CompiledStateGraph:
                 await checkpoint_writer.flush()
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
+            self._run_budgets.pop(run_id, None)
 
     def _plan_tasks(
         self,
@@ -1622,15 +1695,17 @@ class CompiledStateGraph:
         if result is None:
             return _TaskResult(task, {}, ())
         if isinstance(result, _CachedResult):
-            return _TaskResult(task, result.value, (), cached=True)
+            return _TaskResult(
+                task, self._state_adapter.validate_partial(result.value), (), cached=True
+            )
         if isinstance(result, Command):
             if result.scope is CommandScope.PARENT:
                 return _TaskResult(task, {}, (), parent_command=result)
-            update = result.update or {}
+            update = self._state_adapter.validate_partial(result.update or {})
             goto = self._as_targets(result.goto) if result.goto is not None else ()
             return _TaskResult(task, update, goto)
         if isinstance(result, Mapping):
-            return _TaskResult(task, result, ())
+            return _TaskResult(task, self._state_adapter.validate_partial(result), ())
         raise InvalidUpdateError(
             f"node {task.node!r} returned {type(result).__name__}; expected dict or Command"
         )
@@ -1676,6 +1751,12 @@ class CompiledStateGraph:
                     if inspect.isawaitable(value):
                         await value
             return result
+
+    def _validate_output(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(state)
+        if self._output_keys is not None:
+            value = {key: item for key, item in value.items() if key in self._output_keys}
+        return self._output_adapter.validate(value)
 
     async def _attempt(
         self,
@@ -1980,7 +2061,13 @@ class CompiledStateGraph:
             channel_versions=dict(channel_versions or {}),
             tasks=tasks,
         )
-        self.serializer.dumps(checkpoint)
+        encoded = self.serializer.dumps(checkpoint)
+        limits = {**dict(config.get("configurable", {})), **dict(config)}
+        max_state_bytes = limits.get("max_state_bytes")
+        if max_state_bytes is not None and len(encoded) > int(max_state_bytes):
+            raise PersistenceError(
+                f"checkpoint size {len(encoded)} exceeds max_state_bytes={max_state_bytes}"
+            )
         with start_span(
             "lingxigraph.checkpoint.put",
             {
@@ -2044,6 +2131,7 @@ class CompiledStateGraph:
             remaining_steps=remaining_steps,
             stream_mode=stream_mode,
             stream_subgraphs=stream_subgraphs,
+            budget=self._run_budgets.get(run_id),
             _emit=emit,
         )
 

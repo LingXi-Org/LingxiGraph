@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from ..errors import ConcurrentRunError
+from ..errors import ConcurrentRunError, IdempotencyConflictError
 from ..types import MultitaskStrategy, RunStatus
 from .models import (
     Assistant,
@@ -34,6 +34,7 @@ TERMINAL = {
     RunStatus.FAILED.value,
     RunStatus.CANCELLED.value,
     RunStatus.TIMED_OUT.value,
+    RunStatus.DEAD_LETTER.value,
 }
 
 
@@ -42,6 +43,10 @@ class RepositoryLimits:
     max_active_runs: int = 100
     max_queued_runs: int = 1000
     max_sse_connections: int = 200
+    max_requests_per_minute: int = 600
+    max_request_bytes: int = 1_048_576
+    max_state_bytes: int = 1_048_576
+    max_event_bytes: int = 262_144
 
 
 class InMemoryRepository:
@@ -73,6 +78,9 @@ class InMemoryRepository:
         async with self._lock:
             self._assistants[(tenant_id, assistant.id)] = assistant
         return assistant.model_copy(deep=True)
+
+    async def healthcheck(self) -> bool:
+        return True
 
     async def get_assistant(self, tenant_id: str, assistant_id: str) -> Assistant | None:
         async with self._lock:
@@ -155,8 +163,27 @@ class InMemoryRepository:
         thread_id: str | None,
         assistant: Assistant,
         request: RunCreate,
+        *,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
     ) -> Run:
         async with self._lock:
+            if idempotency_key is not None:
+                existing = next(
+                    (
+                        run
+                        for run in self._runs.values()
+                        if run.tenant_id == tenant_id
+                        and run.idempotency_key == idempotency_key
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing.request_digest != request_digest:
+                        raise IdempotencyConflictError(
+                            "idempotency key was already used for a different run request"
+                        )
+                    return existing.model_copy(deep=True)
             tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
             active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
             queued = [
@@ -187,6 +214,8 @@ class InMemoryRepository:
                 assistant_id=assistant.id,
                 graph_id=assistant.graph_id,
                 graph_version=assistant.graph_version,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
                 input=request.input,
                 context={**assistant.context, **request.context},
                 config={**assistant.config, **request.config},
@@ -198,6 +227,11 @@ class InMemoryRepository:
             )
             if request.run_timeout is not None:
                 run.config["run_timeout"] = request.run_timeout
+            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+                budget_value = getattr(request, budget_name)
+                if budget_value is not None:
+                    run.config[budget_name] = budget_value
             self._runs[(tenant_id, run.id)] = run
             self._events[(tenant_id, run.id)] = []
         await self._notify()
@@ -304,6 +338,48 @@ class InMemoryRepository:
                     "output": output,
                     "error": error,
                     "finished_at": utcnow(),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+            )
+            self._runs[key] = updated
+        await self._notify()
+        return updated.model_copy(deep=True)
+
+    async def retry_run(
+        self, tenant_id: str, run_id: str, *, error: dict[str, Any] | None = None
+    ) -> Run:
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs[key]
+            updated = run.model_copy(
+                update={
+                    "status": RunStatus.PENDING.value,
+                    "error": error,
+                    "finished_at": None,
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+            )
+            self._runs[key] = updated
+        await self._notify()
+        return updated.model_copy(deep=True)
+
+    async def redrive_run(self, tenant_id: str, run_id: str) -> Run | None:
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if run is None or enum_value(run.status) not in {
+                RunStatus.DEAD_LETTER.value,
+                RunStatus.FAILED.value,
+            }:
+                return None
+            updated = run.model_copy(
+                update={
+                    "status": RunStatus.PENDING.value,
+                    "attempt": 0,
+                    "error": None,
+                    "finished_at": None,
                     "lease_owner": None,
                     "lease_expires_at": None,
                 }
@@ -474,6 +550,17 @@ class PostgresRepository(InMemoryRepository):
 
     async def setup(self) -> None:
         await asyncio.to_thread(self._setup_sync)
+
+    async def healthcheck(self) -> bool:
+        try:
+            return await asyncio.to_thread(self._healthcheck_sync)
+        except Exception:
+            return False
+
+    def _healthcheck_sync(self) -> bool:
+        with self._connect() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            return cursor.fetchone() is not None
 
     def _setup_sync(self) -> None:
         from importlib.resources import files
@@ -650,14 +737,48 @@ class PostgresRepository(InMemoryRepository):
             )
             return cursor.rowcount > 0
 
-    async def create_run(self, tenant_id, thread_id, assistant, request):
+    async def create_run(
+        self,
+        tenant_id,
+        thread_id,
+        assistant,
+        request,
+        *,
+        idempotency_key=None,
+        request_digest=None,
+    ):
         return await asyncio.to_thread(
-            self._create_run_sync, tenant_id, thread_id, assistant, request
+            self._create_run_sync,
+            tenant_id,
+            thread_id,
+            assistant,
+            request,
+            idempotency_key,
+            request_digest,
         )
 
-    def _create_run_sync(self, tenant_id, thread_id, assistant, request):
+    def _create_run_sync(
+        self, tenant_id, thread_id, assistant, request, idempotency_key, request_digest
+    ):
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
+            if idempotency_key is not None:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{tenant_id}:{idempotency_key}",),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.runs
+                    WHERE tenant_id=%s AND idempotency_key=%s""",
+                    (tenant_id, idempotency_key),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing.get("request_digest") != request_digest:
+                        raise IdempotencyConflictError(
+                            "idempotency key was already used for a different run request"
+                        )
+                    return self._run_from_row(existing)
             cursor.execute(
                 f"""SELECT
                   COUNT(*) FILTER (WHERE status IN ('running','cancelling')) AS active,
@@ -692,6 +813,8 @@ class PostgresRepository(InMemoryRepository):
                 assistant_id=assistant.id,
                 graph_id=assistant.graph_id,
                 graph_version=assistant.graph_version,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
                 input=request.input,
                 context={**assistant.context, **request.context},
                 config={**assistant.config, **request.config},
@@ -703,12 +826,17 @@ class PostgresRepository(InMemoryRepository):
             )
             if request.run_timeout is not None:
                 run.config["run_timeout"] = request.run_timeout
+            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+                budget_value = getattr(request, budget_name)
+                if budget_value is not None:
+                    run.config[budget_name] = budget_value
             cursor.execute(
                 f"""INSERT INTO {self._schema}.runs
                 (id,tenant_id,thread_id,assistant_id,graph_id,graph_version,status,
-                 input,context,config,metadata,resume,update,goto_node,durability,
+                 idempotency_key,request_digest,input,context,config,metadata,resume,update,goto_node,durability,
                  attempt,created_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     run.id,
                     tenant_id,
@@ -717,6 +845,8 @@ class PostgresRepository(InMemoryRepository):
                     run.graph_id,
                     run.graph_version,
                     enum_value(run.status),
+                    run.idempotency_key,
+                    run.request_digest,
                     self._jsonb(run.input) if run.input is not None else None,
                     self._jsonb(run.context),
                     self._jsonb(run.config),
@@ -775,6 +905,29 @@ class PostgresRepository(InMemoryRepository):
         assert value is not None
         return value
 
+    async def retry_run(self, tenant_id, run_id, *, error=None):
+        await asyncio.to_thread(self._retry_run_sync, tenant_id, run_id, error, False)
+        value = await self.get_run(tenant_id, run_id)
+        assert value is not None
+        return value
+
+    async def redrive_run(self, tenant_id, run_id):
+        changed = await asyncio.to_thread(self._retry_run_sync, tenant_id, run_id, None, True)
+        return await self.get_run(tenant_id, run_id) if changed else None
+
+    def _retry_run_sync(self, tenant_id, run_id, error, reset_attempt):
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            allowed = "AND status IN ('failed','dead_letter')" if reset_attempt else ""
+            attempt = "attempt=0," if reset_attempt else ""
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status='pending', {attempt}
+                error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL
+                WHERE tenant_id=%s AND id=%s {allowed}""",
+                (self._jsonb(error) if error is not None else None, tenant_id, run_id),
+            )
+            return cursor.rowcount > 0
+
     def _finish_run_sync(self, tenant_id, run_id, status, output, error):
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
@@ -802,7 +955,7 @@ class PostgresRepository(InMemoryRepository):
                 status=CASE WHEN status='pending' THEN 'cancelled' ELSE 'cancelling' END,
                 finished_at=CASE WHEN status='pending' THEN NOW() ELSE finished_at END
                 WHERE tenant_id=%s AND id=%s
-                  AND status NOT IN ('succeeded','failed','cancelled','timed_out')""",
+                  AND status NOT IN ('succeeded','failed','cancelled','timed_out','dead_letter')""",
                 (tenant_id, run_id),
             )
             return cursor.rowcount > 0

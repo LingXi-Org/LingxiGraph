@@ -37,6 +37,7 @@ class GraphInfo(ApiModel):
 
 class AssistantCreate(ApiModel):
     graph_id: str
+    graph_version: str | None = None
     name: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
@@ -91,6 +92,10 @@ class RunCreate(ApiModel):
     durability: Durability = Durability.SYNC
     multitask_strategy: MultitaskStrategy = MultitaskStrategy.ENQUEUE
     run_timeout: float | None = None
+    max_model_calls: int | None = Field(default=None, gt=0)
+    max_tool_calls: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_cost: float | None = Field(default=None, gt=0)
 
 
 class Run(ApiModel):
@@ -100,6 +105,8 @@ class Run(ApiModel):
     assistant_id: str
     graph_id: str
     graph_version: str
+    idempotency_key: str | None = None
+    request_digest: str | None = Field(default=None, exclude=True)
     status: RunStatus = RunStatus.PENDING
     input: dict[str, Any] | None = None
     context: dict[str, Any] = Field(default_factory=dict)

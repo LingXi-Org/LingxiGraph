@@ -15,6 +15,7 @@ from .checkpoint import (
 )
 from .constants import END, START
 from .errors import (
+    BudgetExceededError,
     ConcurrentRunError,
     EmptyInputError,
     GraphCancelledError,
@@ -22,6 +23,7 @@ from .errors import (
     GraphRecursionError,
     GraphTimeoutError,
     GraphValidationError,
+    IdempotencyConflictError,
     InvalidUpdateError,
     LingxiGraphError,
     PersistenceError,
@@ -48,6 +50,7 @@ from .models import ChatModel, StreamingChatModel
 from .prebuilt import AgentState, create_agent, create_react_agent
 from .runtime import (
     CancellationToken,
+    ExecutionBudget,
     Runtime,
     get_config,
     get_runtime,
@@ -65,7 +68,7 @@ from .store import (
     PostgresStore,
     StoreOperation,
 )
-from .tools import ToolNode, ToolSpec, tool, tools_condition
+from .tools import ToolNode, ToolSpec, tool, tools_condition, validate_json_schema
 from .types import (
     CachePolicy,
     Command,
@@ -78,14 +81,15 @@ from .types import (
     RunStatus,
     Send,
     StateSnapshot,
+    StreamWriter,
     SubgraphPersistence,
     TaskSnapshot,
     interrupt,
 )
-
-__version__ = "2.0.0"
+from .version import __version__
 
 __all__ = [
+    "__version__",
     "AsyncCache",
     "AsyncCheckpointer",
     "AsyncPostgresSaver",
@@ -97,6 +101,7 @@ __all__ = [
     "AnyMessage",
     "BaseCache",
     "BaseStore",
+    "BudgetExceededError",
     "CachePolicy",
     "CancellationToken",
     "Checkpoint",
@@ -111,6 +116,7 @@ __all__ = [
     "Durability",
     "EdgeInfo",
     "Embedder",
+    "ExecutionBudget",
     "END",
     "EmptyInputError",
     "EphemeralValue",
@@ -123,6 +129,7 @@ __all__ = [
     "GraphValidationError",
     "GraphInfo",
     "HumanMessage",
+    "IdempotencyConflictError",
     "InMemoryCache",
     "InMemorySaver",
     "InMemoryStore",
@@ -151,6 +158,7 @@ __all__ = [
     "SqliteSaver",
     "StateGraph",
     "StateSnapshot",
+    "StreamWriter",
     "StreamingChatModel",
     "StoreOperation",
     "SubgraphPersistence",
@@ -174,5 +182,6 @@ __all__ = [
     "merge_chunks",
     "tool",
     "tools_condition",
+    "validate_json_schema",
     "task",
 ]

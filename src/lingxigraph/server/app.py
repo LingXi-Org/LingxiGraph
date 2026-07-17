@@ -1,9 +1,12 @@
-﻿"""FastAPI Agent Server with versioned REST and replayable SSE."""
+"""FastAPI Agent Server with versioned REST and replayable SSE."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,9 +20,10 @@ from fastapi.staticfiles import StaticFiles
 
 from ..cache import BaseCache
 from ..checkpoint import Checkpointer, InMemorySaver
-from ..errors import ConcurrentRunError, EmptyInputError
+from ..errors import ConcurrentRunError, EmptyInputError, IdempotencyConflictError
 from ..store import BaseStore, InMemoryStore, StoreOperation
 from ..types import RunStatus
+from ..version import __version__
 from .eventbus import EventBus, InMemoryEventBus
 from .models import (
     Assistant,
@@ -42,6 +46,8 @@ from .registry import GraphRegistry
 from .repository import TERMINAL, InMemoryRepository
 from .security import Authenticator, Principal
 from .worker import Worker
+
+logger = logging.getLogger("lingxigraph.server")
 
 
 def create_app(
@@ -90,7 +96,7 @@ def create_app(
 
     app = FastAPI(
         title="LingxiGraph Agent Server",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.registry = registry
@@ -102,17 +108,65 @@ def create_app(
     app.state.worker = worker
     app.state.sse_counts = {}
     app.state.sse_lock = asyncio.Lock()
+    app.state.rate_windows = {}
+    app.state.rate_lock = asyncio.Lock()
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
         request.state.request_id = request.headers.get("x-request-id") or str(uuid4())
+        length = request.headers.get("content-length")
+        try:
+            declared_length = int(length) if length is not None else None
+        except ValueError:
+            return _problem(request, 400, "invalid_request", "Content-Length must be an integer")
+        if declared_length is not None and declared_length < 0:
+            return _problem(request, 400, "invalid_request", "Content-Length must not be negative")
+        if declared_length is not None and declared_length > repository.limits.max_request_bytes:
+            return _problem(
+                request,
+                413,
+                "payload_too_large",
+                f"request exceeds {repository.limits.max_request_bytes} bytes",
+            )
+        chunks: list[bytes] = []
+        actual_length = 0
+        async for chunk in request.stream():
+            actual_length += len(chunk)
+            if actual_length > repository.limits.max_request_bytes:
+                return _problem(
+                    request,
+                    413,
+                    "payload_too_large",
+                    f"request exceeds {repository.limits.max_request_bytes} bytes",
+                )
+            chunks.append(chunk)
+        request._body = b"".join(chunks)
+        started = time.perf_counter()
         try:
             response = await call_next(request)
-        except Exception:
+        except Exception as exc:
+            logger.exception(
+                "request failed",
+                extra={
+                    "request_id": request.state.request_id,
+                    "tenant_id": getattr(request.state, "tenant_id", None),
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
             raise
         response.headers["x-request-id"] = request.state.request_id
         response.headers["x-content-type-options"] = "nosniff"
         response.headers["cache-control"] = "no-store"
+        logger.info(
+            "request completed",
+            extra={
+                "request_id": request.state.request_id,
+                "tenant_id": getattr(request.state, "tenant_id", None),
+                "status": response.status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            },
+        )
         return response
 
     @app.exception_handler(ConcurrentRunError)
@@ -125,6 +179,10 @@ def create_app(
             str(exc),
             retryable=True,
         )
+
+    @app.exception_handler(IdempotencyConflictError)
+    async def idempotency_error(request: Request, exc: IdempotencyConflictError):
+        return _problem(request, 409, "idempotency_conflict", str(exc))
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
@@ -160,12 +218,15 @@ def create_app(
         x_roles: str | None = Header(default=None),
     ) -> Principal:
         try:
-            return await request.app.state.authenticator.authenticate(
+            value = await request.app.state.authenticator.authenticate(
                 authorization,
                 api_key=x_api_key,
                 dev_tenant=x_tenant_id,
                 dev_roles=x_roles,
             )
+            request.state.tenant_id = value.tenant_id
+            await _consume_rate_limit(request.app, value.tenant_id)
+            return value
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
@@ -201,22 +262,25 @@ def create_app(
 
     @app.get("/v1/graphs/{graph_id}", response_model=GraphInfo)
     async def get_graph(
-        graph_id: str, _user: Principal = Depends(require("viewer", "developer"))
+        graph_id: str,
+        graph_version: str | None = None,
+        _user: Principal = Depends(require("viewer", "developer")),
     ):
         try:
-            return registry.info(graph_id)
+            return registry.info(graph_id, graph_version)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/v1/graphs/{graph_id}/structure")
     async def get_graph_structure(
         graph_id: str,
+        graph_version: str | None = None,
         xray: bool = False,
         _user: Principal = Depends(require("viewer", "developer")),
     ):
         """Return the serializable topology consumed by the embedded Studio."""
         try:
-            structure = registry.get(graph_id).get_graph(xray=xray)
+            structure = registry.get(graph_id, graph_version).get_graph(xray=xray)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         return {
@@ -244,7 +308,7 @@ def create_app(
         body: AssistantCreate, user: Principal = Depends(require("developer"))
     ):
         try:
-            graph = registry.get(body.graph_id)
+            graph = registry.get(body.graph_id, body.graph_version)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         value = await repository.create_assistant(
@@ -391,6 +455,7 @@ def create_app(
     async def create_thread_run(
         thread_id: str,
         body: RunCreate,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         user: Principal = Depends(require("operator")),
     ):
         if await repository.get_thread(user.tenant_id, thread_id) is None:
@@ -398,18 +463,36 @@ def create_app(
         assistant = await repository.get_assistant(user.tenant_id, body.assistant_id)
         if assistant is None:
             raise HTTPException(404, "assistant not found")
-        value = await repository.create_run(user.tenant_id, thread_id, assistant, body)
+        _validate_idempotency_key(idempotency_key)
+        value = await repository.create_run(
+            user.tenant_id,
+            thread_id,
+            assistant,
+            body,
+            idempotency_key=idempotency_key,
+            request_digest=_run_digest(thread_id, assistant, body),
+        )
         await audit(user, "runs.create", "run", value.id)
         return value
 
     @app.post("/v1/runs", response_model=Run, status_code=202)
     async def create_stateless_run(
-        body: RunCreate, user: Principal = Depends(require("operator"))
+        body: RunCreate,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        user: Principal = Depends(require("operator")),
     ):
         assistant = await repository.get_assistant(user.tenant_id, body.assistant_id)
         if assistant is None:
             raise HTTPException(404, "assistant not found")
-        value = await repository.create_run(user.tenant_id, None, assistant, body)
+        _validate_idempotency_key(idempotency_key)
+        value = await repository.create_run(
+            user.tenant_id,
+            None,
+            assistant,
+            body,
+            idempotency_key=idempotency_key,
+            request_digest=_run_digest(None, assistant, body),
+        )
         await audit(user, "runs.create_stateless", "run", value.id)
         return value
 
@@ -472,17 +555,39 @@ def create_app(
             raise HTTPException(409, "only paused runs can be resumed")
         assistant = await repository.get_assistant(user.tenant_id, previous.assistant_id)
         assert assistant is not None
+        # Resume the immutable execution contract captured by the paused run,
+        # even if the mutable assistant has been edited or redeployed since.
+        assistant = assistant.model_copy(
+            update={
+                "graph_id": previous.graph_id,
+                "graph_version": previous.graph_version,
+                "context": previous.context,
+                "config": previous.config,
+            },
+            deep=True,
+        )
         request = RunCreate(
             assistant_id=assistant.id,
             resume=body.get("resume"),
             update=body.get("update"),
             goto=body.get("goto"),
             durability=previous.durability,
+            metadata={"resumed_from_run_id": previous.id},
         )
         value = await repository.create_run(
             user.tenant_id, previous.thread_id, assistant, request
         )
         await audit(user, "runs.resume", "run", value.id)
+        return value
+
+    @app.post("/v1/runs/{run_id}/redrive", response_model=Run, status_code=202)
+    async def redrive_run(
+        run_id: str, user: Principal = Depends(require("operator"))
+    ):
+        value = await repository.redrive_run(user.tenant_id, run_id)
+        if value is None:
+            raise HTTPException(409, "only failed or dead-letter runs can be redriven")
+        await audit(user, "runs.redrive", "run", run_id)
         return value
 
     @app.get("/v1/runs/{run_id}/stream")
@@ -639,7 +744,25 @@ def create_app(
 
     @app.get("/ready")
     async def ready():
-        return {"status": "ready", "graphs": len(registry.list())}
+        graph_count = len(registry.list())
+        repository_ready = await repository.healthcheck()
+        worker_ready = worker.ready if embedded_worker else True
+        if not repository_ready or not worker_ready or graph_count == 0:
+            raise HTTPException(
+                503,
+                {
+                    "status": "not_ready",
+                    "repository": repository_ready,
+                    "worker": worker_ready,
+                    "graphs": graph_count,
+                },
+            )
+        return {
+            "status": "ready",
+            "repository": repository_ready,
+            "worker": worker_ready,
+            "graphs": graph_count,
+        }
 
     @app.get("/metrics", response_class=Response)
     async def metrics(user: Principal = Depends(require("viewer"))):
@@ -681,7 +804,7 @@ async def _thread_graph(repository, registry, tenant_id: str, thread_id: str):
     runs = await repository.list_runs(tenant_id, thread_id=thread_id)
     if not runs:
         raise HTTPException(404, "thread has no graph state")
-    return registry.get(runs[0].graph_id)
+    return registry.get(runs[0].graph_id, runs[0].graph_version)
 
 
 def _problem(
@@ -705,6 +828,35 @@ def _problem(
         status_code=status_code,
         media_type="application/problem+json",
     )
+
+
+def _validate_idempotency_key(value: str | None) -> None:
+    if value is not None and (not value.strip() or len(value) > 255):
+        raise HTTPException(400, "Idempotency-Key must contain 1 to 255 characters")
+
+
+def _run_digest(thread_id: str | None, assistant: Assistant, body: RunCreate) -> str:
+    payload = {
+        "thread_id": thread_id,
+        "assistant_id": assistant.id,
+        "graph_id": assistant.graph_id,
+        "graph_version": assistant.graph_version,
+        "request": body.model_dump(mode="json"),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _consume_rate_limit(app: FastAPI, tenant_id: str) -> None:
+    now = time.monotonic()
+    limit = app.state.repository.limits.max_requests_per_minute
+    async with app.state.rate_lock:
+        started, count = app.state.rate_windows.get(tenant_id, (now, 0))
+        if now - started >= 60:
+            started, count = now, 0
+        if count >= limit:
+            raise HTTPException(429, "tenant request-rate quota exceeded")
+        app.state.rate_windows[tenant_id] = (started, count + 1)
 
 
 def _snapshot_json(snapshot) -> dict[str, Any]:
@@ -732,4 +884,3 @@ def _jsonable(value: Any) -> Any:
 
 
 __all__ = ["create_app"]
-

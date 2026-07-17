@@ -8,7 +8,9 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
+from ..errors import GraphCancelledError
 from ..messages import (
     AIMessage,
     AIMessageChunk,
@@ -16,9 +18,10 @@ from ..messages import (
     ToolCall,
     ToolMessage,
 )
-from ..runtime import Runtime
-from ..tools import ToolSpec, as_tool_spec
+from ..runtime import Runtime, get_runtime
+from ..tools import ToolNode, ToolSpec
 from ..types import interrupt
+from ._http import should_retry_status, sleep_before_retry
 
 try:
     import httpx
@@ -41,6 +44,7 @@ _ENDPOINTS = {
 
 async def _iter_sse(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
     event = "message"
+    event_id: str | None = None
     data: list[str] = []
     async for line in response.aiter_lines():
         if not line:
@@ -53,20 +57,22 @@ async def _iter_sse(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
                 except json.JSONDecodeError:
                     payload = {"data": raw}
                 if isinstance(payload, Mapping):
-                    yield {"event": event, "data": dict(payload)}
+                    yield {"event": event, "data": dict(payload), "id": event_id}
                 else:
-                    yield {"event": event, "data": payload}
-            event, data = "message", []
+                    yield {"event": event, "data": payload, "id": event_id}
+            event, event_id, data = "message", None, []
             continue
         if line.startswith("event:"):
             event = line[6:].strip()
+        elif line.startswith("id:"):
+            event_id = line[3:].strip()
         elif line.startswith("data:"):
             data.append(line[5:].strip())
     if data:
         raw = "\n".join(data)
         if raw != "[DONE]":
             payload = json.loads(raw)
-            yield {"event": event, "data": payload}
+            yield {"event": event, "data": payload, "id": event_id}
 
 
 TokenProvider = Callable[[], str | Awaitable[str]]
@@ -83,32 +89,115 @@ class AsyncCozeClient:
         base_url: str = "https://api.coze.cn",
         timeout: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        max_retries: int = 3,
+        retry_base: float = 0.5,
     ) -> None:
         if not api_token and token_provider is None:
             raise ValueError("api_token or token_provider is required")
         self._token = api_token
         self._token_provider = token_provider
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        self.max_retries = max_retries
+        self.retry_base = retry_base
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=timeout, transport=transport
         )
 
-    async def _headers(self) -> dict[str, str]:
+    async def _headers(
+        self,
+        *,
+        operation_key: str,
+        last_event_id: str | None = None,
+    ) -> dict[str, str]:
         token = self._token
         if token is None and self._token_provider is not None:
             provided = self._token_provider()
             token = await provided if inspect.isawaitable(provided) else provided
-        return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        try:
+            runtime = get_runtime()
+            runtime.raise_if_cancelled()
+            headers["X-Idempotency-Key"] = runtime.idempotency_key or operation_key
+        except RuntimeError:
+            headers["X-Idempotency-Key"] = operation_key
+        if last_event_id:
+            headers["Last-Event-ID"] = last_event_id
+        return headers
 
     async def _request(self, method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
-        response = await self._client.request(
-            method, _ENDPOINTS[endpoint], headers=await self._headers(), **kwargs
-        )
-        response.raise_for_status()
+        response: httpx.Response | None = None
+        operation_key = str(uuid4())
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await self._client.request(
+                    method,
+                    _ENDPOINTS[endpoint],
+                    headers=await self._headers(operation_key=operation_key),
+                    **kwargs,
+                )
+                if should_retry_status(response.status_code) and attempt < self.max_retries:
+                    await sleep_before_retry(attempt + 1, response.headers, base=self.retry_base)
+                    continue
+                response.raise_for_status()
+                break
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt >= self.max_retries:
+                    raise
+                await sleep_before_retry(attempt + 1, base=self.retry_base)
+        assert response is not None
         payload = response.json()
         if isinstance(payload, Mapping) and payload.get("code") not in (None, 0):
             raise RuntimeError(f"Coze API error {payload.get('code')}: {payload.get('msg')}")
         data = payload.get("data", payload) if isinstance(payload, Mapping) else payload
         return dict(data) if isinstance(data, Mapping) else {"items": data}
+
+    async def _stream(
+        self,
+        endpoint: str,
+        *,
+        json_body: Mapping[str, Any],
+        params: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        last_event_id: str | None = None
+        seen: set[str] = set()
+        operation_key = str(uuid4())
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with self._client.stream(
+                    "POST",
+                    _ENDPOINTS[endpoint],
+                    params=params,
+                    json=dict(json_body),
+                    headers=await self._headers(
+                        operation_key=operation_key,
+                        last_event_id=last_event_id,
+                    ),
+                ) as response:
+                    if should_retry_status(response.status_code) and attempt < self.max_retries:
+                        await response.aread()
+                        await sleep_before_retry(
+                            attempt + 1, response.headers, base=self.retry_base
+                        )
+                        continue
+                    response.raise_for_status()
+                    async for event in _iter_sse(response):
+                        try:
+                            get_runtime().raise_if_cancelled()
+                        except RuntimeError:
+                            pass
+                        identifier = str(event.get("id") or "")
+                        if identifier:
+                            last_event_id = identifier
+                            if identifier in seen:
+                                continue
+                            seen.add(identifier)
+                        yield event
+                    return
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt >= self.max_retries:
+                    raise
+                await sleep_before_retry(attempt + 1, base=self.retry_base)
 
     async def chat(
         self,
@@ -145,16 +234,8 @@ class AsyncCozeClient:
             **kwargs,
         }
         params = {"conversation_id": conversation_id} if conversation_id else None
-        async with self._client.stream(
-            "POST",
-            _ENDPOINTS["chat"],
-            params=params,
-            json=payload,
-            headers=await self._headers(),
-        ) as response:
-            response.raise_for_status()
-            async for event in _iter_sse(response):
-                yield event
+        async for event in self._stream("chat", json_body=payload, params=params):
+            yield event
 
     async def chat_retrieve(self, conversation_id: str, chat_id: str) -> dict[str, Any]:
         return await self._request(
@@ -193,33 +274,25 @@ class AsyncCozeClient:
     async def workflow_stream(
         self, workflow_id: str, parameters: Mapping[str, Any], **kwargs: Any
     ) -> AsyncIterator[dict[str, Any]]:
-        async with self._client.stream(
-            "POST",
-            _ENDPOINTS["workflow_stream"],
-            json={"workflow_id": workflow_id, "parameters": dict(parameters), **kwargs},
-            headers=await self._headers(),
-        ) as response:
-            response.raise_for_status()
-            async for event in _iter_sse(response):
-                yield event
+        async for event in self._stream(
+            "workflow_stream",
+            json_body={"workflow_id": workflow_id, "parameters": dict(parameters), **kwargs},
+        ):
+            yield event
 
     async def workflow_stream_resume(
         self, workflow_id: str, event_id: str, interrupt_type: int | str, resume_data: Any
     ) -> AsyncIterator[dict[str, Any]]:
-        async with self._client.stream(
-            "POST",
-            _ENDPOINTS["workflow_resume"],
-            json={
+        async for event in self._stream(
+            "workflow_resume",
+            json_body={
                 "workflow_id": workflow_id,
                 "event_id": event_id,
                 "interrupt_type": interrupt_type,
                 "resume_data": resume_data,
             },
-            headers=await self._headers(),
-        ) as response:
-            response.raise_for_status()
-            async for event in _iter_sse(response):
-                yield event
+        ):
+            yield event
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -261,6 +334,8 @@ class CozeAgentNode:
     tools: Sequence[ToolSpec | Callable[..., Any]] | None = None
     hitl: bool = False
     max_tool_rounds: int = 5
+    tool_authorize: Callable[..., Any] | None = None
+    secret_resolver: Callable[[str], Any] | None = None
 
     async def __call__(self, state: Mapping[str, Any], runtime: Runtime[Any]) -> Mapping[str, Any]:
         conversations = dict(state.get(self.conversation_key, {}))
@@ -270,25 +345,34 @@ class CozeAgentNode:
         chat_id: str | None = None
         tool_calls: tuple[ToolCall, ...] = ()
         if self.stream:
-            async for event in self.client.chat_stream(
-                self.bot_id,
-                self.user_id,
-                additional_messages=messages,
-                conversation_id=conversation_id,
-            ):
-                runtime.raise_if_cancelled()
-                kind, data = event["event"], event.get("data", {})
-                if isinstance(data, Mapping):
-                    chat_id = str(data.get("id") or data.get("chat_id") or chat_id or "") or None
-                    conversation_id = str(data.get("conversation_id") or conversation_id or "") or None
-                if kind == "conversation.message.delta":
-                    delta = str(data.get("content", ""))
-                    content += delta
-                    runtime.emit_message(AIMessageChunk(delta, id=chat_id), {"provider": "coze"})
-                elif kind == "conversation.chat.requires_action":
-                    tool_calls = _extract_tool_calls(data)
-                elif kind in {"conversation.chat.failed", "error"}:
-                    raise RuntimeError(f"Coze chat failed: {data}")
+            try:
+                async for event in self.client.chat_stream(
+                    self.bot_id,
+                    self.user_id,
+                    additional_messages=messages,
+                    conversation_id=conversation_id,
+                ):
+                    kind, data = event["event"], event.get("data", {})
+                    if isinstance(data, Mapping):
+                        chat_id = str(data.get("id") or data.get("chat_id") or chat_id or "") or None
+                        conversation_id = str(
+                            data.get("conversation_id") or conversation_id or ""
+                        ) or None
+                    runtime.raise_if_cancelled()
+                    if kind == "conversation.message.delta":
+                        delta = str(data.get("content", ""))
+                        content += delta
+                        runtime.emit_message(
+                            AIMessageChunk(delta, id=chat_id), {"provider": "coze"}
+                        )
+                    elif kind == "conversation.chat.requires_action":
+                        tool_calls = _extract_tool_calls(data)
+                    elif kind in {"conversation.chat.failed", "error"}:
+                        raise RuntimeError(f"Coze chat failed: {data}")
+            except GraphCancelledError:
+                if conversation_id and chat_id:
+                    await asyncio.shield(self.client.cancel_chat(conversation_id, chat_id))
+                raise
         else:
             chat = await self.client.chat(
                 self.bot_id,
@@ -300,6 +384,9 @@ class CozeAgentNode:
             conversation_id = str(chat.get("conversation_id") or conversation_id or "")
             while chat.get("status") in {"created", "in_progress"}:
                 await asyncio.sleep(0.25)
+                if runtime.cancelled:
+                    await asyncio.shield(self.client.cancel_chat(conversation_id, chat_id))
+                runtime.raise_if_cancelled()
                 chat = await self.client.chat_retrieve(conversation_id, chat_id)
             if chat.get("status") == "requires_action":
                 tool_calls = _extract_tool_calls(chat)
@@ -323,20 +410,22 @@ class CozeAgentNode:
                 if not isinstance(decision, Mapping) or decision.get("action") != "approve":
                     return {self.messages_key: [AIMessage("Tool calls rejected.")]}
             if self.tools:
-                by_name = {spec.name: spec for spec in (as_tool_spec(item) for item in self.tools)}
+                tool_node = ToolNode(
+                    self.tools,
+                    authorize=self.tool_authorize,
+                    secret_resolver=self.secret_resolver,
+                )
                 for _round in range(self.max_tool_rounds):
-                    outputs = []
-                    for call in tool_calls:
-                        spec = by_name.get(call.name)
-                        if spec is None:
-                            output = f"unknown local tool {call.name}"
-                        elif inspect.iscoroutinefunction(spec.func):
-                            output = await spec.func(**dict(call.args))
-                        else:
-                            output = await asyncio.to_thread(spec.func, **dict(call.args))
-                        if inspect.isawaitable(output):
-                            output = await output
-                        outputs.append({"tool_call_id": call.id, "output": str(output)})
+                    executed = await tool_node(
+                        {"messages": [AIMessage("", tool_calls=tool_calls)]}
+                    )
+                    if not isinstance(executed, Mapping):
+                        raise RuntimeError("Coze local tools may not return graph Commands")
+                    outputs = [
+                        {"tool_call_id": item.tool_call_id, "output": str(item.content)}
+                        for item in executed.get("messages", ())
+                        if isinstance(item, ToolMessage)
+                    ]
                     if not conversation_id or not chat_id:
                         break
                     chat = await self.client.submit_tool_outputs(
@@ -344,6 +433,11 @@ class CozeAgentNode:
                     )
                     while chat.get("status") in {"created", "in_progress"}:
                         await asyncio.sleep(0.25)
+                        if runtime.cancelled:
+                            await asyncio.shield(
+                                self.client.cancel_chat(conversation_id, chat_id)
+                            )
+                        runtime.raise_if_cancelled()
                         chat = await self.client.chat_retrieve(conversation_id, chat_id)
                     if chat.get("status") == "requires_action":
                         tool_calls = _extract_tool_calls(chat)

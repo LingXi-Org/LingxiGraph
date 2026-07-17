@@ -28,6 +28,9 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["worker"]
+          ports:
+            - name: health
+              containerPort: 8125
           env:
             {{- include "lingxigraph.env" . | nindent 12 }}
           resources:
@@ -36,6 +39,14 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: health}
+            initialDelaySeconds: 10
+            periodSeconds: 10
       terminationGracePeriodSeconds: 60
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}

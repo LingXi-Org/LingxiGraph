@@ -9,7 +9,7 @@ from typing import Any
 
 from ..constants import END, START
 from ..graph import CompiledGraph, StateGraph
-from ..messages import HumanMessage, SystemMessage, ToolMessage
+from ..messages import HumanMessage, SystemMessage, ToolCall, ToolMessage
 from ..prebuilt import create_agent
 from ..runtime import Runtime
 from ..schema import SchemaAdapter
@@ -30,7 +30,7 @@ def create_handoff_tool(
     if not agent_name:
         raise ValueError("agent_name must be non-empty")
 
-    def handoff() -> Command[Any]:
+    def handoff(tool_call: ToolCall) -> Command[Any]:
         """Transfer the conversation to another specialist."""
 
         return Command(
@@ -39,7 +39,7 @@ def create_handoff_tool(
                 "messages": [
                     ToolMessage(
                         f"Transferred to {agent_name}.",
-                        tool_call_id=f"handoff:{agent_name}",
+                        tool_call_id=tool_call.id,
                         name=f"transfer_to_{agent_name}",
                     )
                 ],
@@ -55,7 +55,17 @@ def create_handoff_tool(
     )
     assert isinstance(spec, ToolSpec)
     if description is not None:
-        return ToolSpec(spec.name, description, spec.parameters, spec.func, spec.return_direct)
+        return ToolSpec(
+            spec.name,
+            description,
+            spec.parameters,
+            spec.func,
+            spec.return_direct,
+            spec.timeout,
+            spec.permissions,
+            spec.requires_approval,
+            spec.secret_refs,
+        )
     return spec
 
 
@@ -246,6 +256,7 @@ def build_group_chat(
     entry: str | None = None,
     model: Any | None = None,
     agent_descriptions: Mapping[str, str] | None = None,
+    max_turns: int = 20,
 ) -> StateGraph:
     """Build round-robin or selector-driven shared-conversation orchestration.
 
@@ -262,15 +273,24 @@ def build_group_chat(
         raise ValueError("selector strategy requires a selector callable")
     if strategy == "llm" and model is None:
         raise ValueError("llm strategy requires a model")
+    if max_turns < 1:
+        raise ValueError("max_turns must be at least 1")
     first = entry or names[0]
     if first not in agents:
         raise ValueError("group chat entry must name a registered agent")
 
-    async def route(state: Mapping[str, Any]) -> Command[Any]:
+    async def route(state: Mapping[str, Any], runtime: Runtime[Any]) -> Command[Any]:
         if termination is not None and termination(state):
+            runtime.emit("custom", {"type": "group_chat_stopped", "reason": "termination"})
             return Command(goto=END)
         current = str(state.get("active_agent") or first)
-        turn = int(state.get("turn", 0))
+        turn = int(state.get("turn", 0)) + 1
+        if turn >= max_turns:
+            runtime.emit(
+                "custom",
+                {"type": "group_chat_stopped", "reason": "max_turns", "turn": turn},
+            )
+            return Command(update={"turn": turn}, goto=END)
         if strategy == "selector":
             target = selector(state)  # type: ignore[misc]
         elif strategy == "llm":
@@ -286,6 +306,7 @@ def build_group_chat(
                 )
                 for agent in names
             ]
+            runtime.consume_model_call()
             response = await model.agenerate(
                 [
                     SystemMessage(
@@ -295,6 +316,7 @@ def build_group_chat(
                 ],
                 tools=selection_tools,
             )
+            runtime.consume_model_usage(response.usage)
             if response.tool_calls:
                 tool_name = response.tool_calls[0].name
                 target = tool_name.removeprefix("transfer_to_")
@@ -304,7 +326,7 @@ def build_group_chat(
             target = names[(names.index(current) + 1) % len(names)]
         if target not in agents:
             raise ValueError(f"group-chat selector returned unknown agent {target!r}")
-        return Command(update={"active_agent": target, "turn": turn + 1}, goto=target)
+        return Command(update={"active_agent": target, "turn": turn}, goto=target)
 
     graph = StateGraph(state_schema, name=f"group-chat-{strategy}")
     graph.add_node("router", route, destinations=(*names, END))

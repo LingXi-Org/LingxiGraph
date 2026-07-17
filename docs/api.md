@@ -10,15 +10,26 @@ OpenAPI 是 Agent Server 的协议真相。默认服务地址为 `http://localho
 | Graph registry | `GET /v1/graphs`、`GET /v1/graphs/{id}` |
 | Assistants | `POST/GET /v1/assistants`、`GET/PATCH/DELETE /v1/assistants/{id}` |
 | Threads | `POST/GET /v1/threads`、`GET/PATCH/DELETE /v1/threads/{id}`、state、history、fork、runs |
-| Runs | threaded/stateless create、get/list、join、resume、cancel、stream |
+| Runs | threaded/stateless create、get/list、join、resume、cancel、redrive、stream |
 | Store | `POST /v1/store/batch`、`GET /v1/store/search` |
 | Schedules | create/list/update/delete |
 | Interop | `/a2a/{assistant_id}`、`/mcp` |
 | Operations | `/health`、`/ready`、`/metrics` |
 
 创建 run 返回 HTTP 202 和 `pending` 资源。状态固定为 `pending`、`running`、`paused`、
-`succeeded`、`failed`、`cancelling`、`cancelled`、`timed_out`。业务失败不会用 HTTP 状态
+`succeeded`、`failed`、`cancelling`、`cancelled`、`timed_out`、`dead_letter`。业务失败不会用 HTTP 状态
 覆盖 run 状态；查询 run 的 `error.code` 获取稳定机器码。
+
+创建 threaded/stateless run 可携带 `Idempotency-Key`（1–255 字符）。key 在 tenant 内唯一；
+相同 key 和相同请求返回原 run，不会再次入队；不同请求复用 key 返回 HTTP 409 和
+`idempotency_conflict`。建议所有自动重试客户端都发送稳定 key。
+
+`RunCreate` 可设置 `max_model_calls`、`max_tool_calls`、`max_tokens`、`max_cost` 和
+`run_timeout`。预算由父子图共享，超限 run 以 `budget_exceeded` 失败。transient delivery
+耗尽重试后进入 `dead_letter`；排障后调用 `POST /v1/runs/{run_id}/redrive` 重置 attempt 并重新入队。
+
+assistant 可在创建时指定 `graph_version`。每个 run 固定 graph ID/version 以及合并后的
+config/context；paused run 恢复时继续原执行契约，不读取随后修改过的 assistant 配置。
 
 ## 请求示例
 
@@ -32,6 +43,12 @@ curl -X POST http://localhost:8124/v1/threads \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: acme' \
   -d '{}'
+
+curl -X POST http://localhost:8124/v1/runs \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: acme' \
+  -H 'Idempotency-Key: support-ticket-123-attempt-1' \
+  -d '{"assistant_id":"...","input":{"request":"reset access"},"max_model_calls":8}'
 ```
 
 `X-Tenant-ID` 只在 `LINGXIGRAPH_INSECURE_DEV_AUTH=true` 时生效。生产 tenant 必须从已验证
