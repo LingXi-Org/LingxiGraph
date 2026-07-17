@@ -75,7 +75,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-lingxigraph = ["server/migrations/*.sql", "py.typed"]
+lingxigraph = ["server/migrations/*.sql", "studio/*.html", "studio/*.css", "studio/*.js", "py.typed"]
 
 [tool.unittest]
 start-directory = "tests"

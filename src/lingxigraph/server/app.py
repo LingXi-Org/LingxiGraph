@@ -1,4 +1,4 @@
-"""FastAPI Agent Server with versioned REST and replayable SSE."""
+﻿"""FastAPI Agent Server with versioned REST and replayable SSE."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..cache import BaseCache
 from ..checkpoint import Checkpointer, InMemorySaver
@@ -206,6 +207,37 @@ def create_app(
             return registry.info(graph_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/v1/graphs/{graph_id}/structure")
+    async def get_graph_structure(
+        graph_id: str,
+        xray: bool = False,
+        _user: Principal = Depends(require("viewer", "developer")),
+    ):
+        """Return the serializable topology consumed by the embedded Studio."""
+        try:
+            structure = registry.get(graph_id).get_graph(xray=xray)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {
+            "nodes": [
+                {
+                    "id": node.id,
+                    "metadata": node.metadata,
+                    "is_subgraph": node.is_subgraph,
+                }
+                for node in structure.nodes
+            ],
+            "edges": [
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "conditional": edge.conditional,
+                    "label": edge.label,
+                }
+                for edge in structure.edges
+            ],
+        }
 
     @app.post("/v1/assistants", response_model=Assistant, status_code=201)
     async def create_assistant(
@@ -637,6 +669,11 @@ def create_app(
         ]
         return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
+    if embedded_worker:
+        studio_dir = Path(__file__).resolve().parent.parent / "studio"
+        if studio_dir.is_dir():
+            app.mount("/studio", StaticFiles(directory=studio_dir, html=True), name="studio")
+
     return app
 
 
@@ -695,3 +732,4 @@ def _jsonable(value: Any) -> Any:
 
 
 __all__ = ["create_app"]
+

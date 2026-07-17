@@ -52,6 +52,15 @@ class AgentServerTests(unittest.TestCase):
         other = {"x-tenant-id": "other"}
 
         with TestClient(app) as client:
+            studio = client.get("/studio/")
+            self.assertEqual(studio.status_code, 200)
+            self.assertIn("LingxiGraph Studio", studio.text)
+            structure = client.get("/v1/graphs/double/structure", headers=acme)
+            self.assertEqual(structure.status_code, 200, structure.text)
+            self.assertEqual(
+                [node["id"] for node in structure.json()["nodes"]],
+                ["__start__", "double", "__end__"],
+            )
             assistant = client.post(
                 "/v1/assistants", headers=acme, json={"graph_id": "double"}
             )
