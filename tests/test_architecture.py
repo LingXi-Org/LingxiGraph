@@ -15,7 +15,7 @@ OPTIONAL_INTEGRATION_MODULES = {
     "checkpoint/postgres.py",
     "store/postgres.py",
 }
-OPTIONAL_INTEGRATION_PACKAGES = {"protocols", "server"}
+OPTIONAL_INTEGRATION_PACKAGES = {"integrations", "protocols", "server"}
 
 
 class ArchitectureBoundaryTests(unittest.TestCase):

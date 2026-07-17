@@ -1,3 +1,4 @@
+import time
 import unittest
 from typing import TypedDict
 
@@ -67,6 +68,20 @@ class InMemoryStoreTests(unittest.TestCase):
         item = self.store.get(("ns",), "k")
         assert item is not None
         self.assertEqual(item.value["tags"], ["one"])
+
+    def test_ttl_and_semantic_embedder(self) -> None:
+        class Embedder:
+            def embed(self, text):
+                lowered = text.lower()
+                return [float("apple" in lowered), float("banana" in lowered)]
+
+        store = InMemoryStore(embedder=Embedder())
+        store.put(("memory",), "apple", {"text": "apple"})
+        store.put(("memory",), "banana", {"text": "banana"})
+        self.assertEqual(store.search(("memory",), query="banana")[0].key, "banana")
+        store.put(("memory",), "short", {"text": "temporary"}, ttl=0.01)
+        time.sleep(0.03)
+        self.assertIsNone(store.get(("memory",), "short"))
 
 
 class StoreInGraphTests(unittest.TestCase):

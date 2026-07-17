@@ -1021,7 +1021,7 @@ wheels = [
 
 [[package]]
 name = "lingxigraph"
-version = "1.0.0"
+version = "2.0.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1038,6 +1038,9 @@ all = [
     { name = "redis" },
     { name = "uvicorn", extra = ["standard"] },
 ]
+coze = [
+    { name = "httpx" },
+]
 dev = [
     { name = "build" },
     { name = "coverage", extra = ["toml"] },
@@ -1049,6 +1052,9 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
     { name = "testcontainers", extra = ["redis"] },
+]
+openai = [
+    { name = "httpx" },
 ]
 otel = [
     { name = "opentelemetry-api" },
@@ -1083,6 +1089,8 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'all'", specifier = ">=0.115,<1" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115,<1" },
     { name = "httpx", marker = "extra == 'all'", specifier = ">=0.27,<1" },
+    { name = "httpx", marker = "extra == 'coze'", specifier = ">=0.27,<1" },
+    { name = "httpx", marker = "extra == 'openai'", specifier = ">=0.27,<1" },
     { name = "httpx", marker = "extra == 'sdk'", specifier = ">=0.27,<1" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27,<1" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.112,<7" },
@@ -1109,7 +1117,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'all'", specifier = ">=0.30,<1" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.30,<1" },
 ]
-provides-extras = ["server", "postgres", "redis", "otel", "sdk", "all", "dev"]
+provides-extras = ["server", "postgres", "redis", "otel", "sdk", "coze", "openai", "all", "dev"]
 
 [[package]]
 name = "lxml"

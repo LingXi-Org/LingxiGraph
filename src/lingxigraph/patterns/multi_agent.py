@@ -9,10 +9,54 @@ from typing import Any
 
 from ..constants import END, START
 from ..graph import CompiledGraph, StateGraph
+from ..messages import HumanMessage, SystemMessage, ToolMessage
+from ..prebuilt import create_agent
 from ..runtime import Runtime
-from ..types import Command, Send
+from ..schema import SchemaAdapter
+from ..tools import ToolSpec, tool
+from ..types import Command, CommandScope, Send
 
 Agent = Callable[..., Any] | CompiledGraph
+
+
+def create_handoff_tool(
+    agent_name: str,
+    *,
+    description: str | None = None,
+    update: Mapping[str, Any] | None = None,
+) -> ToolSpec:
+    """Create a model-callable tool that transfers control to a parent agent node."""
+
+    if not agent_name:
+        raise ValueError("agent_name must be non-empty")
+
+    def handoff() -> Command[Any]:
+        """Transfer the conversation to another specialist."""
+
+        return Command(
+            goto=agent_name,
+            update={
+                "messages": [
+                    ToolMessage(
+                        f"Transferred to {agent_name}.",
+                        tool_call_id=f"handoff:{agent_name}",
+                        name=f"transfer_to_{agent_name}",
+                    )
+                ],
+                "active_agent": agent_name,
+                **dict(update or {}),
+            },
+            scope=CommandScope.PARENT,
+        )
+
+    spec = tool(
+        handoff,
+        name=f"transfer_to_{agent_name}",
+    )
+    assert isinstance(spec, ToolSpec)
+    if description is not None:
+        return ToolSpec(spec.name, description, spec.parameters, spec.func, spec.return_direct)
+    return spec
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +124,12 @@ def build_manager_as_tools(
 
 def build_supervisor(
     state_schema: type,
-    supervisor: Callable[..., Any],
-    agents: Mapping[str, Agent],
+    supervisor: Callable[..., Any] | None = None,
+    agents: Mapping[str, Agent] | None = None,
     *,
     name: str = "supervisor",
+    model: Any | None = None,
+    agent_descriptions: Mapping[str, str] | None = None,
 ) -> StateGraph:
     """Build a manager-owned loop.
 
@@ -93,10 +139,31 @@ def build_supervisor(
 
     if not agents:
         raise ValueError("supervisor pattern requires at least one agent")
+    if supervisor is None and model is None:
+        raise ValueError("supervisor callable or model is required")
+    if supervisor is not None and model is not None:
+        raise ValueError("use either supervisor callable or model, not both")
+    supervisor_node: Agent
+    if model is not None:
+        supervisor_node = create_agent(
+            model,
+            [
+                create_handoff_tool(
+                    agent_name,
+                    description=(agent_descriptions or {}).get(agent_name),
+                )
+                for agent_name in agents
+            ],
+            state_schema=state_schema,
+            name=f"{name}-router",
+        )
+    else:
+        assert supervisor is not None
+        supervisor_node = supervisor
     graph = StateGraph(state_schema, name=name)
     graph.add_node(
         "supervisor",
-        supervisor,
+        supervisor_node,
         destinations=(*agents.keys(), END),
         metadata={"pattern": "supervisor", "role": "manager"},
     )
@@ -141,22 +208,31 @@ def build_swarm(
     *,
     entry: str,
 ) -> StateGraph:
-    """Alias of handoff with explicit decentralized-swarm metadata."""
+    """Build a decentralized swarm that resumes at the persisted active agent."""
 
-    graph = build_handoff(state_schema, agents, entry=entry, name="swarm")
-    for node_name, spec in list(graph._nodes.items()):
-        graph._nodes[node_name] = type(spec)(
-            action=spec.action,
-            retry=spec.retry,
-            cache=spec.cache,
-            timeout=spec.timeout,
-            max_concurrency=spec.max_concurrency,
-            subgraph=spec.subgraph,
-            subgraph_persistence=spec.subgraph_persistence,
-            destinations=spec.destinations,
+    if entry not in agents:
+        raise ValueError("swarm entry must name a registered agent")
+    graph = StateGraph(state_schema, name="swarm")
+    destinations = (*agents.keys(), END)
+    for agent_name, agent in agents.items():
+        graph.add_node(
+            agent_name,
+            agent,
+            destinations=destinations,
             metadata={"pattern": "swarm", "role": "peer"},
-            middleware=spec.middleware,
         )
+    if "active_agent" in SchemaAdapter(state_schema).fields:
+        def route(state: Mapping[str, Any]) -> str:
+            target = str(state.get("active_agent") or entry)
+            if target not in agents:
+                raise ValueError(f"state selected unknown active_agent {target!r}")
+            return target
+
+        graph.add_conditional_edges(START, route, {name: name for name in agents})
+    else:
+        # Compatibility for 1.x state schemas; durable swarm handoff requires
+        # declaring ``active_agent`` in the state.
+        graph.add_edge(START, entry)
     return graph
 
 
@@ -168,6 +244,8 @@ def build_group_chat(
     selector: Callable[[Mapping[str, Any]], str] | None = None,
     termination: Callable[[Mapping[str, Any]], bool] | None = None,
     entry: str | None = None,
+    model: Any | None = None,
+    agent_descriptions: Mapping[str, str] | None = None,
 ) -> StateGraph:
     """Build round-robin or selector-driven shared-conversation orchestration.
 
@@ -178,21 +256,50 @@ def build_group_chat(
     names = tuple(agents)
     if not names:
         raise ValueError("group chat requires at least one agent")
-    if strategy not in {"round_robin", "selector"}:
-        raise ValueError("strategy must be 'round_robin' or 'selector'")
+    if strategy not in {"round_robin", "selector", "llm"}:
+        raise ValueError("strategy must be 'round_robin', 'selector', or 'llm'")
     if strategy == "selector" and selector is None:
         raise ValueError("selector strategy requires a selector callable")
+    if strategy == "llm" and model is None:
+        raise ValueError("llm strategy requires a model")
     first = entry or names[0]
     if first not in agents:
         raise ValueError("group chat entry must name a registered agent")
 
-    def route(state: Mapping[str, Any]) -> Command[Any]:
+    async def route(state: Mapping[str, Any]) -> Command[Any]:
         if termination is not None and termination(state):
             return Command(goto=END)
         current = str(state.get("active_agent") or first)
         turn = int(state.get("turn", 0))
         if strategy == "selector":
             target = selector(state)  # type: ignore[misc]
+        elif strategy == "llm":
+            assert model is not None
+            descriptions = "\n".join(
+                f"- {agent}: {(agent_descriptions or {}).get(agent, '')}"
+                for agent in names
+            )
+            selection_tools = [
+                create_handoff_tool(
+                    agent,
+                    description=(agent_descriptions or {}).get(agent),
+                )
+                for agent in names
+            ]
+            response = await model.agenerate(
+                [
+                    SystemMessage(
+                        "Select exactly one next speaker using a transfer tool.\n" + descriptions
+                    ),
+                    HumanMessage(repr(dict(state))),
+                ],
+                tools=selection_tools,
+            )
+            if response.tool_calls:
+                tool_name = response.tool_calls[0].name
+                target = tool_name.removeprefix("transfer_to_")
+            else:
+                target = str(response.content).strip()
         else:
             target = names[(names.index(current) + 1) % len(names)]
         if target not in agents:
@@ -277,4 +384,5 @@ __all__ = [
     "build_plan_execute",
     "build_supervisor",
     "build_swarm",
+    "create_handoff_tool",
 ]

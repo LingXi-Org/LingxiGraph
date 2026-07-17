@@ -44,6 +44,7 @@ class _NodeSpec:
     destinations: tuple[str, ...] = ()
     metadata: Mapping[str, Any] | None = None
     middleware: tuple[Any, ...] = ()
+    defer: bool = False
 
 
 class StateGraph:
@@ -90,6 +91,7 @@ class StateGraph:
         destinations: Iterable[str] | None = None,
         metadata: Mapping[str, Any] | None = None,
         middleware: Iterable[Any] | None = None,
+        defer: bool = False,
         subgraph_persistence: SubgraphPersistence | str = SubgraphPersistence.INVOCATION,
     ) -> StateGraph:
         """Register a node.
@@ -133,6 +135,7 @@ class StateGraph:
                 destinations=targets,
                 metadata=dict(metadata or {}),
                 middleware=tuple(middleware or ()),
+                defer=defer,
             )
             return self
         if not callable(action):
@@ -146,6 +149,7 @@ class StateGraph:
             destinations=targets,
             metadata=dict(metadata or {}),
             middleware=tuple(middleware or ()),
+            defer=defer,
         )
         return self
 

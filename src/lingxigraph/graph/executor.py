@@ -7,7 +7,7 @@ import copy
 import hashlib
 import inspect
 import random
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -41,6 +41,7 @@ from ..schema import SchemaAdapter
 from ..serialization import JsonSerializer, Serializer
 from ..types import (
     Command,
+    CommandScope,
     Durability,
     Interrupt,
     Send,
@@ -53,8 +54,9 @@ from ..types import (
     _utc_now,
 )
 from .builder import _ConditionalEdge, _Edge, _NodeSpec
+from .structure import EdgeInfo, GraphInfo, NodeInfo
 
-StreamMode = str
+StreamMode = str | Sequence[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,36 @@ class _TaskResult:
     goto: tuple[str | Send, ...]
     interrupt: Interrupt | None = None
     cached: bool = False
+    parent_command: Command[Any] | None = None
+
+
+class _ParentCommand(BaseException):
+    """Control-flow signal that crosses exactly one subgraph boundary."""
+
+    def __init__(self, command: Command[Any]) -> None:
+        self.command = command
+        super().__init__("command targets parent graph")
+
+
+class _AsyncCheckpointWriter:
+    """Per-run ordered checkpoint writer used by ``Durability.ASYNC``."""
+
+    def __init__(self) -> None:
+        self._tail: asyncio.Task[Any] | None = None
+
+    def enqueue(self, operation: Callable[[], Awaitable[Any]]) -> None:
+        previous = self._tail
+
+        async def write() -> Any:
+            if previous is not None:
+                await previous
+            return await operation()
+
+        self._tail = asyncio.create_task(write())
+
+    async def flush(self) -> None:
+        if self._tail is not None:
+            await asyncio.shield(self._tail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +181,9 @@ class CompiledStateGraph:
         self.state_schema = state_schema
         self.input_schema = input_schema or state_schema
         self.output_schema = output_schema or state_schema
+        state_keys = frozenset(SchemaAdapter(state_schema).fields)
+        output_keys = frozenset(SchemaAdapter(self.output_schema).fields)
+        self._output_keys = None if output_keys == state_keys else output_keys
         self.context_schema = context_schema
         self.graph_name = str(graph_name or getattr(state_schema, "__name__", "graph"))
         self.graph_version = graph_version
@@ -181,15 +216,20 @@ class CompiledStateGraph:
             index: _callable_uses_runtime(conditional.path)
             for index, conditional in enumerate(conditional_edges)
         }
-        self._node_semaphores = {
-            name: asyncio.Semaphore(spec.max_concurrency)
+        self._concurrency_limits = {
+            name: spec.max_concurrency
             for name, spec in nodes.items()
             if spec.max_concurrency is not None
         }
         self._active_runs: dict[str, CancellationToken] = {}
+        self._event_sequences: dict[str, int] = {}
+        self.response_format: Mapping[str, Any] | type | None = None
 
     def _child_runtime(
-        self, checkpointer: Checkpointer | None, store: Any | None
+        self,
+        checkpointer: Checkpointer | None,
+        store: Any | None,
+        cache: BaseCache | None = None,
     ) -> CompiledStateGraph:
         """Rebind this graph to the parent run's checkpointer and store."""
 
@@ -206,7 +246,7 @@ class CompiledStateGraph:
             conditional_edges=self._conditional_edges,
             checkpointer=checkpointer,
             store=store,
-            cache=self.cache,
+            cache=self.cache if cache is None else cache,
             serializer=self.serializer,
             step_timeout=self.step_timeout,
             interrupt_before=tuple(self.interrupt_before),
@@ -222,13 +262,11 @@ class CompiledStateGraph:
     ) -> CompiledStateGraph:
         """Return an immutable graph rebound to deployment-managed services."""
 
-        rebound = self._child_runtime(
+        return self._child_runtime(
             checkpointer if checkpointer is not None else self.checkpointer,
             store if store is not None else self.store,
+            cache if cache is not None else self.cache,
         )
-        if cache is not None:
-            rebound.cache = cache
-        return rebound
 
     async def ainvoke(
         self,
@@ -239,6 +277,8 @@ class CompiledStateGraph:
         durability: Durability | str = Durability.SYNC,
         run_id: str | None = None,
         cancellation: CancellationToken | None = None,
+        _is_subgraph: bool = False,
+        _project: bool = True,
     ) -> dict[str, Any]:
         last: dict[str, Any] | None = None
         async for value in self.astream(
@@ -249,12 +289,14 @@ class CompiledStateGraph:
             durability=durability,
             run_id=run_id,
             cancellation=cancellation,
+            _is_subgraph=_is_subgraph,
+            _project=_project,
         ):
             last = value
         if last is not None:
             return last
         if self.checkpointer is not None and config is not None:
-            return dict(self.get_state(config).values)
+            return dict((await self.aget_state(config)).values)
         return {}
 
     def invoke(
@@ -290,12 +332,68 @@ class CompiledStateGraph:
         subgraphs: bool = False,
         run_id: str | None = None,
         cancellation: CancellationToken | None = None,
+        _project: bool = True,
+        _is_subgraph: bool = False,
     ) -> AsyncIterator[Any]:
-        if stream_mode not in {"values", "updates", "events", "custom", "messages"}:
+        valid_modes = {"values", "updates", "events", "custom", "messages"}
+        if not isinstance(stream_mode, str):
+            modes = tuple(dict.fromkeys(stream_mode))
+            if not modes or any(mode not in valid_modes for mode in modes):
+                raise ValueError("stream_mode sequence contains an unsupported mode")
+            current_state: dict[str, Any] = {}
+            pending_updates: dict[str, Any] = {}
+            async for event in self.astream(
+                input,
+                config,
+                stream_mode="events",
+                context=context,
+                durability=durability,
+                subgraphs=subgraphs,
+                run_id=run_id,
+                cancellation=cancellation,
+                _project=False,
+                _is_subgraph=_is_subgraph,
+            ):
+                if "events" in modes:
+                    yield ("events", event)
+                if event.kind in {EventKind.RUN_STARTED, EventKind.STATE_UPDATED, EventKind.RUN_COMPLETED}:
+                    if isinstance(event.data.get("state"), Mapping):
+                        current_state = copy.deepcopy(dict(event.data["state"]))
+                if event.kind in {EventKind.NODE_COMPLETED, EventKind.NODE_CACHED}:
+                    pending_updates[str(event.data.get("task_id") or event.task_id)] = copy.deepcopy(
+                        event.data.get("update", {})
+                    )
+                if event.kind is EventKind.STATE_UPDATED:
+                    if "updates" in modes:
+                        yield ("updates", pending_updates)
+                    pending_updates = {}
+                    if "values" in modes:
+                        value = current_state
+                        if _project and self._output_keys is not None:
+                            value = {key: item for key, item in value.items() if key in self._output_keys}
+                        yield ("values", copy.deepcopy(value))
+                elif event.kind is EventKind.INTERRUPT_RAISED:
+                    markers = event.data.get("interrupts", ())
+                    if "updates" in modes:
+                        yield ("updates", {"__interrupt__": markers})
+                    if "values" in modes:
+                        value = {**copy.deepcopy(current_state), "__interrupt__": markers}
+                        if _project and self._output_keys is not None:
+                            value = {
+                                key: item
+                                for key, item in value.items()
+                                if key in self._output_keys or key == "__interrupt__"
+                            }
+                        yield ("values", value)
+                elif event.kind is EventKind.CUSTOM and "custom" in modes:
+                    yield ("custom", {event.data.get("channel", "custom"): event.data.get("value")})
+                elif event.kind is EventKind.MESSAGE and "messages" in modes:
+                    yield ("messages", event.data.get("value"))
+            return
+        if stream_mode not in valid_modes:
             raise ValueError(
                 "stream_mode must be 'values', 'updates', 'events', 'custom', or 'messages'"
             )
-        del subgraphs  # namespaces are always retained in v1 event envelopes
         selected_durability = Durability(durability)
         if self.context_schema is not None and isinstance(context, Mapping):
             context = SchemaAdapter(self.context_schema).validate(context)
@@ -307,8 +405,22 @@ class CompiledStateGraph:
             durability=selected_durability,
             run_id=run_id,
             cancellation=cancellation,
+            allow_parent_command=_is_subgraph,
+            subgraphs=subgraphs,
         ):
-            yield item
+            if (
+                _project
+                and stream_mode == "values"
+                and self._output_keys is not None
+                and isinstance(item, Mapping)
+            ):
+                yield {
+                    key: copy.deepcopy(value)
+                    for key, value in item.items()
+                    if key in self._output_keys or key == "__interrupt__"
+                }
+            else:
+                yield item
 
     def stream(
         self,
@@ -365,6 +477,32 @@ class CompiledStateGraph:
         if self.checkpointer is None:
             raise ValueError("get_state_history() requires a checkpointer")
         for item in self.checkpointer.list(config):
+            yield self._snapshot(item)
+
+    async def aget_state(
+        self, config: Mapping[str, Any], *, subgraphs: bool = False
+    ) -> StateSnapshot:
+        del subgraphs
+        if self.checkpointer is None:
+            raise ValueError("aget_state() requires a graph compiled with a checkpointer")
+        item = await self._aget_tuple(config)
+        if item is None:
+            raise EmptyInputError("no checkpoint exists for the requested thread")
+        return self._snapshot(item)
+
+    async def aget_state_history(
+        self, config: Mapping[str, Any]
+    ) -> AsyncIterator[StateSnapshot]:
+        if self.checkpointer is None:
+            raise ValueError("aget_state_history() requires a checkpointer")
+        method = getattr(self.checkpointer, "alist", None)
+        if method is not None:
+            async for item in method(config):
+                yield self._snapshot(item)
+            return
+        checkpointer = self.checkpointer
+        items = await asyncio.to_thread(lambda: tuple(checkpointer.list(config)))
+        for item in items:
             yield self._snapshot(item)
 
     @staticmethod
@@ -435,6 +573,46 @@ class CompiledStateGraph:
         }
         return self.checkpointer.put(config, checkpoint, metadata)
 
+    async def aupdate_state(
+        self,
+        config: Mapping[str, Any],
+        values: Mapping[str, Any],
+        *,
+        as_node: str | None = None,
+    ) -> Mapping[str, Any]:
+        if self.checkpointer is None:
+            raise ValueError("aupdate_state() requires a checkpointer")
+        item = await self._aget_tuple(config)
+        if item is None:
+            raise EmptyInputError("no checkpoint exists for the requested thread")
+        state = merge_updates(
+            item.checkpoint.channel_values,
+            [("__update_state__", values)],
+            self.channels,
+        )
+        checkpoint = Checkpoint(
+            id=str(uuid4()),
+            ts=_utc_now(),
+            step=item.checkpoint.step,
+            channel_values=state,
+            next=item.checkpoint.next,
+            pending_sends=item.checkpoint.pending_sends,
+            pending_interrupts=item.checkpoint.pending_interrupts,
+            parent_id=item.checkpoint.id,
+            namespace=item.checkpoint.namespace,
+            run_id=item.checkpoint.run_id,
+            channel_versions={
+                **dict(item.checkpoint.channel_versions),
+                **{key: item.checkpoint.channel_versions.get(key, 0) + 1 for key in values},
+            },
+            tasks=item.checkpoint.tasks,
+        )
+        return await self._aput(
+            config,
+            checkpoint,
+            {**dict(item.metadata), "source": "update_state", "as_node": as_node},
+        )
+
     def replay(
         self,
         config: Mapping[str, Any],
@@ -444,6 +622,11 @@ class CompiledStateGraph:
         """Replay execution after the checkpoint selected by ``config``."""
 
         return self.invoke(None, config, context=context)
+
+    async def areplay(
+        self, config: Mapping[str, Any], *, context: Any | None = None
+    ) -> dict[str, Any]:
+        return await self.ainvoke(None, config, context=context)
 
     def fork(
         self,
@@ -456,6 +639,15 @@ class CompiledStateGraph:
 
         return self.update_state(config, values, as_node=as_node)
 
+    async def afork(
+        self,
+        config: Mapping[str, Any],
+        values: Mapping[str, Any],
+        *,
+        as_node: str | None = None,
+    ) -> Mapping[str, Any]:
+        return await self.aupdate_state(config, values, as_node=as_node)
+
     def cancel(self, run_id: str) -> bool:
         token = self._active_runs.get(run_id)
         if token is None:
@@ -463,20 +655,72 @@ class CompiledStateGraph:
         token.cancel()
         return True
 
+    def get_graph(self, *, xray: bool = False) -> GraphInfo:
+        """Return a stable structural view suitable for tooling and diagrams."""
+
+        del xray  # reserved for recursive subgraph expansion
+        node_infos = [NodeInfo(START)]
+        node_infos.extend(
+            NodeInfo(
+                name,
+                dict(spec.metadata or {}),
+                is_subgraph=spec.subgraph is not None,
+            )
+            for name, spec in self.nodes.items()
+        )
+        node_infos.append(NodeInfo(END))
+        edges = [
+            EdgeInfo(source, edge.target, label=edge.trigger if len(edge.sources) > 1 else None)
+            for edge in self._edges
+            for source in edge.sources
+        ]
+        for conditional in self._conditional_edges:
+            if conditional.path_map is None:
+                targets = (*self.nodes.keys(), END)
+                edges.extend(
+                    EdgeInfo(conditional.source, target, conditional=True)
+                    for target in targets
+                    if target != conditional.source
+                )
+            else:
+                edges.extend(
+                    EdgeInfo(
+                        conditional.source,
+                        target,
+                        conditional=True,
+                        label=str(route),
+                    )
+                    for route, target in conditional.path_map.items()
+                )
+        return GraphInfo(tuple(node_infos), tuple(edges))
+
+    def draw_mermaid(self, *, xray: bool = False) -> str:
+        return self.get_graph(xray=xray).draw_mermaid()
+
     async def _run(
         self,
         input: Mapping[str, Any] | Command[Any] | None,
         config: dict[str, Any],
-        stream_mode: StreamMode,
+        stream_mode: str,
         *,
         context: Any | None,
         durability: Durability,
         run_id: str | None,
         cancellation: CancellationToken | None,
+        allow_parent_command: bool,
+        subgraphs: bool,
     ) -> AsyncIterator[Any]:
         run_id = run_id or str(uuid4())
         cancellation = cancellation or CancellationToken()
         self._active_runs[run_id] = cancellation
+        self._event_sequences[run_id] = 0
+        node_semaphores = {
+            name: asyncio.Semaphore(limit)
+            for name, limit in self._concurrency_limits.items()
+        }
+        checkpoint_writer = (
+            _AsyncCheckpointWriter() if durability is Durability.ASYNC else None
+        )
         configurable = config.get("configurable", {})
         namespace_value = configurable.get("checkpoint_ns", "")
         namespace = tuple(part for part in str(namespace_value).split("|") if part)
@@ -496,13 +740,14 @@ class CompiledStateGraph:
         latest = None
         if self.checkpointer is not None:
             self._require_thread_id(config)
-            latest = self.checkpointer.get_tuple(config)
+            latest = await self._aget_tuple(config)
 
         state: dict[str, Any]
         active: tuple[str, ...]
         sends: tuple[Send, ...]
         step: int
         join_progress: dict[int, set[str]] = {}
+        pending_deferred: set[str] = set()
         resume: dict[str, list[Any]] = {}
         skip_before: set[str] = set()
         pending_interrupts: tuple[Interrupt, ...] = ()
@@ -527,6 +772,7 @@ class CompiledStateGraph:
                 int(index): set(nodes)
                 for index, nodes in latest.metadata.get("join_progress", {}).items()
             }
+            pending_deferred = set(latest.metadata.get("deferred", ()))
             marker = latest.metadata.get("static_interrupt")
             if isinstance(marker, Mapping) and marker.get("position") == "before":
                 skip_before = set(marker.get("nodes", ()))
@@ -610,6 +856,7 @@ class CompiledStateGraph:
                     data={"interrupts": markers},
                 )
             self._active_runs.pop(run_id, None)
+            self._event_sequences.pop(run_id, None)
             return
 
         if not active and not sends:
@@ -625,6 +872,7 @@ class CompiledStateGraph:
                     data={"state": state},
                 )
             self._active_runs.pop(run_id, None)
+            self._event_sequences.pop(run_id, None)
             return
 
         executed_steps = 0
@@ -639,8 +887,26 @@ class CompiledStateGraph:
                         f"{executed_steps} supersteps"
                     )
 
+                deferred_now = {
+                    node for node in active if self.nodes[node].defer
+                }
+                non_deferred = tuple(node for node in active if node not in deferred_now)
+                if deferred_now and (non_deferred or sends):
+                    pending_deferred.update(deferred_now)
+                    active = non_deferred
                 tasks = self._plan_tasks(active, sends, namespace)
                 task_nodes = {task.node for task in tasks}
+
+                if stream_mode == "events":
+                    yield self._event(
+                        EventKind.STEP_STARTED,
+                        run_id,
+                        step=step,
+                        namespace=namespace,
+                        checkpoint_id=base_checkpoint_id,
+                        thread_id=thread_id,
+                        data={"tasks": tuple(task.id for task in tasks)},
+                    )
 
                 before_nodes = task_nodes & self.interrupt_before - skip_before
                 skip_before.clear()
@@ -652,7 +918,7 @@ class CompiledStateGraph:
                         id=f"static-before-{step}",
                         when="before",
                     )
-                    saved_id = self._save_checkpoint(
+                    saved_id = await self._save_checkpoint(
                         config,
                         state,
                         active,
@@ -664,11 +930,13 @@ class CompiledStateGraph:
                             "static_interrupt": {"position": "before", "nodes": ordered_before},
                             "join_progress": self._serialize_join_progress(join_progress),
                             "resume": {key: list(value) for key, value in resume.items()},
+                            "deferred": sorted(pending_deferred),
                         },
                         parent_id=parent_checkpoint_id,
                         namespace=namespace,
                         run_id=run_id,
                         channel_versions=channel_versions,
+                        writer=checkpoint_writer,
                     )
                     parent_checkpoint_id = saved_id or parent_checkpoint_id
                     if stream_mode == "values":
@@ -676,6 +944,23 @@ class CompiledStateGraph:
                     elif stream_mode == "updates":
                         yield {}
                     elif stream_mode == "events":
+                        yield self._event(
+                            EventKind.CHECKPOINT_SAVED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=saved_id,
+                            thread_id=thread_id,
+                        )
+                        yield self._event(
+                            EventKind.RUN_PAUSED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=saved_id,
+                            thread_id=thread_id,
+                            data={"reason": "interrupt_before"},
+                        )
                         yield self._event(
                             EventKind.INTERRUPT_RAISED,
                             run_id,
@@ -701,15 +986,20 @@ class CompiledStateGraph:
                         )
 
                 snapshot = copy.deepcopy(state)
-                custom_events: list[tuple[str, Any, str]] = []
+                event_queue: asyncio.Queue[tuple[str, Any, str]] = asyncio.Queue()
+                loop = asyncio.get_running_loop()
 
                 def emit(
                     channel: str,
                     value: Any,
                     task_id: str = "",
-                    _events: list[tuple[str, Any, str]] = custom_events,
+                    _loop: asyncio.AbstractEventLoop = loop,
+                    _queue: asyncio.Queue[tuple[str, Any, str]] = event_queue,
                 ) -> None:
-                    _events.append((channel, copy.deepcopy(value), task_id))
+                    _loop.call_soon_threadsafe(
+                        _queue.put_nowait,
+                        (channel, copy.deepcopy(value), task_id),
+                    )
 
                 persisted = {
                     write.task_id: write
@@ -745,16 +1035,72 @@ class CompiledStateGraph:
                                 cancellation=cancellation,
                                 deadline=deadline,
                                 emit=partial(emit, task_id=task.id),
+                                node_semaphores=node_semaphores,
+                                remaining_steps=recursion_limit - executed_steps,
+                                stream_mode=stream_mode,
+                                stream_subgraphs=subgraphs,
                             )
                         )
                     )
                 gather = asyncio.gather(*futures, return_exceptions=True)
                 try:
-                    completed_outcomes = (
-                        await asyncio.wait_for(gather, timeout=self.step_timeout)
-                        if self.step_timeout is not None
-                        else await gather
-                    )
+                    async with asyncio.timeout(self.step_timeout):
+                        while not gather.done():
+                            next_event = asyncio.create_task(event_queue.get())
+                            waitables: set[asyncio.Future[Any]] = {gather, next_event}
+                            done, _ = await asyncio.wait(
+                                waitables,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if next_event in done:
+                                channel, value, task_id_value = next_event.result()
+                                if channel == "__subgraph__" and subgraphs:
+                                    yield value
+                                elif stream_mode == "custom" and channel != "__retry__":
+                                    yield {channel: value}
+                                elif stream_mode == "messages" and channel == "messages":
+                                    yield value
+                                elif stream_mode == "events":
+                                    yield self._event(
+                                        EventKind.NODE_RETRYING
+                                        if channel == "__retry__"
+                                        else EventKind.MESSAGE
+                                        if channel == "messages"
+                                        else EventKind.CUSTOM,
+                                        run_id,
+                                        step=step,
+                                        namespace=namespace,
+                                        task_id=task_id_value,
+                                        checkpoint_id=base_checkpoint_id,
+                                        thread_id=thread_id,
+                                        data={"channel": channel, "value": value},
+                                    )
+                            else:
+                                next_event.cancel()
+                        completed_outcomes = await gather
+                        while not event_queue.empty():
+                            channel, value, task_id_value = event_queue.get_nowait()
+                            if channel == "__subgraph__" and subgraphs:
+                                yield value
+                            elif stream_mode == "custom" and channel != "__retry__":
+                                yield {channel: value}
+                            elif stream_mode == "messages" and channel == "messages":
+                                yield value
+                            elif stream_mode == "events":
+                                yield self._event(
+                                    EventKind.NODE_RETRYING
+                                    if channel == "__retry__"
+                                    else EventKind.MESSAGE
+                                    if channel == "messages"
+                                    else EventKind.CUSTOM,
+                                    run_id,
+                                    step=step,
+                                    namespace=namespace,
+                                    task_id=task_id_value,
+                                    checkpoint_id=base_checkpoint_id,
+                                    thread_id=thread_id,
+                                    data={"channel": channel, "value": value},
+                                )
                 except TimeoutError as exc:
                     for future in futures:
                         future.cancel()
@@ -780,29 +1126,28 @@ class CompiledStateGraph:
                     raise failure
                 results: list[_TaskResult] = list(outcomes)  # type: ignore[arg-type]
 
-                if stream_mode in {"custom", "messages"}:
-                    for channel, value, _task_id in custom_events:
-                        if stream_mode == "custom" or channel == "messages":
-                            yield {channel: value}
-                elif stream_mode == "events":
-                    for channel, value, task_id_value in custom_events:
-                        yield self._event(
-                            EventKind.MESSAGE if channel == "messages" else EventKind.CUSTOM,
-                            run_id,
-                            step=step,
-                            namespace=namespace,
-                            task_id=task_id_value,
-                            checkpoint_id=base_checkpoint_id,
-                            thread_id=thread_id,
-                            data={"channel": channel, "value": value},
+                parent_commands = [
+                    result.parent_command
+                    for result in results
+                    if result.parent_command is not None
+                ]
+                if parent_commands:
+                    if len(parent_commands) != 1:
+                        raise InvalidUpdateError(
+                            "a superstep may return at most one Command(scope=PARENT)"
                         )
+                    if not allow_parent_command:
+                        raise InvalidUpdateError(
+                            "Command(scope=PARENT) is only valid inside a subgraph node"
+                        )
+                    raise _ParentCommand(parent_commands[0])
 
                 interrupts = tuple(
                     result.interrupt for result in results if result.interrupt is not None
                 )
                 if interrupts:
                     self._require_interrupt_support(config)
-                    saved_id = self._save_checkpoint(
+                    saved_id = await self._save_checkpoint(
                         config,
                         state,
                         active,
@@ -813,14 +1158,18 @@ class CompiledStateGraph:
                             "source": "interrupt",
                             "resume": {key: list(value) for key, value in resume.items()},
                             "join_progress": self._serialize_join_progress(join_progress),
+                            "deferred": sorted(pending_deferred),
                         },
                         parent_id=parent_checkpoint_id,
                         namespace=namespace,
                         run_id=run_id,
                         channel_versions=channel_versions,
                         tasks=tuple(self._task_snapshot(result) for result in results),
+                        writer=checkpoint_writer,
                     )
                     if saved_id is not None:
+                        if checkpoint_writer is not None:
+                            await checkpoint_writer.flush()
                         await self._put_pending_results(config, saved_id, tasks, successful)
                         parent_checkpoint_id = saved_id
                     if stream_mode == "values":
@@ -828,6 +1177,23 @@ class CompiledStateGraph:
                     elif stream_mode == "updates":
                         yield {"__interrupt__": interrupts}
                     elif stream_mode == "events":
+                        yield self._event(
+                            EventKind.CHECKPOINT_SAVED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=saved_id,
+                            thread_id=thread_id,
+                        )
+                        yield self._event(
+                            EventKind.RUN_PAUSED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=saved_id,
+                            thread_id=thread_id,
+                            data={"reason": "interrupt"},
+                        )
                         yield self._event(
                             EventKind.INTERRUPT_RAISED,
                             run_id,
@@ -925,10 +1291,13 @@ class CompiledStateGraph:
 
                 active = self._normalize_targets(tuple(next_names))
                 sends = tuple(next_sends)
+                if pending_deferred and not active and not sends:
+                    active = self._normalize_targets(tuple(pending_deferred))
+                    pending_deferred.clear()
                 resume = {}
 
                 if durability is not Durability.EXIT:
-                    saved_id = self._save_checkpoint(
+                    saved_id = await self._save_checkpoint(
                         config,
                         state,
                         active,
@@ -940,6 +1309,7 @@ class CompiledStateGraph:
                             "step": step,
                             "join_progress": self._serialize_join_progress(join_progress),
                             "resume": {},
+                            "deferred": sorted(pending_deferred),
                             "durability": durability.value,
                         },
                         parent_id=parent_checkpoint_id,
@@ -947,9 +1317,19 @@ class CompiledStateGraph:
                         run_id=run_id,
                         channel_versions=channel_versions,
                         tasks=tuple(self._task_snapshot(result) for result in results),
+                        writer=checkpoint_writer,
                     )
                     parent_checkpoint_id = saved_id or parent_checkpoint_id
                     base_checkpoint_id = saved_id or base_checkpoint_id
+                    if stream_mode == "events" and saved_id is not None:
+                        yield self._event(
+                            EventKind.CHECKPOINT_SAVED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=saved_id,
+                            thread_id=thread_id,
+                        )
 
                 if stream_mode == "values":
                     yield copy.deepcopy(state)
@@ -958,6 +1338,16 @@ class CompiledStateGraph:
                         result.task.id: self._display_update(result.update)
                         for result in results
                     }
+
+                if stream_mode == "events":
+                    yield self._event(
+                        EventKind.STEP_COMPLETED,
+                        run_id,
+                        step=step,
+                        namespace=namespace,
+                        checkpoint_id=parent_checkpoint_id,
+                        thread_id=thread_id,
+                    )
 
                 if completed & self.interrupt_after:
                     self._require_interrupt_support(config)
@@ -970,6 +1360,15 @@ class CompiledStateGraph:
                             },
                             id=f"static-after-{step}",
                             when="after",
+                        )
+                        yield self._event(
+                            EventKind.RUN_PAUSED,
+                            run_id,
+                            step=step,
+                            namespace=namespace,
+                            checkpoint_id=parent_checkpoint_id,
+                            thread_id=thread_id,
+                            data={"reason": "interrupt_after"},
                         )
                         yield self._event(
                             EventKind.INTERRUPT_RAISED,
@@ -986,7 +1385,7 @@ class CompiledStateGraph:
                 executed_steps += 1
 
             if durability is Durability.EXIT and self.checkpointer is not None:
-                parent_checkpoint_id = self._save_checkpoint(
+                parent_checkpoint_id = await self._save_checkpoint(
                     config,
                     state,
                     (),
@@ -998,7 +1397,17 @@ class CompiledStateGraph:
                     namespace=namespace,
                     run_id=run_id,
                     channel_versions=channel_versions,
+                    writer=checkpoint_writer,
                 )
+                if stream_mode == "events":
+                    yield self._event(
+                        EventKind.CHECKPOINT_SAVED,
+                        run_id,
+                        step=step,
+                        namespace=namespace,
+                        checkpoint_id=parent_checkpoint_id,
+                        thread_id=thread_id,
+                    )
             if stream_mode == "events":
                 yield self._event(
                     EventKind.RUN_COMPLETED,
@@ -1041,7 +1450,10 @@ class CompiledStateGraph:
                 )
             raise
         finally:
+            if checkpoint_writer is not None:
+                await checkpoint_writer.flush()
             self._active_runs.pop(run_id, None)
+            self._event_sequences.pop(run_id, None)
 
     def _plan_tasks(
         self,
@@ -1141,6 +1553,10 @@ class CompiledStateGraph:
         cancellation: CancellationToken,
         deadline: datetime | None,
         emit: Callable[[str, Any], None],
+        node_semaphores: Mapping[str, asyncio.Semaphore],
+        remaining_steps: int,
+        stream_mode: str,
+        stream_subgraphs: bool,
     ) -> _TaskResult:
         spec = self.nodes[task.node]
         interrupt_context = _InterruptContext(
@@ -1162,6 +1578,9 @@ class CompiledStateGraph:
             emit=emit,
             metadata=spec.metadata,
             task_path=task.path,
+            remaining_steps=remaining_steps,
+            stream_mode=stream_mode,
+            stream_subgraphs=stream_subgraphs,
         )
         runtime_context = _RuntimeContext(
             config=MappingProxyType(dict(config)),
@@ -1172,7 +1591,7 @@ class CompiledStateGraph:
         runtime_token = _set_runtime_context(runtime_context)
         try:
             try:
-                semaphore = self._node_semaphores.get(task.node)
+                semaphore = node_semaphores.get(task.node)
                 if semaphore is not None:
                     async with semaphore:
                         result = await self._execute_task(
@@ -1205,6 +1624,8 @@ class CompiledStateGraph:
         if isinstance(result, _CachedResult):
             return _TaskResult(task, result.value, (), cached=True)
         if isinstance(result, Command):
+            if result.scope is CommandScope.PARENT:
+                return _TaskResult(task, {}, (), parent_command=result)
             update = result.update or {}
             goto = self._as_targets(result.goto) if result.goto is not None else ()
             return _TaskResult(task, update, goto)
@@ -1311,6 +1732,16 @@ class CompiledStateGraph:
                 delay = min(interval, policy.max_interval)
                 if policy.jitter and delay > 0:
                     delay += random.uniform(0, delay / 2)
+                runtime.emit(
+                    "__retry__",
+                    {
+                        "node": task.node,
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "delay": delay,
+                        "error": repr(exc),
+                    },
+                )
                 await asyncio.sleep(delay)
                 interval *= policy.backoff_factor
         raise AssertionError("unreachable retry state")
@@ -1324,7 +1755,7 @@ class CompiledStateGraph:
         config: Mapping[str, Any],
         step: int,
         runtime: Runtime[Any],
-    ) -> Mapping[str, Any]:
+    ) -> Any:
         child = spec.subgraph
         assert isinstance(child, CompiledStateGraph)
         shared = [key for key in child.channels if key in self.channels]
@@ -1348,13 +1779,16 @@ class CompiledStateGraph:
 
         if not durable:
             runnable = child._child_runtime(None, child.store or self.store)
+            configurable["checkpoint_ns"] = "|".join((*runtime.namespace, task.node))
             child_config["configurable"] = configurable
-            result = await runnable.ainvoke(
-                subinput,
-                child_config,
-                context=runtime.context,
-                cancellation=runtime.cancellation,
-            )
+            try:
+                result = await self._invoke_child(runnable, subinput, child_config, runtime)
+            except _ParentCommand as signal:
+                return Command(
+                    update=signal.command.update,
+                    goto=signal.command.goto,
+                    scope=CommandScope.SELF,
+                )
         else:
             runnable = child._child_runtime(self.checkpointer, child.store or self.store)
             # One child thread per activation: stable across interrupt replays
@@ -1371,7 +1805,7 @@ class CompiledStateGraph:
             )
             child_config["configurable"] = configurable
             assert self.checkpointer is not None
-            existing = self.checkpointer.get_tuple(child_config)
+            existing = await self._aget_tuple(child_config)
             pending = existing.checkpoint.pending_interrupts if existing is not None else ()
             if pending:
                 own = context.resume_values
@@ -1379,20 +1813,28 @@ class CompiledStateGraph:
                     # Replay without a new answer: surface the child's pause again.
                     raise GraphInterrupt(self._wrap_child_interrupt(task, pending[0], 0))
                 context.call_index = len(own)
-                result = await runnable.ainvoke(
-                    Command(resume=own[-1]),
-                    child_config,
-                    context=runtime.context,
-                    cancellation=runtime.cancellation,
-                )
+                try:
+                    result = await self._invoke_child(
+                        runnable, Command(resume=own[-1]), child_config, runtime
+                    )
+                except _ParentCommand as signal:
+                    return Command(
+                        update=signal.command.update,
+                        goto=signal.command.goto,
+                        scope=CommandScope.SELF,
+                    )
             else:
                 context.call_index = len(context.resume_values)
-                result = await runnable.ainvoke(
-                    subinput,
-                    child_config,
-                    context=runtime.context,
-                    cancellation=runtime.cancellation,
-                )
+                try:
+                    result = await self._invoke_child(
+                        runnable, subinput, child_config, runtime
+                    )
+                except _ParentCommand as signal:
+                    return Command(
+                        update=signal.command.update,
+                        goto=signal.command.goto,
+                        scope=CommandScope.SELF,
+                    )
 
         inner = result.get("__interrupt__")
         if inner:
@@ -1402,6 +1844,44 @@ class CompiledStateGraph:
         # The child already merged the parent's seed values, so its final values
         # replace the parent channels instead of passing through the reducers.
         return {key: ReplaceValue(result[key]) for key in shared if key in result}
+
+    async def _invoke_child(
+        self,
+        child: CompiledStateGraph,
+        input: Mapping[str, Any] | Command[Any],
+        config: Mapping[str, Any],
+        runtime: Runtime[Any],
+    ) -> dict[str, Any]:
+        if not runtime.stream_subgraphs:
+            return await child.ainvoke(
+                input,
+                config,
+                context=runtime.context,
+                cancellation=runtime.cancellation,
+                _is_subgraph=True,
+                _project=False,
+            )
+        requested = runtime.stream_mode or "values"
+        result: dict[str, Any] = {}
+        async for mode, chunk in child.astream(
+            input,
+            config,
+            stream_mode=(requested, "values"),
+            context=runtime.context,
+            cancellation=runtime.cancellation,
+            subgraphs=True,
+            _is_subgraph=True,
+            _project=False,
+        ):
+            if mode == "values" and isinstance(chunk, Mapping):
+                result = copy.deepcopy(dict(chunk))
+            if mode == requested:
+                namespace_value = config.get("configurable", {}).get("checkpoint_ns", "")
+                child_namespace = tuple(
+                    part for part in str(namespace_value).split("|") if part
+                )
+                runtime.emit("__subgraph__", (child_namespace, chunk))
+        return result
 
     @staticmethod
     def _wrap_child_interrupt(task: _Task, inner: Interrupt, consumed: int) -> Interrupt:
@@ -1467,7 +1947,7 @@ class CompiledStateGraph:
             "route must return a node name, a Send, or a sequence of them"
         )
 
-    def _save_checkpoint(
+    async def _save_checkpoint(
         self,
         config: Mapping[str, Any],
         state: Mapping[str, Any],
@@ -1482,6 +1962,7 @@ class CompiledStateGraph:
         run_id: str | None = None,
         channel_versions: Mapping[str, int] | None = None,
         tasks: tuple[TaskSnapshot, ...] = (),
+        writer: _AsyncCheckpointWriter | None = None,
     ) -> str | None:
         if self.checkpointer is None:
             return None
@@ -1508,7 +1989,10 @@ class CompiledStateGraph:
                 "lingxigraph.run.id": run_id or "",
             },
         ):
-            self.checkpointer.put(config, checkpoint, metadata)
+            if writer is not None:
+                writer.enqueue(lambda: self._aput(config, checkpoint, metadata))
+            else:
+                await self._aput(config, checkpoint, metadata)
         return checkpoint.id
 
     def _make_runtime(
@@ -1525,6 +2009,9 @@ class CompiledStateGraph:
         emit: Callable[[str, Any], None] | None = None,
         metadata: Mapping[str, Any] | None = None,
         task_path: tuple[str, ...] = (),
+        remaining_steps: int | None = None,
+        stream_mode: str | None = None,
+        stream_subgraphs: bool = False,
     ) -> Runtime[Any]:
         # A retry or lease recovery receives the same key even when it happens
         # in another process/run attempt.  External side-effect services can
@@ -1554,8 +2041,32 @@ class CompiledStateGraph:
             namespace=namespace,
             idempotency_key=idempotency_key,
             metadata=MappingProxyType(dict(metadata or {})),
+            remaining_steps=remaining_steps,
+            stream_mode=stream_mode,
+            stream_subgraphs=stream_subgraphs,
             _emit=emit,
         )
+
+    async def _aget_tuple(self, config: Mapping[str, Any]) -> Any:
+        if self.checkpointer is None:
+            return None
+        method = getattr(self.checkpointer, "aget_tuple", None)
+        if method is not None:
+            return await method(config)
+        return await asyncio.to_thread(self.checkpointer.get_tuple, config)
+
+    async def _aput(
+        self,
+        config: Mapping[str, Any],
+        checkpoint: Checkpoint,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if self.checkpointer is None:
+            return config
+        method = getattr(self.checkpointer, "aput", None)
+        if method is not None:
+            return await method(config, checkpoint, metadata)
+        return await asyncio.to_thread(self.checkpointer.put, config, checkpoint, metadata)
 
     def _cache_key(self, task: _Task, spec: _NodeSpec, argument: Any) -> str | None:
         if self.cache is None or spec.cache is None:
@@ -1677,6 +2188,8 @@ class CompiledStateGraph:
         checkpoint_id: str | None = None,
         thread_id: str | None = None,
     ) -> Event:
+        sequence = self._event_sequences.get(run_id, 0) + 1
+        self._event_sequences[run_id] = sequence
         return Event(
             kind,
             run_id,
@@ -1688,6 +2201,7 @@ class CompiledStateGraph:
             checkpoint_id=checkpoint_id,
             graph_id=self.graph_name,
             thread_id=thread_id,
+            sequence=sequence,
         )
 
     @staticmethod

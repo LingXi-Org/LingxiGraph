@@ -36,7 +36,7 @@ class Checkpoint:
     run_id: str | None = None
     channel_versions: Mapping[str, int] = field(default_factory=dict)
     tasks: tuple[TaskSnapshot, ...] = ()
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 @dataclass(frozen=True, slots=True)

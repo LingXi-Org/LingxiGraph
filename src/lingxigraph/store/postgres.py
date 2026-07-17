@@ -65,9 +65,14 @@ class PostgresStore:
                     value JSONB NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ,
                     PRIMARY KEY (tenant_id, namespace, key)
                 )
                 """
+            )
+            cursor.execute(
+                f'ALTER TABLE "{self._schema}".store_items '
+                "ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"
             )
             cursor.execute(
                 f"""CREATE INDEX IF NOT EXISTS store_items_namespace
@@ -78,18 +83,21 @@ class PostgresStore:
                 ON "{self._schema}".store_items USING GIN (value)"""
             )
 
-    def put(self, namespace, key, value):
+    def put(self, namespace, key, value, *, ttl=None):
         namespace = _validate_namespace(namespace)
         if not key:
             raise ValueError("store key must be non-empty")
+        if ttl is not None and ttl <= 0:
+            raise ValueError("ttl must be positive")
         with self._connect() as conn, conn.cursor() as cursor:
             self._set_tenant(cursor)
             cursor.execute(
                 f"""INSERT INTO "{self._schema}".store_items
-                (tenant_id, namespace, key, value) VALUES (%s, %s, %s, %s)
+                (tenant_id, namespace, key, value, expires_at)
+                VALUES (%s, %s, %s, %s, CASE WHEN %s IS NULL THEN NULL ELSE NOW() + (%s * INTERVAL '1 second') END)
                 ON CONFLICT (tenant_id, namespace, key) DO UPDATE
-                SET value=EXCLUDED.value, updated_at=NOW()""",
-                (self._tenant_id, list(namespace), key, self._jsonb(dict(value))),
+                SET value=EXCLUDED.value, updated_at=NOW(), expires_at=EXCLUDED.expires_at""",
+                (self._tenant_id, list(namespace), key, self._jsonb(dict(value)), ttl, ttl),
             )
 
     def get(self, namespace, key):
@@ -97,9 +105,10 @@ class PostgresStore:
         with self._connect() as conn, conn.cursor() as cursor:
             self._set_tenant(cursor)
             cursor.execute(
-                f"""SELECT namespace, key, value, created_at, updated_at
+                f"""SELECT namespace, key, value, created_at, updated_at, expires_at
                 FROM "{self._schema}".store_items
-                WHERE tenant_id=%s AND namespace=%s AND key=%s""",
+                WHERE tenant_id=%s AND namespace=%s AND key=%s
+                  AND (expires_at IS NULL OR expires_at > NOW())""",
                 (self._tenant_id, list(namespace), key),
             )
             row = cursor.fetchone()
@@ -127,7 +136,7 @@ class PostgresStore:
         prefix = tuple(namespace_prefix)
         if limit < 1 or offset < 0:
             raise ValueError("limit must be positive and offset non-negative")
-        clauses = ["tenant_id=%s"]
+        clauses = ["tenant_id=%s", "(expires_at IS NULL OR expires_at > NOW())"]
         params: list[Any] = [self._tenant_id]
         if prefix:
             clauses.append(f"namespace[1:{len(prefix)}]=%s")
@@ -142,7 +151,7 @@ class PostgresStore:
         with self._connect() as conn, conn.cursor() as cursor:
             self._set_tenant(cursor)
             cursor.execute(
-                f"""SELECT namespace, key, value, created_at, updated_at
+                f"""SELECT namespace, key, value, created_at, updated_at, expires_at
                 FROM "{self._schema}".store_items
                 WHERE {' AND '.join(clauses)}
                 ORDER BY updated_at DESC, key LIMIT %s OFFSET %s""",
@@ -176,7 +185,12 @@ class PostgresStore:
             elif operation.kind == "put":
                 if operation.key is None or operation.value is None:
                     raise ValueError("put operation requires key and value")
-                self.put(operation.namespace, operation.key, operation.value)
+                self.put(
+                    operation.namespace,
+                    operation.key,
+                    operation.value,
+                    ttl=operation.ttl,
+                )
                 results.append(None)
             elif operation.kind == "delete":
                 self.delete(operation.namespace, operation.key or "")
@@ -203,10 +217,11 @@ class PostgresStore:
             value=dict(row[2]),
             created_at=row[3].isoformat(),
             updated_at=row[4].isoformat(),
+            expires_at=row[5].isoformat() if len(row) > 5 and row[5] is not None else None,
         )
 
-    async def aput(self, namespace, key, value):
-        await asyncio.to_thread(self.put, namespace, key, value)
+    async def aput(self, namespace, key, value, *, ttl=None):
+        await asyncio.to_thread(self.put, namespace, key, value, ttl=ttl)
 
     async def aget(self, namespace, key):
         return await asyncio.to_thread(self.get, namespace, key)

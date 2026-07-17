@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingxigraph"
-version = "1.0.0"
+version = "2.0.0"
 description = "Enterprise, provider-neutral durable graph runtime for multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,8 @@ otel = [
   "opentelemetry-sdk>=1.27,<2",
 ]
 sdk = ["httpx>=0.27,<1"]
+coze = ["httpx>=0.27,<1"]
+openai = ["httpx>=0.27,<1"]
 all = [
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",

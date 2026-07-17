@@ -4,7 +4,10 @@ from typing import Annotated, TypedDict
 
 from lingxigraph.channels import (
     BinaryOperatorAggregate,
+    EphemeralValue,
     LastValue,
+    ReplaceValue,
+    Topic,
     extract_channels,
     merge_updates,
 )
@@ -51,6 +54,36 @@ class ChannelTests(unittest.TestCase):
     def test_unknown_key_fails(self) -> None:
         with self.assertRaises(InvalidUpdateError):
             merge_updates({}, [("a", {"missing": 1})], self.channels)
+
+    def test_topic_and_ephemeral_channels(self) -> None:
+        class AdvancedState(TypedDict):
+            events: Annotated[list[str], Topic(str, accumulate=True)]
+            current: Annotated[str, EphemeralValue(str)]
+
+        channels = extract_channels(AdvancedState)
+        first = merge_updates(
+            {},
+            [("a", {"events": ["a"], "current": "now"}), ("b", {"events": "b"})],
+            channels,
+        )
+        self.assertEqual(first, {"events": ["a", "b"], "current": "now"})
+        second = merge_updates(first, [("c", {"events": ["c"]})], channels)
+        self.assertEqual(second, {"events": ["a", "b", "c"]})
+        replaced = merge_updates(
+            second,
+            [("d", {"events": ReplaceValue(["reset"]), "current": ReplaceValue("x")})],
+            channels,
+        )
+        self.assertEqual(replaced, {"events": ["reset"], "current": "x"})
+        with self.assertRaises(InvalidUpdateError):
+            merge_updates(
+                {},
+                [("a", {"current": "a"}), ("b", {"current": "b"})],
+                channels,
+            )
+
+        non_accumulating = Topic(str)
+        self.assertEqual(non_accumulating.merge(["old"], [], key="events"), [])
 
 
 if __name__ == "__main__":

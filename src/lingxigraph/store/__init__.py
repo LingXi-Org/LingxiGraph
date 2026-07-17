@@ -16,6 +16,7 @@ class Item:
     value: Mapping[str, Any]
     created_at: str
     updated_at: str
+    expires_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,13 +31,26 @@ class StoreOperation:
     filter: Mapping[str, Any] | None = None
     limit: int = 10
     offset: int = 0
+    ttl: float | None = None
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    def embed(self, text: str) -> Sequence[float]: ...
 
 
 @runtime_checkable
 class BaseStore(Protocol):
     """Cross-thread key-value memory with namespace-prefix search."""
 
-    def put(self, namespace: Sequence[str], key: str, value: Mapping[str, Any]) -> None: ...
+    def put(
+        self,
+        namespace: Sequence[str],
+        key: str,
+        value: Mapping[str, Any],
+        *,
+        ttl: float | None = None,
+    ) -> None: ...
 
     def get(self, namespace: Sequence[str], key: str) -> Item | None: ...
 
@@ -60,7 +74,12 @@ class BaseStore(Protocol):
 @runtime_checkable
 class AsyncStore(Protocol):
     async def aput(
-        self, namespace: Sequence[str], key: str, value: Mapping[str, Any]
+        self,
+        namespace: Sequence[str],
+        key: str,
+        value: Mapping[str, Any],
+        *,
+        ttl: float | None = None,
     ) -> None: ...
 
     async def aget(self, namespace: Sequence[str], key: str) -> Item | None: ...
@@ -96,6 +115,7 @@ from .postgres import AsyncPostgresStore, PostgresStore
 __all__ = [
     "AsyncStore",
     "BaseStore",
+    "Embedder",
     "InMemoryStore",
     "Item",
     "PostgresStore",

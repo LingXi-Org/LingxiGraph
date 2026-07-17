@@ -25,7 +25,7 @@ password、api_key 和 cookie 字段。
 
 ## 可信执行边界
 
-v1 不提供在线 Python 上传、多租户代码沙箱或微虚机。Worker 只执行镜像/签名制品中的
+当前版本不提供在线 Python 上传、多租户代码沙箱或微虚机。Worker 只执行镜像/签名制品中的
 `lingxigraph.json` 导入路径。因此：
 
 - 图变更与普通生产代码执行相同的 review、CI、SBOM、签名和发布流程。

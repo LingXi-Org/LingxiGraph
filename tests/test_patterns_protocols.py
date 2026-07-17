@@ -4,7 +4,7 @@ import unittest
 from typing import Annotated, TypedDict
 from unittest.mock import patch
 
-from lingxigraph import END, START, Command, Runtime, StateGraph
+from lingxigraph import END, START, AIMessage, Command, Runtime, StateGraph, ToolCall
 from lingxigraph.patterns import (
     build_group_chat,
     build_handoff,
@@ -73,6 +73,32 @@ class PatternTests(unittest.TestCase):
         ).compile()
         chat_result = chat.invoke({"active_agent": "a", "turn": 0, "result": ""})
         self.assertEqual(chat_result["result"], "b")
+
+        class SelectorModel:
+            async def agenerate(self, messages, *, tools=None, **kwargs):
+                del messages, kwargs
+                self.asserted_tools = tools
+                return AIMessage(
+                    "",
+                    tool_calls=(ToolCall("transfer_to_b", {}, "select-b"),),
+                )
+
+        selector_model = SelectorModel()
+        llm_chat = build_group_chat(
+            ChatState,
+            {
+                "a": lambda _state: {"result": "a"},
+                "b": lambda _state: {"result": "b"},
+            },
+            strategy="llm",
+            model=selector_model,
+            termination=lambda state: state["turn"] >= 1,
+        ).compile()
+        self.assertEqual(
+            llm_chat.invoke({"active_agent": "a", "turn": 0, "result": ""})["result"],
+            "b",
+        )
+        self.assertEqual(selector_model.asserted_tools[0].name, "transfer_to_a")
 
         planned = build_plan_execute(
             PatternState,

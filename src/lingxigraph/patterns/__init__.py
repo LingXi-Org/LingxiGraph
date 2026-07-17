@@ -9,6 +9,7 @@ from .multi_agent import (
     build_plan_execute,
     build_supervisor,
     build_swarm,
+    create_handoff_tool,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "build_plan_execute",
     "build_supervisor",
     "build_swarm",
+    "create_handoff_tool",
 ]

@@ -1,6 +1,7 @@
-"""Public API for the LingxiGraph v1 runtime."""
+"""Public API for the LingxiGraph runtime."""
 
 from .cache import AsyncCache, BaseCache, InMemoryCache
+from .channels import EphemeralValue, Topic
 from .checkpoint import (
     AsyncCheckpointer,
     AsyncPostgresSaver,
@@ -26,7 +27,25 @@ from .errors import (
     PersistenceError,
 )
 from .events import Event, EventKind
-from .graph import CompiledGraph, CompiledStateGraph, StateGraph
+from .func import entrypoint, task
+from .graph import CompiledGraph, CompiledStateGraph, EdgeInfo, GraphInfo, NodeInfo, StateGraph
+from .messages import (
+    REMOVE_ALL_MESSAGES,
+    AIMessage,
+    AIMessageChunk,
+    AnyMessage,
+    HumanMessage,
+    MessagesState,
+    RemoveMessage,
+    SystemMessage,
+    ToolCall,
+    ToolCallChunk,
+    ToolMessage,
+    add_messages,
+    merge_chunks,
+)
+from .models import ChatModel, StreamingChatModel
+from .prebuilt import AgentState, create_agent, create_react_agent
 from .runtime import (
     CancellationToken,
     Runtime,
@@ -40,11 +59,13 @@ from .store import (
     AsyncPostgresStore,
     AsyncStore,
     BaseStore,
+    Embedder,
     InMemoryStore,
     Item,
     PostgresStore,
     StoreOperation,
 )
+from .tools import ToolNode, ToolSpec, tool, tools_condition
 from .types import (
     CachePolicy,
     Command,
@@ -62,7 +83,7 @@ from .types import (
     interrupt,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "AsyncCache",
@@ -70,6 +91,10 @@ __all__ = [
     "AsyncPostgresSaver",
     "AsyncPostgresStore",
     "AsyncStore",
+    "AIMessage",
+    "AIMessageChunk",
+    "AgentState",
+    "AnyMessage",
     "BaseCache",
     "BaseStore",
     "CachePolicy",
@@ -77,14 +102,18 @@ __all__ = [
     "Checkpoint",
     "Checkpointer",
     "CheckpointTuple",
+    "ChatModel",
     "Command",
     "CommandScope",
     "CompiledGraph",
     "CompiledStateGraph",
     "ConcurrentRunError",
     "Durability",
+    "EdgeInfo",
+    "Embedder",
     "END",
     "EmptyInputError",
+    "EphemeralValue",
     "Event",
     "EventKind",
     "GraphCancelledError",
@@ -92,6 +121,8 @@ __all__ = [
     "GraphRecursionError",
     "GraphTimeoutError",
     "GraphValidationError",
+    "GraphInfo",
+    "HumanMessage",
     "InMemoryCache",
     "InMemorySaver",
     "InMemoryStore",
@@ -101,13 +132,17 @@ __all__ = [
     "JsonSerializer",
     "LingxiGraphError",
     "MultitaskStrategy",
+    "MessagesState",
     "PendingWrite",
+    "NodeInfo",
     "PersistenceError",
     "PostgresSaver",
     "PostgresStore",
     "RetryPolicy",
     "RunConfig",
     "RunStatus",
+    "REMOVE_ALL_MESSAGES",
+    "RemoveMessage",
     "Runtime",
     "START",
     "Send",
@@ -116,12 +151,28 @@ __all__ = [
     "SqliteSaver",
     "StateGraph",
     "StateSnapshot",
+    "StreamingChatModel",
     "StoreOperation",
     "SubgraphPersistence",
+    "SystemMessage",
     "TaskSnapshot",
+    "ToolCall",
+    "ToolCallChunk",
+    "ToolMessage",
+    "ToolNode",
+    "ToolSpec",
+    "Topic",
+    "add_messages",
+    "create_agent",
+    "create_react_agent",
+    "entrypoint",
     "get_config",
     "get_runtime",
     "get_store",
     "get_stream_writer",
     "interrupt",
+    "merge_chunks",
+    "tool",
+    "tools_condition",
+    "task",
 ]

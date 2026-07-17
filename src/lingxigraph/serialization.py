@@ -4,12 +4,40 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime, time
 from enum import Enum
 from pathlib import PurePath
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
+
+from .messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolCall,
+    ToolCallChunk,
+    ToolMessage,
+)
+from .types import Interrupt, Send, TaskSnapshot
+
+_TYPES: tuple[tuple[type[Any], str], ...] = (
+    (SystemMessage, "lx:msg.system"),
+    (HumanMessage, "lx:msg.human"),
+    (AIMessage, "lx:msg.ai"),
+    (ToolMessage, "lx:msg.tool"),
+    (AIMessageChunk, "lx:msg.ai_chunk"),
+    (RemoveMessage, "lx:msg.remove"),
+    (ToolCall, "lx:tool_call"),
+    (ToolCallChunk, "lx:tool_call_chunk"),
+    (Interrupt, "lx:interrupt"),
+    (Send, "lx:send"),
+    (TaskSnapshot, "lx:task_snapshot"),
+)
+_TYPE_TO_TAG = {kind: tag for kind, tag in _TYPES}
+_TAG_TO_TYPE = {tag: kind for kind, tag in _TYPES}
 
 
 class SerializationError(TypeError):
@@ -26,7 +54,7 @@ class Serializer(Protocol):
 class JsonSerializer:
     """Strict JSON serializer with a small allowlist of lossless extensions."""
 
-    version = 1
+    version = 2
 
     def dumps(self, value: Any) -> bytes:
         envelope = {"version": self.version, "value": self._encode(value)}
@@ -45,7 +73,7 @@ class JsonSerializer:
             envelope = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SerializationError("invalid JSON payload") from exc
-        if envelope.get("version") != self.version:
+        if envelope.get("version") not in {1, self.version}:
             raise SerializationError(
                 f"unsupported serializer version {envelope.get('version')!r}"
             )
@@ -71,6 +99,15 @@ class JsonSerializer:
             if not all(isinstance(key, str) for key in value):
                 raise SerializationError("JSON state mappings must use string keys")
             return {key: self._encode(item) for key, item in value.items()}
+        tag = _TYPE_TO_TAG.get(type(value))
+        if tag is not None:
+            return {
+                "__type__": tag,
+                "fields": {
+                    item.name: self._encode(getattr(value, item.name))
+                    for item in fields(value)
+                },
+            }
         if isinstance(value, datetime):
             return {"__type__": "datetime", "value": value.isoformat()}
         if isinstance(value, date):
@@ -86,7 +123,7 @@ class JsonSerializer:
         if hasattr(value, "model_dump") and callable(value.model_dump):
             return self._encode(value.model_dump(mode="json"))
         if is_dataclass(value) and not isinstance(value, type):
-            return self._encode(asdict(value))
+            return self._encode({item.name: getattr(value, item.name) for item in fields(value)})
         raise SerializationError(
             f"unsafe or unsupported state value {type(value).__module__}.{type(value).__qualname__}"
         )
@@ -97,6 +134,14 @@ class JsonSerializer:
         if not isinstance(value, dict):
             return value
         kind = value.get("__type__")
+        if isinstance(kind, str) and kind.startswith("lx:"):
+            target = _TAG_TO_TYPE.get(kind)
+            if target is None:
+                raise SerializationError(f"unsupported registered type {kind!r}")
+            raw_fields = value.get("fields")
+            if not isinstance(raw_fields, dict):
+                raise SerializationError(f"invalid registered type payload {kind!r}")
+            return target(**{key: self._decode(item) for key, item in raw_fields.items()})
         if kind == "bytes":
             return base64.b64decode(value["value"], validate=True)
         if kind == "tuple":

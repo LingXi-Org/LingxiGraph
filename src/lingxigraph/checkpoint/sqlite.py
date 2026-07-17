@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping
 from threading import RLock
 from typing import Any
 
+from ..errors import PersistenceError
 from ..serialization import JsonSerializer
 from ..types import Interrupt, Send, TaskSnapshot
 from . import Checkpoint, CheckpointTuple, PendingWrite
@@ -23,7 +24,9 @@ def _thread_id(config: Mapping[str, Any]) -> str:
     return str(configurable["thread_id"])
 
 
-def _interrupt(value: Mapping[str, Any]) -> Interrupt:
+def _interrupt(value: Mapping[str, Any] | Interrupt) -> Interrupt:
+    if isinstance(value, Interrupt):
+        return value
     return Interrupt(
         value=value.get("value"),
         resumable=bool(value.get("resumable", True)),
@@ -35,7 +38,9 @@ def _interrupt(value: Mapping[str, Any]) -> Interrupt:
     )
 
 
-def _task(value: Mapping[str, Any]) -> TaskSnapshot:
+def _task(value: Mapping[str, Any] | TaskSnapshot) -> TaskSnapshot:
+    if isinstance(value, TaskSnapshot):
+        return value
     return TaskSnapshot(
         id=str(value["id"]),
         name=str(value["name"]),
@@ -46,7 +51,14 @@ def _task(value: Mapping[str, Any]) -> TaskSnapshot:
     )
 
 
-def _checkpoint(value: Mapping[str, Any]) -> Checkpoint:
+def _checkpoint(value: Mapping[str, Any] | Checkpoint) -> Checkpoint:
+    if isinstance(value, Checkpoint):
+        return value
+    schema_version = int(value.get("schema_version", 1))
+    if schema_version > 2:
+        raise PersistenceError(
+            f"checkpoint schema_version={schema_version} is newer than supported version 2"
+        )
     return Checkpoint(
         id=str(value["id"]),
         ts=str(value["ts"]),
@@ -54,7 +66,7 @@ def _checkpoint(value: Mapping[str, Any]) -> Checkpoint:
         channel_values=dict(value.get("channel_values", {})),
         next=tuple(value.get("next", ())),
         pending_sends=tuple(
-            Send(str(item["node"]), item.get("arg"))
+            item if isinstance(item, Send) else Send(str(item["node"]), item.get("arg"))
             for item in value.get("pending_sends", ())
         ),
         pending_interrupts=tuple(
@@ -68,7 +80,7 @@ def _checkpoint(value: Mapping[str, Any]) -> Checkpoint:
             for key, version in value.get("channel_versions", {}).items()
         },
         tasks=tuple(_task(item) for item in value.get("tasks", ())),
-        schema_version=int(value.get("schema_version", 1)),
+        schema_version=2,
     )
 
 
@@ -108,16 +120,28 @@ class SqliteSaver:
                 );
                 CREATE INDEX IF NOT EXISTS checkpoints_v1_by_thread
                     ON checkpoints_v1 (thread_id, namespace, seq);
-                CREATE TABLE IF NOT EXISTS checkpoint_writes_v1 (
+                CREATE TABLE IF NOT EXISTS checkpoint_writes_v2 (
                     thread_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT '',
                     checkpoint_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     write_index INTEGER NOT NULL,
                     write_json BLOB NOT NULL,
-                    PRIMARY KEY (thread_id, checkpoint_id, task_id, write_index)
+                    PRIMARY KEY (thread_id, namespace, checkpoint_id, task_id, write_index)
                 );
                 """
             )
+            legacy = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='checkpoint_writes_v1'"
+            ).fetchone()
+            if legacy is not None:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO checkpoint_writes_v2
+                       (thread_id, namespace, checkpoint_id, task_id, write_index, write_json)
+                       SELECT thread_id, '', checkpoint_id, task_id, write_index, write_json
+                       FROM checkpoint_writes_v1"""
+                )
+                self._conn.execute("DROP TABLE checkpoint_writes_v1")
 
     @classmethod
     def from_conn_string(cls, database: str) -> SqliteSaver:
@@ -203,9 +227,11 @@ class SqliteSaver:
         writes: Iterable[PendingWrite],
     ) -> None:
         thread_id = _thread_id(config)
+        namespace = str(config.get("configurable", {}).get("checkpoint_ns", ""))
         rows = [
             (
                 thread_id,
+                namespace,
                 checkpoint_id,
                 write.task_id,
                 write.index,
@@ -217,9 +243,9 @@ class SqliteSaver:
             return
         with self._lock, self._conn:
             self._conn.executemany(
-                """INSERT OR REPLACE INTO checkpoint_writes_v1
-                   (thread_id, checkpoint_id, task_id, write_index, write_json)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO checkpoint_writes_v2
+                   (thread_id, namespace, checkpoint_id, task_id, write_index, write_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 rows,
             )
 
@@ -227,12 +253,13 @@ class SqliteSaver:
         self, config: Mapping[str, Any], checkpoint_id: str
     ) -> Iterable[PendingWrite]:
         thread_id = _thread_id(config)
+        namespace = str(config.get("configurable", {}).get("checkpoint_ns", ""))
         with self._lock:
             rows = self._conn.execute(
-                """SELECT write_json FROM checkpoint_writes_v1
-                   WHERE thread_id = ? AND checkpoint_id = ?
+                """SELECT write_json FROM checkpoint_writes_v2
+                   WHERE thread_id = ? AND namespace = ? AND checkpoint_id = ?
                    ORDER BY write_index, task_id""",
-                (thread_id, checkpoint_id),
+                (thread_id, namespace, checkpoint_id),
             ).fetchall()
         result: list[PendingWrite] = []
         for row in rows:
@@ -245,7 +272,7 @@ class SqliteSaver:
                     values=dict(value.get("values", {})),
                     task_path=tuple(value.get("task_path", ())),
                     goto=tuple(
-                        Send(str(item["node"]), item.get("arg"))
+                        item if isinstance(item, Send) else Send(str(item["node"]), item.get("arg"))
                         if isinstance(item, Mapping) and "node" in item
                         else str(item)
                         for item in value.get("goto", ())
@@ -259,7 +286,7 @@ class SqliteSaver:
         thread_id = _thread_id(config)
         with self._lock, self._conn:
             self._conn.execute(
-                "DELETE FROM checkpoint_writes_v1 WHERE thread_id = ?", (thread_id,)
+                "DELETE FROM checkpoint_writes_v2 WHERE thread_id = ?", (thread_id,)
             )
             self._conn.execute(
                 "DELETE FROM checkpoints_v1 WHERE thread_id = ?", (thread_id,)

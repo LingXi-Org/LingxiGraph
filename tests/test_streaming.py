@@ -31,12 +31,16 @@ class StreamingTests(unittest.TestCase):
             [event.kind for event in events],
             [
                 EventKind.RUN_STARTED,
+                EventKind.STEP_STARTED,
                 EventKind.NODE_STARTED,
                 EventKind.NODE_COMPLETED,
                 EventKind.STATE_UPDATED,
+                EventKind.STEP_COMPLETED,
+                EventKind.STEP_STARTED,
                 EventKind.NODE_STARTED,
                 EventKind.NODE_COMPLETED,
                 EventKind.STATE_UPDATED,
+                EventKind.STEP_COMPLETED,
                 EventKind.RUN_COMPLETED,
             ],
         )

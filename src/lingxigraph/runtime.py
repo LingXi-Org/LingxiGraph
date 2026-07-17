@@ -54,6 +54,9 @@ class Runtime(Generic[ContextT]):
     namespace: tuple[str, ...] = ()
     idempotency_key: str = ""
     metadata: Mapping[str, Any] | None = None
+    remaining_steps: int | None = None
+    stream_mode: str | None = None
+    stream_subgraphs: bool = False
     _emit: StreamEmitter | None = None
 
     @property
@@ -75,6 +78,20 @@ class Runtime(Generic[ContextT]):
             raise ValueError("stream channel must be a non-empty string")
         if self._emit is not None:
             self._emit(channel, value)
+
+    def emit_message(self, message: Any, metadata: Mapping[str, Any] | None = None) -> None:
+        """Emit a model message/chunk with task-scoped stream metadata."""
+
+        envelope = (
+            message,
+            {
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "namespace": self.namespace,
+                **dict(metadata or {}),
+            },
+        )
+        self.emit("messages", envelope)
 
 
 @dataclass(frozen=True, slots=True)

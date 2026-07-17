@@ -66,8 +66,48 @@ class BinaryOperatorAggregate:
         return result
 
 
-Channel = LastValue | BinaryOperatorAggregate
+@dataclass(frozen=True, slots=True)
+class Topic:
+    """A multi-value channel that optionally accumulates across supersteps."""
+
+    value_type: Any = Any
+    accumulate: bool = False
+
+    def merge(self, current: Any, writes: list[Any], *, key: str) -> Any:
+        del key
+        values: list[Any] = []
+        if self.accumulate and current is not _MISSING:
+            values.extend(copy.deepcopy(list(current)))
+        for write in writes:
+            if isinstance(write, ReplaceValue):
+                values = copy.deepcopy(list(write.value))
+            elif isinstance(write, (list, tuple)):
+                values.extend(copy.deepcopy(list(write)))
+            else:
+                values.append(copy.deepcopy(write))
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class EphemeralValue:
+    """A last-value channel cleared when a superstep does not write it."""
+
+    value_type: Any = Any
+
+    def merge(self, current: Any, writes: list[Any], *, key: str) -> Any:
+        if len(writes) > 1:
+            raise InvalidUpdateError(
+                f"ephemeral state key {key!r} received {len(writes)} writes in one superstep"
+            )
+        if not writes:
+            return _CLEAR
+        write = writes[0]
+        return copy.deepcopy(write.value if isinstance(write, ReplaceValue) else write)
+
+
+Channel = LastValue | BinaryOperatorAggregate | Topic | EphemeralValue
 _MISSING = object()
+_CLEAR = object()
 
 
 def extract_channels(schema: type) -> dict[str, Channel]:
@@ -92,6 +132,10 @@ def extract_channels(schema: type) -> dict[str, Channel]:
         if get_origin(hint) is Annotated:
             args = get_args(hint)
             value_type, metadata = args[0], args[1:]
+            channel = next((item for item in metadata if isinstance(item, (LastValue, BinaryOperatorAggregate, Topic, EphemeralValue))), None)
+            if channel is not None:
+                channels[key] = channel
+                continue
             reducer = next((item for item in metadata if callable(item)), None)
             channels[key] = (
                 BinaryOperatorAggregate(value_type, reducer)
@@ -127,7 +171,9 @@ def merge_updates(
     for key, channel in channels.items():
         current = merged.get(key, _MISSING)
         value = channel.merge(current, writes[key], key=key)
-        if value is not _MISSING:
+        if value is _CLEAR:
+            merged.pop(key, None)
+        elif value is not _MISSING:
             merged[key] = value
     return merged
 
@@ -136,7 +182,9 @@ __all__ = [
     "BinaryOperatorAggregate",
     "Channel",
     "LastValue",
+    "EphemeralValue",
     "ReplaceValue",
+    "Topic",
     "extract_channels",
     "merge_updates",
 ]
