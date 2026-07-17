@@ -94,10 +94,11 @@ class PostgresStore:
             cursor.execute(
                 f"""INSERT INTO "{self._schema}".store_items
                 (tenant_id, namespace, key, value, expires_at)
-                VALUES (%s, %s, %s, %s, CASE WHEN %s IS NULL THEN NULL ELSE NOW() + (%s * INTERVAL '1 second') END)
+                VALUES (%s, %s, %s, %s,
+                        NOW() + (%s::double precision * INTERVAL '1 second'))
                 ON CONFLICT (tenant_id, namespace, key) DO UPDATE
                 SET value=EXCLUDED.value, updated_at=NOW(), expires_at=EXCLUDED.expires_at""",
-                (self._tenant_id, list(namespace), key, self._jsonb(dict(value)), ttl, ttl),
+                (self._tenant_id, list(namespace), key, self._jsonb(dict(value)), ttl),
             )
 
     def get(self, namespace, key):
