@@ -9,6 +9,33 @@ permissions:
   contents: read
 
 jobs:
+  chainlit-adapter:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - uses: astral-sh/setup-uv@v6
+      - run: uv lock --check
+        working-directory: adapters/chainlit
+      - run: uv sync --extra dev --locked
+        working-directory: adapters/chainlit
+      - run: uv run ruff check src tests
+        working-directory: adapters/chainlit
+      - run: uv run mypy src/lingxigraph_chainlit
+        working-directory: adapters/chainlit
+      - run: uv run coverage run --branch -m pytest
+        working-directory: adapters/chainlit
+      - run: uv run coverage report --fail-under=80
+        working-directory: adapters/chainlit
+      - run: uv build
+        working-directory: adapters/chainlit
+
   quality:
     runs-on: ubuntu-latest
     strategy:

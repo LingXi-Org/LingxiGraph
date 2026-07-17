@@ -1,0 +1,11 @@
+.chainlit/
+.coverage
+.mypy_cache/
+.pytest-tmp/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lingxigraph-chainlit"
+version = "0.1.0"
+description = "Standalone Chainlit adapter for embedded LingxiGraph applications."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+dependencies = [
+  "chainlit>=2.11,<3",
+  "lingxigraph>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "coverage[toml]>=7.6,<8",
+  "mypy>=1.11,<2",
+  "pytest>=9,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+lingxigraph-chainlit = "lingxigraph_chainlit.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+lingxigraph = { path = "../..", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 96
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "ASYNC"]
+ignore = ["E501", "B008", "ASYNC109", "ASYNC110"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["lingxigraph_chainlit"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+
