@@ -125,8 +125,10 @@ CREATE TABLE IF NOT EXISTS {{schema}}.store_items (
     value JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, namespace, key)
 );
+ALTER TABLE {{schema}}.store_items ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS store_items_namespace ON {{schema}}.store_items USING GIN (namespace);
 CREATE INDEX IF NOT EXISTS store_items_value ON {{schema}}.store_items USING GIN (value);
 

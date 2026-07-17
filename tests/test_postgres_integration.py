@@ -28,6 +28,22 @@ class PostgresIntegrationTests(unittest.TestCase):
         from lingxigraph.server.repository import PostgresRepository
         from lingxigraph.store.postgres import PostgresStore
 
+        # Simulate a database created before store item TTL support. Repository
+        # setup must upgrade it before PostgresStore starts using expires_at.
+        with psycopg.connect(POSTGRES_URL) as conn:
+            conn.execute(f'CREATE SCHEMA "{self.schema}"')
+            conn.execute(
+                f'''CREATE TABLE "{self.schema}".store_items (
+                    tenant_id TEXT NOT NULL,
+                    namespace TEXT[] NOT NULL,
+                    key TEXT NOT NULL,
+                    value JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (tenant_id, namespace, key)
+                )'''
+            )
+
         async def scenario():
             repository = PostgresRepository(POSTGRES_URL, schema=self.schema)
             await repository.setup()
