@@ -10,6 +10,26 @@ conversation_id 写入用户声明的 `coze_conversations` 状态键。SSE delta
 `astream(..., stream_mode="messages"|"events")` 已可消费，Chainlit 可直接逐 token 调用
 `stream_token()`。requires_action 可交给本地工具或通过 `hitl=True` 触发耐久审批 interrupt。
 
+## 完整能力（对齐 Coze 开发者文档）
+
+- **流式返回**：SSE `conversation.message.delta` 的 `content` 逐 token 通过 messages 模式输出。
+- **思考信息流式输出**：delta 中的 `reasoning_content` 单独形成 `AIMessageChunk`，并在
+  `additional_kwargs={"reasoning": True}` 上打标，Chainlit 侧据此渲染独立的“思考中”Step；
+  完整思维链也汇总到最终 `AIMessage.additional_kwargs["reasoning_content"]`。
+- **用户问题建议（follow-up）**：`conversation.message.completed` 中 `type == "follow_up"`
+  的消息被收集为建议问题，写入最终 `AIMessage.additional_kwargs["follow_ups"]` 与
+  `response_metadata["follow_ups"]`；若 `CozeAgentNode(suggestions_key=...)` 指定了状态键
+  （且图 state schema 已声明），也会写入该键。非流式轮询路径从 `chat/message/list` 的
+  `type == "follow_up"` 条目提取，逻辑一致。
+- **文件上传**：`AsyncCozeClient.upload_file(content, filename=..., content_type=...)` 调用
+  `/v1/files/upload`（multipart），返回含 `id` 的文件元数据。用 `file_object(file_id)` /
+  `image_object(file_id)` / `text_object(text)` 构造 `object_string` 项，放入
+  `HumanMessage(additional_kwargs={"objects": [...]})`；`_message_to_coze` 会自动切换为
+  `content_type="object_string"`，并在缺省时把消息正文补成首个 text 项。
+
+`suggestions_key` 默认 `None`：只有显式指定且 state schema 声明该键时才写入，避免破坏严格
+schema 的图。
+
 `CozeWorkflowNode` 遇到工作流 interrupt 时返回 `coze_workflow_question`。恢复值必须回显
 `event_id`、`interrupt_type` 和 `resume_data`，例如：
 

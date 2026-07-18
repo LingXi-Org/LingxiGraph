@@ -23,6 +23,9 @@ from lingxigraph.integrations.coze import (
     CozeAgentNode,
     CozeChatModel,
     CozeWorkflowNode,
+    _message_to_coze,
+    file_object,
+    image_object,
 )
 from lingxigraph.integrations.openai_compat import OpenAICompatChatModel
 
@@ -260,6 +263,123 @@ class IntegrationV2Tests(unittest.TestCase):
             self.assertEqual(client.submitted[0:2], ("conv", "chat"))
 
         asyncio.run(run())
+
+
+class CozeCompleteFeatureTests(unittest.TestCase):
+    def test_file_upload_multipart_and_object_string(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["content_type"] = request.headers.get("content-type", "")
+            captured["body"] = request.content
+            return httpx.Response(200, json={"code": 0, "data": {"id": "file-123"}})
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            result = await client.upload_file(
+                b"hello", filename="a.txt", content_type="text/plain"
+            )
+            self.assertEqual(result["id"], "file-123")
+            await client.aclose()
+
+        asyncio.run(run())
+        self.assertEqual(captured["path"], "/v1/files/upload")
+        self.assertTrue(captured["content_type"].startswith("multipart/form-data"))
+        self.assertIn(b"hello", captured["body"])
+
+        # An object_string message carries text plus file/image references.
+        message = HumanMessage(
+            "look at these",
+            additional_kwargs={"objects": [file_object("f1"), image_object("i1")]},
+        )
+        encoded = _message_to_coze(message)
+        self.assertEqual(encoded["content_type"], "object_string")
+        items = json.loads(encoded["content"])
+        self.assertEqual(items[0], {"type": "text", "text": "look at these"})
+        self.assertEqual(items[1], {"type": "file", "file_id": "f1"})
+        self.assertEqual(items[2], {"type": "image", "file_id": "i1"})
+
+    def test_reasoning_and_follow_up_streaming(self) -> None:
+        body = (
+            "event: conversation.chat.created\n"
+            'data: {"id":"chat-1","conversation_id":"conv-1"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m1","reasoning_content":"let me think"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m1","content":"answer"}\n\n'
+            "event: conversation.message.completed\n"
+            'data: {"id":"m2","type":"follow_up","content":"want more?"}\n\n'
+            "event: done\ndata: [DONE]\n\n"
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=body, headers={"content-type": "text/event-stream"}
+            )
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            model = CozeChatModel("bot", client=client, user_id="user")
+            # agenerate splits reasoning, content, and follow-ups.
+            result = await model.agenerate([HumanMessage("hi")])
+            self.assertEqual(result.content, "answer")
+            self.assertEqual(result.additional_kwargs["reasoning_content"], "let me think")
+            self.assertEqual(result.additional_kwargs["follow_ups"], ("want more?",))
+            self.assertEqual(result.response_metadata["follow_ups"], ("want more?",))
+            # astream tags reasoning chunks so the UI can route them separately.
+            chunks = [chunk async for chunk in model.astream([HumanMessage("hi")])]
+            reasoning = [c.content for c in chunks if c.additional_kwargs.get("reasoning")]
+            answer = [c.content for c in chunks if not c.additional_kwargs.get("reasoning")]
+            self.assertEqual("".join(reasoning), "let me think")
+            self.assertEqual("".join(answer), "answer")
+            await client.aclose()
+
+        asyncio.run(run())
+
+    def test_agent_node_surfaces_reasoning_and_follow_ups(self) -> None:
+        class FakeClient:
+            async def chat_stream(self, *args, **kwargs):
+                del args, kwargs
+                yield {
+                    "event": "conversation.chat.created",
+                    "data": {"id": "chat", "conversation_id": "conv"},
+                }
+                yield {
+                    "event": "conversation.message.delta",
+                    "data": {"id": "chat", "reasoning_content": "thinking..."},
+                }
+                yield {
+                    "event": "conversation.message.delta",
+                    "data": {"id": "chat", "content": "done"},
+                }
+                yield {
+                    "event": "conversation.message.completed",
+                    "data": {"type": "follow_up", "content": "next?"},
+                }
+
+        class AgentState(TypedDict):
+            messages: Annotated[list[Any], add_messages]
+            coze_conversations: dict[str, str]
+            coze_suggestions: tuple[str, ...]
+
+        node = CozeAgentNode(
+            "bot", client=FakeClient(), user_id="user", suggestions_key="coze_suggestions"
+        )
+        builder = StateGraph(AgentState)
+        builder.add_node("coze", node).add_edge(START, "coze").add_edge("coze", END)
+        result = builder.compile().invoke(
+            {
+                "messages": [HumanMessage("go")],
+                "coze_conversations": {},
+                "coze_suggestions": (),
+            }
+        )
+        final = result["messages"][-1]
+        self.assertEqual(final.content, "done")
+        self.assertEqual(final.additional_kwargs["reasoning_content"], "thinking...")
+        self.assertEqual(final.additional_kwargs["follow_ups"], ("next?",))
+        self.assertEqual(result["coze_suggestions"], ("next?",))
 
 
 if __name__ == "__main__":

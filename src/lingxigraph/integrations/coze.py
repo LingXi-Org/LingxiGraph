@@ -36,6 +36,7 @@ _ENDPOINTS = {
     "submit_tool_outputs": "/v3/chat/submit_tool_outputs",
     "cancel_chat": "/v3/chat/cancel",
     "conversation": "/v1/conversation/create",
+    "files_upload": "/v1/files/upload",
     "workflow": "/v1/workflow/run",
     "workflow_stream": "/v1/workflow/stream_run",
     "workflow_resume": "/v1/workflow/stream_resume",
@@ -109,12 +110,15 @@ class AsyncCozeClient:
         *,
         operation_key: str,
         last_event_id: str | None = None,
+        content_type: str | None = "application/json",
     ) -> dict[str, str]:
         token = self._token
         if token is None and self._token_provider is not None:
             provided = self._token_provider()
             token = await provided if inspect.isawaitable(provided) else provided
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {token}"}
+        if content_type is not None:
+            headers["Content-Type"] = content_type
         try:
             runtime = get_runtime()
             runtime.raise_if_cancelled()
@@ -128,12 +132,16 @@ class AsyncCozeClient:
     async def _request(self, method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         response: httpx.Response | None = None
         operation_key = str(uuid4())
+        # httpx sets the multipart Content-Type (with boundary) itself, so drop ours.
+        content_type = None if "files" in kwargs else "application/json"
         for attempt in range(self.max_retries + 1):
             try:
                 response = await self._client.request(
                     method,
                     _ENDPOINTS[endpoint],
-                    headers=await self._headers(operation_key=operation_key),
+                    headers=await self._headers(
+                        operation_key=operation_key, content_type=content_type
+                    ),
                     **kwargs,
                 )
                 if should_retry_status(response.status_code) and attempt < self.max_retries:
@@ -266,6 +274,26 @@ class AsyncCozeClient:
     async def create_conversation(self, messages: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
         return await self._request("POST", "conversation", json={"messages": list(messages)})
 
+    async def upload_file(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> dict[str, Any]:
+        """Upload a file to Coze and return its metadata (including ``id``).
+
+        The returned ``id`` is referenced from ``additional_messages`` via an
+        ``object_string`` content item (see :func:`file_object` /
+        :func:`image_object`).
+        """
+
+        return await self._request(
+            "POST",
+            "files_upload",
+            files={"file": (filename, content, content_type)},
+        )
+
     async def workflow_run(self, workflow_id: str, parameters: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         return await self._request(
             "POST", "workflow", json={"workflow_id": workflow_id, "parameters": dict(parameters), **kwargs}
@@ -298,9 +326,41 @@ class AsyncCozeClient:
         await self._client.aclose()
 
 
+def file_object(file_id: str) -> dict[str, str]:
+    """Build a Coze ``object_string`` item that references an uploaded file."""
+
+    return {"type": "file", "file_id": str(file_id)}
+
+
+def image_object(file_id: str) -> dict[str, str]:
+    """Build a Coze ``object_string`` item that references an uploaded image."""
+
+    return {"type": "image", "file_id": str(file_id)}
+
+
+def text_object(text: str) -> dict[str, str]:
+    """Build a Coze ``object_string`` text item."""
+
+    return {"type": "text", "text": str(text)}
+
+
 def _message_to_coze(message: AnyMessage) -> dict[str, Any]:
     role = {"human": "user", "ai": "assistant"}.get(message.type, message.type)
-    data: dict[str, Any] = {"role": role, "content": message.content, "content_type": "text"}
+    # Multimodal messages carry object_string items in additional_kwargs["objects"];
+    # when present we emit a Coze object_string message (text + file/image refs).
+    objects = message.additional_kwargs.get("objects")
+    if objects:
+        items = list(objects)
+        text = str(message.content or "")
+        if text and not any(item.get("type") == "text" for item in items):
+            items = [text_object(text), *items]
+        data: dict[str, Any] = {
+            "role": role,
+            "content": json.dumps(items, ensure_ascii=False),
+            "content_type": "object_string",
+        }
+    else:
+        data = {"role": role, "content": message.content, "content_type": "text"}
     if isinstance(message, ToolMessage):
         data["tool_call_id"] = message.tool_call_id
     return data
@@ -323,6 +383,34 @@ def _extract_tool_calls(data: Mapping[str, Any]) -> tuple[ToolCall, ...]:
     return tuple(calls)
 
 
+def _extract_follow_up(data: Mapping[str, Any]) -> str | None:
+    """Return the follow-up question text from a completed message event, if any."""
+
+    if data.get("type") != "follow_up":
+        return None
+    content = str(data.get("content", "")).strip()
+    return content or None
+
+
+def _split_answer_and_follow_ups(
+    items: Sequence[Mapping[str, Any]],
+) -> tuple[str, list[str]]:
+    """Split polled chat messages into the assistant answer and follow-up prompts."""
+
+    answer_parts: list[str] = []
+    follow_ups: list[str] = []
+    for item in items:
+        if item.get("role") != "assistant":
+            continue
+        if item.get("type") == "follow_up":
+            text = str(item.get("content", "")).strip()
+            if text:
+                follow_ups.append(text)
+        elif item.get("type") in (None, "answer"):
+            answer_parts.append(str(item.get("content", "")))
+    return "".join(answer_parts), follow_ups
+
+
 @dataclass(slots=True)
 class CozeAgentNode:
     bot_id: str
@@ -330,6 +418,9 @@ class CozeAgentNode:
     user_id: str
     messages_key: str = "messages"
     conversation_key: str = "coze_conversations"
+    # State key for follow-up suggestions. Only written when the graph's state
+    # schema declares it (opt-in), so strict schemas are never broken.
+    suggestions_key: str | None = None
     stream: bool = True
     tools: Sequence[ToolSpec | Callable[..., Any]] | None = None
     hitl: bool = False
@@ -342,6 +433,8 @@ class CozeAgentNode:
         conversation_id = conversations.get(self.bot_id)
         messages = [_message_to_coze(item) for item in state.get(self.messages_key, ())]
         content = ""
+        reasoning = ""
+        suggestions: list[str] = []
         chat_id: str | None = None
         tool_calls: tuple[ToolCall, ...] = ()
         if self.stream:
@@ -360,11 +453,27 @@ class CozeAgentNode:
                         ) or None
                     runtime.raise_if_cancelled()
                     if kind == "conversation.message.delta":
+                        reasoning_delta = str(data.get("reasoning_content", "") or "")
+                        if reasoning_delta:
+                            reasoning += reasoning_delta
+                            runtime.emit_message(
+                                AIMessageChunk(
+                                    reasoning_delta,
+                                    id=chat_id,
+                                    additional_kwargs={"reasoning": True},
+                                ),
+                                {"provider": "coze", "channel": "reasoning"},
+                            )
                         delta = str(data.get("content", ""))
-                        content += delta
-                        runtime.emit_message(
-                            AIMessageChunk(delta, id=chat_id), {"provider": "coze"}
-                        )
+                        if delta:
+                            content += delta
+                            runtime.emit_message(
+                                AIMessageChunk(delta, id=chat_id), {"provider": "coze"}
+                            )
+                    elif kind == "conversation.message.completed":
+                        suggestion = _extract_follow_up(data)
+                        if suggestion is not None:
+                            suggestions.append(suggestion)
                     elif kind == "conversation.chat.requires_action":
                         tool_calls = _extract_tool_calls(data)
                     elif kind in {"conversation.chat.failed", "error"}:
@@ -392,9 +501,7 @@ class CozeAgentNode:
                 tool_calls = _extract_tool_calls(chat)
             else:
                 items = await self.client.chat_messages(conversation_id, chat_id)
-                content = "".join(
-                    str(item.get("content", "")) for item in items if item.get("role") == "assistant"
-                )
+                content, suggestions = _split_answer_and_follow_ups(items)
         if runtime.cancelled and conversation_id and chat_id:
             await self.client.cancel_chat(conversation_id, chat_id)
         if tool_calls:
@@ -443,11 +550,7 @@ class CozeAgentNode:
                         tool_calls = _extract_tool_calls(chat)
                         continue
                     items = await self.client.chat_messages(conversation_id, chat_id)
-                    content = "".join(
-                        str(item.get("content", ""))
-                        for item in items
-                        if item.get("role") == "assistant"
-                    )
+                    content, suggestions = _split_answer_and_follow_ups(items)
                     tool_calls = ()
                     break
                 else:
@@ -456,16 +559,29 @@ class CozeAgentNode:
                     )
         if conversation_id:
             conversations[self.bot_id] = conversation_id
-        return {
+        additional_kwargs: dict[str, Any] = {}
+        if reasoning:
+            additional_kwargs["reasoning_content"] = reasoning
+        if suggestions:
+            additional_kwargs["follow_ups"] = tuple(suggestions)
+        result: dict[str, Any] = {
             self.messages_key: [
                 AIMessage(
                     content,
                     tool_calls=tool_calls,
-                    response_metadata={"conversation_id": conversation_id, "chat_id": chat_id},
+                    additional_kwargs=additional_kwargs,
+                    response_metadata={
+                        "conversation_id": conversation_id,
+                        "chat_id": chat_id,
+                        "follow_ups": tuple(suggestions),
+                    },
                 )
             ],
             self.conversation_key: conversations,
         }
+        if self.suggestions_key is not None:
+            result[self.suggestions_key] = tuple(suggestions)
+        return result
 
 
 @dataclass(slots=True)
@@ -555,18 +671,19 @@ class CozeChatModel:
                         },
                     )
                 items = await self.client.chat_messages(str(conversation_id), str(chat_id))
+                answer, follow_ups = _split_answer_and_follow_ups(items)
                 return AIMessage(
-                    "".join(
-                        str(item.get("content", ""))
-                        for item in items
-                        if item.get("role") == "assistant"
-                    ),
+                    answer,
+                    additional_kwargs={"follow_ups": tuple(follow_ups)} if follow_ups else {},
                     response_metadata={
                         "conversation_id": conversation_id,
                         "chat_id": chat_id,
+                        "follow_ups": tuple(follow_ups),
                     },
                 )
         content = ""
+        reasoning = ""
+        follow_ups: list[str] = []
         calls: tuple[ToolCall, ...] = ()
         metadata: dict[str, Any] = {}
         async for event in self.client.chat_stream(
@@ -578,13 +695,26 @@ class CozeChatModel:
             data = event.get("data", {})
             if event["event"] == "conversation.message.delta":
                 content += str(data.get("content", ""))
+                reasoning += str(data.get("reasoning_content", "") or "")
+            elif event["event"] == "conversation.message.completed":
+                suggestion = _extract_follow_up(data)
+                if suggestion is not None:
+                    follow_ups.append(suggestion)
             elif event["event"] == "conversation.chat.requires_action":
                 calls = _extract_tool_calls(data)
             if isinstance(data, Mapping):
                 metadata.update(
                     {key: data[key] for key in ("conversation_id", "chat_id") if key in data}
                 )
-        return AIMessage(content, tool_calls=calls, response_metadata=metadata)
+        additional_kwargs: dict[str, Any] = {}
+        if reasoning:
+            additional_kwargs["reasoning_content"] = reasoning
+        if follow_ups:
+            additional_kwargs["follow_ups"] = tuple(follow_ups)
+        metadata["follow_ups"] = tuple(follow_ups)
+        return AIMessage(
+            content, tool_calls=calls, additional_kwargs=additional_kwargs, response_metadata=metadata
+        )
 
     async def astream(
         self, messages: Sequence[AnyMessage], *, tools=None, **kwargs: Any
@@ -598,7 +728,16 @@ class CozeChatModel:
         ):
             if event["event"] == "conversation.message.delta":
                 data = event.get("data", {})
-                yield AIMessageChunk(str(data.get("content", "")), id=data.get("id"))
+                reasoning_delta = str(data.get("reasoning_content", "") or "")
+                if reasoning_delta:
+                    yield AIMessageChunk(
+                        reasoning_delta,
+                        id=data.get("id"),
+                        additional_kwargs={"reasoning": True},
+                    )
+                content_delta = str(data.get("content", ""))
+                if content_delta:
+                    yield AIMessageChunk(content_delta, id=data.get("id"))
 
 
 __all__ = [
@@ -606,4 +745,7 @@ __all__ = [
     "CozeAgentNode",
     "CozeChatModel",
     "CozeWorkflowNode",
+    "file_object",
+    "image_object",
+    "text_object",
 ]

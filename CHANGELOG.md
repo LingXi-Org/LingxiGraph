@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Coze 集成补齐开发者文档全量能力：`AsyncCozeClient.upload_file` 走 `/v1/files/upload`
+  （multipart）；新增 `file_object`/`image_object`/`text_object` 与 `object_string` 消息编码，
+  支持在 `additional_messages` 中携带文件/图片。
+- `CozeAgentNode`/`CozeChatModel` 流式输出 `reasoning_content`（思考信息，打
+  `additional_kwargs={"reasoning": True}` 标记）并收集 `follow_up` 用户问题建议，写入最终
+  `AIMessage.additional_kwargs`（`reasoning_content`/`follow_ups`）与 `response_metadata`。
+  `CozeAgentNode(suggestions_key=...)` 可选把建议写入 state（默认 `None`，不破坏严格 schema）。
+
 ## 2.0.0
 
 - 完成 MVP P0/P1 硬化：强类型 state/output/工具参数校验、结构化输出修复、工具权限/审批/
