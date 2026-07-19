@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.1
 
 - Coze 集成补齐开发者文档全量能力：`AsyncCozeClient.upload_file` 走 `/v1/files/upload`
   （multipart）；新增 `file_object`/`image_object`/`text_object` 与 `object_string` 消息编码，
