@@ -757,15 +757,17 @@ class CozeChatModel:
                         },
                     )
                 items = await self.client.chat_messages(str(conversation_id), str(chat_id))
-                answer, follow_ups = _split_answer_and_follow_ups(items)
+                answer, tool_follow_ups = _split_answer_and_follow_ups(items)
                 return AIMessage(
                     answer,
                     usage=dict(chat["usage"]) if isinstance(chat.get("usage"), Mapping) else {},
-                    additional_kwargs={"follow_ups": tuple(follow_ups)} if follow_ups else {},
+                    additional_kwargs=(
+                        {"follow_ups": tuple(tool_follow_ups)} if tool_follow_ups else {}
+                    ),
                     response_metadata={
                         "conversation_id": conversation_id,
                         "chat_id": chat_id,
-                        "follow_ups": tuple(follow_ups),
+                        "follow_ups": tuple(tool_follow_ups),
                     },
                 )
         content = ""
