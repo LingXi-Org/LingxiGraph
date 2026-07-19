@@ -9,6 +9,14 @@
   `additional_kwargs={"reasoning": True}` 标记）并收集 `follow_up` 用户问题建议，写入最终
   `AIMessage.additional_kwargs`（`reasoning_content`/`follow_ups`）与 `response_metadata`。
   `CozeAgentNode(suggestions_key=...)` 可选把建议写入 state（默认 `None`，不破坏严格 schema）。
+- 修复：`conversation.message.delta`/`.completed` 流式路径此前未按 `data.type` 过滤，
+  `verbose`（多智能体 jump 信息）、`function_call`、`knowledge_recall` 等非正文消息会被
+  错误拼接进可见回答；新增 `_is_answer_delta` 只放行 `type in (None, "answer")`。
+- 新增会话/消息管理端点：`conversation_retrieve`、`conversation_message_create`、
+  `conversation_message_list`（游标分页）、`conversation_message_retrieve`；新增
+  `file_retrieve`（查询上传文件状态）与 `bot_retrieve`（bot 元信息）。
+- `conversation.chat.completed` 的 `usage`（`token_count`/`input_count`/`output_count`）
+  现在会写入最终 `AIMessage.usage`，流式与轮询路径均覆盖。
 
 ## 2.0.0
 

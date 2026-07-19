@@ -36,7 +36,13 @@ _ENDPOINTS = {
     "submit_tool_outputs": "/v3/chat/submit_tool_outputs",
     "cancel_chat": "/v3/chat/cancel",
     "conversation": "/v1/conversation/create",
+    "conversation_retrieve": "/v1/conversation/retrieve",
+    "conversation_message_create": "/v1/conversation/message/create",
+    "conversation_message_list": "/v1/conversation/message/list",
+    "conversation_message_retrieve": "/v1/conversation/message/retrieve",
     "files_upload": "/v1/files/upload",
+    "files_retrieve": "/v1/files/retrieve",
+    "bot_retrieve": "/v1/bot/get_online_info",
     "workflow": "/v1/workflow/run",
     "workflow_stream": "/v1/workflow/stream_run",
     "workflow_resume": "/v1/workflow/stream_resume",
@@ -274,6 +280,65 @@ class AsyncCozeClient:
     async def create_conversation(self, messages: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
         return await self._request("POST", "conversation", json={"messages": list(messages)})
 
+    async def conversation_retrieve(self, conversation_id: str) -> dict[str, Any]:
+        return await self._request(
+            "GET", "conversation_retrieve", params={"conversation_id": conversation_id}
+        )
+
+    async def conversation_message_create(
+        self, conversation_id: str, *, role: str, content: str, content_type: str = "text"
+    ) -> dict[str, Any]:
+        """Append a message to a conversation without triggering a chat run."""
+        return await self._request(
+            "POST",
+            "conversation_message_create",
+            params={"conversation_id": conversation_id},
+            json={"role": role, "content": content, "content_type": content_type},
+        )
+
+    async def conversation_message_list(
+        self,
+        conversation_id: str,
+        *,
+        order: str = "desc",
+        chat_id: str | None = None,
+        before_id: str | None = None,
+        after_id: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List messages in a conversation with cursor pagination.
+
+        Returns a mapping with ``items``, ``first_id``, ``last_id`` and ``has_more``.
+        """
+        body: dict[str, Any] = {"order": order, "limit": limit}
+        if chat_id:
+            body["chat_id"] = chat_id
+        if before_id:
+            body["before_id"] = before_id
+        if after_id:
+            body["after_id"] = after_id
+        return await self._request(
+            "POST",
+            "conversation_message_list",
+            params={"conversation_id": conversation_id},
+            json=body,
+        )
+
+    async def conversation_message_retrieve(
+        self, conversation_id: str, message_id: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "conversation_message_retrieve",
+            params={"conversation_id": conversation_id, "message_id": message_id},
+        )
+
+    async def file_retrieve(self, file_id: str) -> dict[str, Any]:
+        return await self._request("GET", "files_retrieve", params={"file_id": file_id})
+
+    async def bot_retrieve(self, bot_id: str) -> dict[str, Any]:
+        return await self._request("GET", "bot_retrieve", params={"bot_id": bot_id})
+
     async def upload_file(
         self,
         content: bytes,
@@ -383,6 +448,17 @@ def _extract_tool_calls(data: Mapping[str, Any]) -> tuple[ToolCall, ...]:
     return tuple(calls)
 
 
+def _is_answer_delta(data: Mapping[str, Any]) -> bool:
+    """True if a message.delta/completed event carries the visible answer text.
+
+    Coze multiplexes ``function_call``, ``tool_output``, ``verbose`` (e.g. multi-agent
+    jump info) and ``knowledge_recall`` payloads onto the same event names as the
+    real answer; only ``type in (None, "answer")`` should be shown to the user.
+    """
+
+    return data.get("type") in (None, "answer")
+
+
 def _extract_follow_up(data: Mapping[str, Any]) -> str | None:
     """Return the follow-up question text from a completed message event, if any."""
 
@@ -437,6 +513,7 @@ class CozeAgentNode:
         suggestions: list[str] = []
         chat_id: str | None = None
         tool_calls: tuple[ToolCall, ...] = ()
+        usage: dict[str, Any] = {}
         if self.stream:
             try:
                 async for event in self.client.chat_stream(
@@ -464,7 +541,7 @@ class CozeAgentNode:
                                 ),
                                 {"provider": "coze", "channel": "reasoning"},
                             )
-                        delta = str(data.get("content", ""))
+                        delta = str(data.get("content", "")) if _is_answer_delta(data) else ""
                         if delta:
                             content += delta
                             runtime.emit_message(
@@ -474,6 +551,10 @@ class CozeAgentNode:
                         suggestion = _extract_follow_up(data)
                         if suggestion is not None:
                             suggestions.append(suggestion)
+                    elif kind == "conversation.chat.completed":
+                        raw_usage = data.get("usage") if isinstance(data, Mapping) else None
+                        if isinstance(raw_usage, Mapping):
+                            usage = dict(raw_usage)
                     elif kind == "conversation.chat.requires_action":
                         tool_calls = _extract_tool_calls(data)
                     elif kind in {"conversation.chat.failed", "error"}:
@@ -500,6 +581,8 @@ class CozeAgentNode:
             if chat.get("status") == "requires_action":
                 tool_calls = _extract_tool_calls(chat)
             else:
+                if isinstance(chat.get("usage"), Mapping):
+                    usage = dict(chat["usage"])
                 items = await self.client.chat_messages(conversation_id, chat_id)
                 content, suggestions = _split_answer_and_follow_ups(items)
         if runtime.cancelled and conversation_id and chat_id:
@@ -549,6 +632,8 @@ class CozeAgentNode:
                     if chat.get("status") == "requires_action":
                         tool_calls = _extract_tool_calls(chat)
                         continue
+                    if isinstance(chat.get("usage"), Mapping):
+                        usage = dict(chat["usage"])
                     items = await self.client.chat_messages(conversation_id, chat_id)
                     content, suggestions = _split_answer_and_follow_ups(items)
                     tool_calls = ()
@@ -569,6 +654,7 @@ class CozeAgentNode:
                 AIMessage(
                     content,
                     tool_calls=tool_calls,
+                    usage=usage,
                     additional_kwargs=additional_kwargs,
                     response_metadata={
                         "conversation_id": conversation_id,
@@ -674,6 +760,7 @@ class CozeChatModel:
                 answer, follow_ups = _split_answer_and_follow_ups(items)
                 return AIMessage(
                     answer,
+                    usage=dict(chat["usage"]) if isinstance(chat.get("usage"), Mapping) else {},
                     additional_kwargs={"follow_ups": tuple(follow_ups)} if follow_ups else {},
                     response_metadata={
                         "conversation_id": conversation_id,
@@ -686,6 +773,7 @@ class CozeChatModel:
         follow_ups: list[str] = []
         calls: tuple[ToolCall, ...] = ()
         metadata: dict[str, Any] = {}
+        usage: dict[str, Any] = {}
         async for event in self.client.chat_stream(
             self.bot_id,
             self.user_id,
@@ -694,12 +782,17 @@ class CozeChatModel:
         ):
             data = event.get("data", {})
             if event["event"] == "conversation.message.delta":
-                content += str(data.get("content", ""))
+                if _is_answer_delta(data):
+                    content += str(data.get("content", ""))
                 reasoning += str(data.get("reasoning_content", "") or "")
             elif event["event"] == "conversation.message.completed":
                 suggestion = _extract_follow_up(data)
                 if suggestion is not None:
                     follow_ups.append(suggestion)
+            elif event["event"] == "conversation.chat.completed":
+                raw_usage = data.get("usage") if isinstance(data, Mapping) else None
+                if isinstance(raw_usage, Mapping):
+                    usage = dict(raw_usage)
             elif event["event"] == "conversation.chat.requires_action":
                 calls = _extract_tool_calls(data)
             if isinstance(data, Mapping):
@@ -713,7 +806,11 @@ class CozeChatModel:
             additional_kwargs["follow_ups"] = tuple(follow_ups)
         metadata["follow_ups"] = tuple(follow_ups)
         return AIMessage(
-            content, tool_calls=calls, additional_kwargs=additional_kwargs, response_metadata=metadata
+            content,
+            tool_calls=calls,
+            usage=usage,
+            additional_kwargs=additional_kwargs,
+            response_metadata=metadata,
         )
 
     async def astream(
@@ -735,7 +832,7 @@ class CozeChatModel:
                         id=data.get("id"),
                         additional_kwargs={"reasoning": True},
                     )
-                content_delta = str(data.get("content", ""))
+                content_delta = str(data.get("content", "")) if _is_answer_delta(data) else ""
                 if content_delta:
                     yield AIMessageChunk(content_delta, id=data.get("id"))
 

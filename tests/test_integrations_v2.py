@@ -381,6 +381,183 @@ class CozeCompleteFeatureTests(unittest.TestCase):
         self.assertEqual(final.additional_kwargs["follow_ups"], ("next?",))
         self.assertEqual(result["coze_suggestions"], ("next?",))
 
+    def test_verbose_and_function_call_deltas_do_not_leak_into_answer(self) -> None:
+        # Coze multiplexes verbose (multi-agent jump), function_call, and
+        # knowledge_recall deltas onto the same event name as the real answer;
+        # only type in (None, "answer") should ever reach visible content.
+        body = (
+            "event: conversation.chat.created\n"
+            'data: {"id":"chat-1","conversation_id":"conv-1"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m0","type":"verbose","content":"{\\"msg_type\\":\\"jump_to\\"}"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m1","type":"answer","content":"real "}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m2","type":"knowledge_recall","content":"[recalled chunk]"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m1","type":"answer","content":"answer"}\n\n'
+            "event: done\ndata: [DONE]\n\n"
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=body, headers={"content-type": "text/event-stream"}
+            )
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            model = CozeChatModel("bot", client=client, user_id="user")
+            result = await model.agenerate([HumanMessage("hi")])
+            self.assertEqual(result.content, "real answer")
+            chunks = [chunk async for chunk in model.astream([HumanMessage("hi")])]
+            self.assertEqual("".join(c.content for c in chunks), "real answer")
+            await client.aclose()
+
+        asyncio.run(run())
+
+        class FakeClient:
+            async def chat_stream(self, *args, **kwargs):
+                del args, kwargs
+                yield {
+                    "event": "conversation.chat.created",
+                    "data": {"id": "chat", "conversation_id": "conv"},
+                }
+                yield {
+                    "event": "conversation.message.delta",
+                    "data": {"id": "chat", "type": "verbose", "content": "jump info"},
+                }
+                yield {
+                    "event": "conversation.message.delta",
+                    "data": {"id": "chat", "type": "answer", "content": "clean answer"},
+                }
+
+        class AgentState(TypedDict):
+            messages: Annotated[list[Any], add_messages]
+            coze_conversations: dict[str, str]
+
+        node = CozeAgentNode("bot", client=FakeClient(), user_id="user")
+        builder = StateGraph(AgentState)
+        builder.add_node("coze", node).add_edge(START, "coze").add_edge("coze", END)
+        result = builder.compile().invoke(
+            {"messages": [HumanMessage("go")], "coze_conversations": {}}
+        )
+        self.assertEqual(result["messages"][-1].content, "clean answer")
+
+    def test_token_usage_extracted_from_chat_completed(self) -> None:
+        body = (
+            "event: conversation.chat.created\n"
+            'data: {"id":"chat-1","conversation_id":"conv-1"}\n\n'
+            "event: conversation.message.delta\n"
+            'data: {"id":"m1","type":"answer","content":"hi"}\n\n'
+            "event: conversation.chat.completed\n"
+            'data: {"id":"chat-1","conversation_id":"conv-1",'
+            '"usage":{"token_count":30,"input_count":10,"output_count":20}}\n\n'
+            "event: done\ndata: [DONE]\n\n"
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=body, headers={"content-type": "text/event-stream"}
+            )
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            model = CozeChatModel("bot", client=client, user_id="user")
+            result = await model.agenerate([HumanMessage("hi")])
+            self.assertEqual(
+                result.usage,
+                {"token_count": 30, "input_count": 10, "output_count": 20},
+            )
+            await client.aclose()
+
+        asyncio.run(run())
+
+        class FakeClient:
+            async def chat_stream(self, *args, **kwargs):
+                del args, kwargs
+                yield {
+                    "event": "conversation.chat.created",
+                    "data": {"id": "chat", "conversation_id": "conv"},
+                }
+                yield {
+                    "event": "conversation.message.delta",
+                    "data": {"id": "chat", "type": "answer", "content": "hi"},
+                }
+                yield {
+                    "event": "conversation.chat.completed",
+                    "data": {"usage": {"token_count": 30, "input_count": 10, "output_count": 20}},
+                }
+
+        class AgentState(TypedDict):
+            messages: Annotated[list[Any], add_messages]
+            coze_conversations: dict[str, str]
+
+        node = CozeAgentNode("bot", client=FakeClient(), user_id="user")
+        builder = StateGraph(AgentState)
+        builder.add_node("coze", node).add_edge(START, "coze").add_edge("coze", END)
+        result = builder.compile().invoke(
+            {"messages": [HumanMessage("go")], "coze_conversations": {}}
+        )
+        self.assertEqual(
+            result["messages"][-1].usage,
+            {"token_count": 30, "input_count": 10, "output_count": 20},
+        )
+
+    def test_conversation_message_and_file_and_bot_endpoints(self) -> None:
+        paths: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == "/v1/conversation/message/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": "msg-1", "content": "hi"}],
+                            "first_id": "msg-1",
+                            "last_id": "msg-1",
+                            "has_more": False,
+                        },
+                    },
+                )
+            if request.url.path == "/v1/files/retrieve":
+                return httpx.Response(
+                    200, json={"code": 0, "data": {"id": "file-1", "status": "processed"}}
+                )
+            if request.url.path == "/v1/bot/get_online_info":
+                return httpx.Response(
+                    200, json={"code": 0, "data": {"bot_id": "bot-1", "name": "Assistant"}}
+                )
+            return httpx.Response(200, json={"code": 0, "data": {"id": "ok"}})
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            await client.conversation_retrieve("conv")
+            await client.conversation_message_create("conv", role="user", content="hi")
+            listed = await client.conversation_message_list("conv", limit=10)
+            self.assertEqual(listed["items"][0]["id"], "msg-1")
+            self.assertFalse(listed["has_more"])
+            await client.conversation_message_retrieve("conv", "msg-1")
+            retrieved = await client.file_retrieve("file-1")
+            self.assertEqual(retrieved["status"], "processed")
+            bot = await client.bot_retrieve("bot-1")
+            self.assertEqual(bot["name"], "Assistant")
+            await client.aclose()
+
+        asyncio.run(run())
+        self.assertEqual(
+            paths,
+            [
+                "/v1/conversation/retrieve",
+                "/v1/conversation/message/create",
+                "/v1/conversation/message/list",
+                "/v1/conversation/message/retrieve",
+                "/v1/files/retrieve",
+                "/v1/bot/get_online_info",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

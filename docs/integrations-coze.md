@@ -25,10 +25,30 @@ conversation_id 写入用户声明的 `coze_conversations` 状态键。SSE delta
   `/v1/files/upload`（multipart），返回含 `id` 的文件元数据。用 `file_object(file_id)` /
   `image_object(file_id)` / `text_object(text)` 构造 `object_string` 项，放入
   `HumanMessage(additional_kwargs={"objects": [...]})`；`_message_to_coze` 会自动切换为
-  `content_type="object_string"`，并在缺省时把消息正文补成首个 text 项。
+  `content_type="object_string"`，并在缺省时把消息正文补成首个 text 项。`file_retrieve(file_id)`
+  可查询上传文件的处理状态/元数据。
+- **Token 用量**：`conversation.chat.completed`（流式）与轮询终态 `chat` 对象的 `usage`
+  字段（`token_count`/`input_count`/`output_count`）会写入最终 `AIMessage.usage`。
 
 `suggestions_key` 默认 `None`：只有显式指定且 state schema 声明该键时才写入，避免破坏严格
 schema 的图。
+
+### 消息 type 过滤（重要）
+
+Coze `conversation.message.delta` / `.completed` 把 `answer`、`function_call`、
+`tool_output`、`verbose`（如多智能体 jump 信息）、`knowledge_recall`、`follow_up` 等不同
+语义的消息复用同一个事件名，仅靠 `event:` 无法区分。集成内部用 `_is_answer_delta(data)`
+（即 `data["type"] in (None, "answer")`）过滤出真正要展示给用户的正文，避免 verbose/
+function_call/knowledge_recall 内容混入可见回答；`follow_up` 单独按 `_extract_follow_up`
+收集。自定义消费 `chat_stream()`/`workflow_stream()` 原始事件时也应做同样的 `type` 判断。
+
+### 会话与消息管理
+
+除 `create_conversation` 外，还提供 `conversation_retrieve`、
+`conversation_message_create`（直接向会话追加消息，不触发 chat 运行）、
+`conversation_message_list`（`before_id`/`after_id`/`limit` 游标分页，返回
+`items`/`first_id`/`last_id`/`has_more`）、`conversation_message_retrieve`。
+`bot_retrieve(bot_id)` 对应 `/v1/bot/get_online_info`，用于读取 bot 元信息。
 
 `CozeWorkflowNode` 遇到工作流 interrupt 时返回 `coze_workflow_question`。恢复值必须回显
 `event_id`、`interrupt_type` 和 `resume_data`，例如：
