@@ -3,92 +3,111 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <title>LingxiGraph Studio</title>
   <link rel="stylesheet" href="./studio.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand"><span class="brand-mark">L</span><b>LingxiGraph</b><span>Studio</span></div>
-    <div class="instance"><i></i><span>本地实例</span><b id="graphName">research_agent</b><span class="version">v2.0.0</span></div>
+    <div class="instance">
+      <i id="connDot" class="conn off"></i>
+      <span id="connText">连接中…</span>
+      <b id="graphName">—</b><span class="version" id="graphVersion"></span>
+    </div>
+    <div class="graph-picker">
+      <label for="graphSelect">Graph</label>
+      <select id="graphSelect"></select>
+      <label class="xray-toggle"><input type="checkbox" id="xrayToggle"> X-ray 子图</label>
+    </div>
     <div class="top-actions">
-      <button class="icon-btn" id="themeBtn" aria-label="切换主题">◐</button>
-      <button class="run-button" id="runButton"><span>▶</span> 运行 Graph</button>
+      <button class="icon-btn" id="refreshBtn" title="重新加载结构">⟳</button>
+      <button class="icon-btn" id="themeBtn" title="切换主题">◐</button>
+      <button class="run-button" id="runButton"><span>▶</span> 运行</button>
     </div>
   </header>
 
   <main class="workspace">
+    <!-- LEFT: graph explorer -->
     <section class="panel graph-panel">
       <div class="panel-head">
         <div><p class="eyebrow">GRAPH EXPLORER</p><h1>图结构</h1></div>
-        <div class="segmented"><button class="active">结构</button><button>配置</button></div>
-      </div>
-      <div class="graph-tools">
-        <span><b id="nodeCount">6</b> 个节点 · <b id="edgeCount">7</b> 条边</span>
-        <div><button aria-label="缩小">−</button><button aria-label="适配">◎</button><button aria-label="放大">＋</button></div>
+        <div class="graph-tools">
+          <span><b id="nodeCount">0</b> 节点 · <b id="edgeCount">0</b> 边</span>
+        </div>
       </div>
       <div class="graph-canvas" id="graphCanvas">
-        <div class="grid"></div>
-        <div class="edge e1"></div><div class="edge e2"></div><div class="edge e3"></div><div class="edge e4"></div><div class="edge e5"></div>
-        <div class="edge-label label-yes">需要工具</div><div class="edge-label label-no">直接回答</div>
-        <button class="node start" data-node="__start__" style="--x:8%;--y:43%"><span>→</span><label>START</label></button>
-        <button class="node complete" data-node="understand" style="--x:25%;--y:43%"><span>✓</span><label>理解问题<small>LLM · 486ms</small></label></button>
-        <button class="node running" data-node="decide" style="--x:47%;--y:43%"><span>◇</span><label>决策路由<small>条件分支</small></label></button>
-        <button class="node idle upper" data-node="tools" style="--x:67%;--y:20%"><span>⌘</span><label>调用工具<small>3 tools</small></label></button>
-        <button class="node idle lower" data-node="answer" style="--x:67%;--y:66%"><span>✦</span><label>生成回答<small>LLM</small></label></button>
-        <button class="node end" data-node="__end__" style="--x:90%;--y:43%"><span>■</span><label>END</label></button>
+        <svg id="graphSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div class="empty-hint" id="graphEmpty">选择一个 Graph 以查看结构</div>
       </div>
-      <div class="node-detail" id="nodeDetail">
-        <div><span class="node-icon">◇</span><div><b>决策路由</b><small>decide · conditional</small></div></div>
-        <button aria-label="关闭详情">×</button>
-        <dl><dt>执行状态</dt><dd><i class="pulse"></i> 运行中</dd><dt>重试策略</dt><dd>最多 3 次 · 指数退避</dd><dt>下一节点</dt><dd><code>tools | answer</code></dd></dl>
+      <div class="node-detail" id="nodeDetail" hidden>
+        <div class="node-detail-head">
+          <div><span class="node-icon" id="ndIcon">◇</span>
+            <div><b id="ndName">—</b><small id="ndKind"></small></div></div>
+          <button id="ndClose" title="关闭">×</button>
+        </div>
+        <dl id="ndBody"></dl>
       </div>
     </section>
 
+    <!-- MIDDLE: run trace -->
     <section class="panel trace-panel">
       <div class="panel-head trace-head">
-        <div><p class="eyebrow">RUN TRACE VIEWER</p><h2>运行轨迹 <span class="live"><i></i> LIVE</span></h2></div>
-        <button class="more">•••</button>
+        <div><p class="eyebrow">RUN TRACE</p><h2>运行轨迹 <span class="live" id="liveTag" hidden><i></i> LIVE</span></h2></div>
+        <div class="run-input">
+          <input id="inputBox" placeholder='输入 JSON，如 {"request":"你好"}' spellcheck="false">
+        </div>
       </div>
       <div class="run-summary">
-        <div><span class="status-dot"></span><p><b id="runStatus">运行中</b><small id="runId">run_8f2a…c91d</small></p></div>
-        <div><small>总耗时</small><b id="totalTime">1.42s</b></div>
-        <div><small>Token</small><b>1,284</b></div>
+        <div><span class="status-dot" id="statusDot"></span><p><b id="runStatus">空闲</b><small id="runId">尚未运行</small></p></div>
+        <div><small>耗时</small><b id="totalTime">—</b></div>
+        <div><small>事件</small><b id="eventCount">0</b></div>
       </div>
-      <div class="trace-tabs" role="tablist"><button class="active">时间线</button><button>事件流 <em>12</em></button><button>错误 <em class="zero">0</em></button></div>
+      <div class="trace-tabs" role="tablist">
+        <button class="active" data-trace="timeline">时间线</button>
+        <button data-trace="events">事件流 <em id="evBadge">0</em></button>
+        <button data-trace="errors">错误 <em id="errBadge" class="zero">0</em></button>
+      </div>
       <div class="trace-list" id="traceList">
-        <article class="trace-item done"><div class="rail"><i>✓</i></div><div class="trace-content"><div><b>理解问题</b><span>486ms</span></div><small>NODE COMPLETED · 14:32:08.124</small><p><span>输入</span>“帮我分析本季度用户流失的主要原因…”</p><p><span>输出</span><code>{ intent: "analysis", scope: "quarterly" }</code></p></div></article>
-        <article class="trace-item active"><div class="rail"><i>◇</i></div><div class="trace-content"><div><b>决策路由</b><span class="counting">216ms</span></div><small>NODE RUNNING · 14:32:08.611</small><p class="thinking"><i></i><i></i><i></i> 正在评估工具调用条件</p></div></article>
-        <article class="trace-item pending"><div class="rail"><i>3</i></div><div class="trace-content"><div><b>调用工具</b></div><small>等待执行</small></div></article>
-        <article class="trace-item pending"><div class="rail"><i>4</i></div><div class="trace-content"><div><b>生成回答</b></div><small>等待执行</small></div></article>
+        <div class="empty-hint">运行 Graph 后，节点执行轨迹会在这里实时呈现</div>
       </div>
-      <div class="stream-foot"><span><i></i> 事件流已连接</span><button id="pauseButton">Ⅱ 暂停追踪</button></div>
+      <div class="event-list hidden" id="eventList"></div>
+      <div class="error-list hidden" id="errorList"><div class="empty-hint">暂无错误</div></div>
+      <div class="stream-foot">
+        <span id="streamState"><i></i> 未连接</span>
+        <button id="cancelButton" disabled>■ 取消运行</button>
+      </div>
     </section>
 
+    <!-- RIGHT: state & checkpoint inspector -->
     <section class="panel inspector-panel">
-      <div class="panel-head"><div><p class="eyebrow">STATE &amp; CHECKPOINT</p><h2>状态检查器</h2></div><button class="more">•••</button></div>
-      <div class="checkpoint-select"><small>当前检查点</small><button id="checkpointButton"><span><i></i><b>checkpoint_004</b><small>刚刚 · step 2</small></span><em>⌄</em></button></div>
-      <div class="inspector-tabs"><button class="active" data-tab="state">状态</button><button data-tab="diff">变量变化 <em>3</em></button><button data-tab="history">历史 <em>4</em></button></div>
-      <div class="state-view" id="stateView">
-        <div class="code-toolbar"><span>StateSnapshot</span><button id="copyButton">□ 复制</button></div>
-        <pre id="stateCode"><span class="line">1</span><span class="brace">{</span>
-<span class="line">2</span>  <span class="key">"messages"</span>: <span class="brace">[</span>
-<span class="line">3</span>    <span class="brace">{</span> <span class="key">"role"</span>: <span class="str">"user"</span>,
-<span class="line">4</span>      <span class="key">"content"</span>: <span class="str">"帮我分析本季度…"</span> <span class="brace">}</span>
-<span class="line">5</span>  <span class="brace">]</span>,
-<span class="line">6</span>  <span class="key">"intent"</span>: <span class="str changed">"analysis"</span>,
-<span class="line">7</span>  <span class="key">"scope"</span>: <span class="str changed">"quarterly"</span>,
-<span class="line">8</span>  <span class="key">"tool_calls"</span>: <span class="num changed">0</span>,
-<span class="line">9</span>  <span class="key">"next"</span>: <span class="str">"decide"</span>
-<span class="line">10</span><span class="brace">}</span></pre>
+      <div class="panel-head"><div><p class="eyebrow">STATE &amp; CHECKPOINT</p><h2>状态检查器</h2></div></div>
+      <div class="checkpoint-select">
+        <small>检查点</small>
+        <select id="checkpointSelect"><option>—</option></select>
       </div>
-      <div class="state-view hidden" id="diffView"><div class="diff-row add"><i>＋</i><div><b>intent</b><code>"analysis"</code></div></div><div class="diff-row add"><i>＋</i><div><b>scope</b><code>"quarterly"</code></div></div><div class="diff-row change"><i>↗</i><div><b>tool_calls</b><code>— → 0</code></div></div></div>
-      <div class="state-view hidden" id="historyView"><ol class="history"><li class="current"><b>checkpoint_004</b><small>step 2 · 刚刚</small></li><li><b>checkpoint_003</b><small>step 1 · 1 秒前</small></li><li><b>checkpoint_002</b><small>输入已接收 · 2 秒前</small></li><li><b>checkpoint_001</b><small>运行初始化 · 2 秒前</small></li></ol></div>
-      <div class="interrupt-card"><div class="interrupt-title"><span>Ⅱ</span><div><b>Interrupt 暂停点</b><small>未触发</small></div></div><p>当 Graph 请求人工确认时，运行将在这里暂停，可检查状态后继续执行。</p><button disabled>继续运行</button></div>
-      <footer class="inspector-foot"><span>快照大小 <b>2.4 KB</b></span><span>序列化 <b>JSON</b></span></footer>
+      <div class="inspector-tabs">
+        <button class="active" data-tab="state">状态</button>
+        <button data-tab="history">历史 <em id="histBadge">0</em></button>
+        <button data-tab="explain">解释</button>
+      </div>
+      <div class="state-view" id="stateView">
+        <div class="code-toolbar"><span id="stateLabel">StateSnapshot</span><button id="copyButton">复制</button></div>
+        <pre id="stateCode" class="code"><span class="dim">运行后在此查看状态快照</span></pre>
+      </div>
+      <div class="state-view hidden" id="historyView"><div class="empty-hint">暂无历史</div></div>
+      <div class="state-view hidden" id="explainView"><div class="empty-hint">选择一个节点以查看解释</div></div>
+      <div class="interrupt-card" id="interruptCard" hidden>
+        <div class="interrupt-title"><span>Ⅱ</span><div><b>Interrupt 暂停</b><small id="interruptWhy">运行已暂停</small></div></div>
+        <textarea id="resumeValue" placeholder='resume 值 (JSON)，如 "approved"'></textarea>
+        <button id="resumeButton">继续运行</button>
+      </div>
+      <footer class="inspector-foot">
+        <span>快照 <b id="snapSize">—</b></span><span>序列化 <b>JSON</b></span>
+      </footer>
     </section>
   </main>
-  <div class="toast" id="toast">已复制状态快照</div>
+  <div class="toast" id="toast"></div>
   <script src="./studio.js"></script>
 </body>
 </html>

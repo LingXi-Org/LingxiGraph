@@ -280,28 +280,21 @@ def create_app(
     ):
         """Return the serializable topology consumed by the embedded Studio."""
         try:
-            structure = registry.get(graph_id, graph_version).get_graph(xray=xray)
+            graph = registry.get(graph_id, graph_version)
+            structure = graph.get_graph(xray=xray)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
-        return {
-            "nodes": [
-                {
-                    "id": node.id,
-                    "metadata": node.metadata,
-                    "is_subgraph": node.is_subgraph,
-                }
-                for node in structure.nodes
-            ],
-            "edges": [
-                {
-                    "source": edge.source,
-                    "target": edge.target,
-                    "conditional": edge.conditional,
-                    "label": edge.label,
-                }
-                for edge in structure.edges
-            ],
+        payload = _structure_json(structure)
+        payload["graph"] = {
+            "id": graph_id,
+            "name": getattr(graph, "graph_name", graph_id),
+            "version": getattr(graph, "graph_version", graph_version),
         }
+        try:
+            payload["mermaid"] = structure.draw_mermaid(xray=xray)
+        except Exception:  # diagram rendering must never break the endpoint
+            payload["mermaid"] = None
+        return payload
 
     @app.post("/v1/assistants", response_model=Assistant, status_code=201)
     async def create_assistant(
@@ -792,10 +785,15 @@ def create_app(
         ]
         return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
-    if embedded_worker:
-        studio_dir = Path(__file__).resolve().parent.parent / "studio"
-        if studio_dir.is_dir():
-            app.mount("/studio", StaticFiles(directory=studio_dir, html=True), name="studio")
+    studio_dir = Path(__file__).resolve().parent.parent / "studio"
+    if studio_dir.is_dir():
+        app.mount("/studio", StaticFiles(directory=studio_dir, html=True), name="studio")
+
+        @app.get("/")
+        async def studio_root():
+            from fastapi.responses import RedirectResponse
+
+            return RedirectResponse(url="/studio/")
 
     return app
 
@@ -857,6 +855,34 @@ async def _consume_rate_limit(app: FastAPI, tenant_id: str) -> None:
         if count >= limit:
             raise HTTPException(429, "tenant request-rate quota exceeded")
         app.state.rate_windows[tenant_id] = (started, count + 1)
+
+
+def _structure_json(structure) -> dict[str, Any]:
+    """Serialize a GraphInfo (with recursive xray subgraphs) for Studio."""
+
+    return {
+        "nodes": [
+            {
+                "id": node.id,
+                "kind": node.kind,
+                "metadata": node.metadata,
+                "is_subgraph": node.is_subgraph,
+                "debug": node.debug,
+                "namespace": list(node.namespace),
+                "subgraph": _structure_json(node.subgraph) if node.subgraph else None,
+            }
+            for node in structure.nodes
+        ],
+        "edges": [
+            {
+                "source": edge.source,
+                "target": edge.target,
+                "conditional": edge.conditional,
+                "label": edge.label,
+            }
+            for edge in structure.edges
+        ],
+    }
 
 
 def _snapshot_json(snapshot) -> dict[str, Any]:

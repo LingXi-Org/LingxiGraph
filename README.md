@@ -25,6 +25,9 @@ REST/SSE 协议组成的生产运行面。
 - 强类型工具参数、权限策略、secret resolver、单工具 timeout 和结构化输出校验/修复。
 - Coze Bot/工作流一等图节点、Coze ChatModel，以及 OpenAI 兼容模型适配器。
 - 实时 token/custom 流、组合流模式、图结构/Mermaid、TTL 与可插拔语义记忆。
+- `lingxigraph new/dev/build/up` 项目脚手架与开发者工作流；Docker Compose 单服务器交付。
+- 内嵌 Studio 1.0：真实 API 图浏览器、实时 SSE 运行轨迹、状态/检查点检查器、
+  节点解释与调试、X-ray 子图逐层展开。
 
 ## 嵌入式 SDK
 
@@ -118,20 +121,51 @@ HITL；`CozeWorkflowNode` 支持工作流流式输出和中断恢复。中国站
 `https://api.coze.cn`，国际站或兼容网关通过 `base_url` 配置。详见
 [Coze 集成](docs/integrations-coze.md)。
 
-## 本地生产栈
+## 快速开始（开发者工作流）
 
-安装全部平台组件：
+v2 以 **Docker Compose 单服务器部署** 为主要交付方式，并提供完整的开发者 CLI：
 
 ```bash
-pip install "lingxigraph[all]"
-docker compose up --build
+lingxigraph new my-agent      # 脚手架一个可直接运行的多智能体项目
+cd my-agent && pip install -e .
+lingxigraph dev               # 本地内存栈 + 内嵌 Worker + Studio
 ```
 
-Compose 会启动 PostgreSQL 16、Redis 7.2、迁移任务、一个 Agent Server 和两个 Worker。
-示例可信图由 [lingxigraph.json](lingxigraph.json) 注册，服务位于
-`http://localhost:8124`。本地栈启用显式的不安全开发认证；不要在生产环境使用该设置。
+`lingxigraph dev` 启动一个零外部依赖的开发服务器（内存 checkpoint/store、内嵌 Worker），
+自动打开 Studio（`http://localhost:8124/studio`），无需 PostgreSQL 或 Redis。
 
-生产环境使用：
+四个开发者命令：
+
+| 命令 | 作用 |
+| --- | --- |
+| `lingxigraph new <name>` | 脚手架项目：图模块、manifest、Docker Compose、Dockerfile |
+| `lingxigraph dev` | 内存 + 内嵌 Worker + Studio 的本地开发服务器（支持 `--reload`） |
+| `lingxigraph build` | 构建部署镜像（`--wheel` 构建 Python wheel） |
+| `lingxigraph up` | 启动 Docker Compose 单服务器栈 |
+
+## Studio 1.0
+
+内嵌 Studio 是连接真实 Agent Server 的图调试 IDE，服务于 `/studio`：
+
+- **图浏览器**：从 `/v1/graphs/{id}/structure` 渲染真实拓扑，分层布局、条件边可视化。
+- **X-ray 子图**：逐层展开嵌套子图，面包屑下钻，解释多智能体图的完整结构。
+- **实时运行轨迹**：一键运行图，通过 SSE 实时呈现节点级执行时间线与完整事件流。
+- **状态与检查点检查器**：从真实 thread 读取状态快照、历史与检查点，JSON 高亮与复制。
+- **节点解释与调试**：展示节点实现、Runtime 注入、超时/重试/并发护栏、后继与控制流解释。
+- **中断/恢复**：在 interrupt 暂停点检查状态并提交 resume 值继续运行。
+
+## 单服务器部署（Docker Compose）
+
+```bash
+docker compose up --build          # 或 lingxigraph up
+```
+
+Compose 启动 PostgreSQL 16、Redis 7.2、迁移任务，以及一个内嵌 Worker 的 Agent Server
+（`--embedded-worker`），服务位于 `http://localhost:8124`，Studio 在 `/studio`。示例可信图
+由 [lingxigraph.json](lingxigraph.json) 注册。本地栈启用显式的不安全开发认证；不要在生产环境
+使用该设置。
+
+需要独立扩展 Worker 的多进程生产部署：
 
 ```bash
 lingxigraph doctor

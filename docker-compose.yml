@@ -50,9 +50,12 @@ services:
     restart: "no"
     command: ["migrate"]
 
+  # Single-server delivery: one Agent Server with an embedded Worker, serving
+  # the REST/SSE API and the Studio UI at /studio. Scale out with the optional
+  # `worker` profile below when you need independent worker replicas.
   api:
     <<: *runtime
-    command: ["server", "--host", "0.0.0.0", "--port", "8124"]
+    command: ["server", "--host", "0.0.0.0", "--port", "8124", "--embedded-worker"]
     ports:
       - "8124:8124"
     depends_on:
@@ -65,6 +68,7 @@ services:
 
   worker:
     <<: *runtime
+    profiles: ["scale"]
     command: ["worker"]
     deploy:
       replicas: 2

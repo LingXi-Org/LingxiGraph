@@ -2,6 +2,23 @@
 
 ## 2.0.0
 
+### 开发者体验与 Studio 1.0
+
+- 新增开发者 CLI：`lingxigraph new`（项目脚手架）、`dev`（内存 + 内嵌 Worker + Studio 的本地
+  开发服务器，支持 `--reload`）、`build`（镜像/wheel 构建）、`up`（Docker Compose 单服务器栈）。
+  以 Docker Compose 单服务器部署为主要交付方式（`api` 服务内嵌 Worker 并托管 Studio）。
+- 完整实现 Studio 1.0：从真实 Agent Server API 驱动的图调试 IDE。真实图拓扑渲染（分层布局、
+  条件边）、一键运行图并通过 SSE 实时呈现节点级执行轨迹与事件流、真实 thread 状态/历史/检查点
+  检查器、节点解释与调试（实现/Runtime/超时/重试/并发护栏/控制流）、interrupt 检查与 resume。
+- 实现 `CompiledGraph.get_graph(xray=True)` 递归子图展开与调试元数据（`kind`、`debug`、嵌套
+  `subgraph`），`draw_mermaid(xray=True)` 输出嵌套 Mermaid 子图；Studio 支持 X-ray 逐层下钻。
+- `/v1/graphs/{id}/structure` 返回节点调试元数据、图信息与 Mermaid；Studio 静态资源在存在时
+  始终挂载于 `/studio`，`/` 重定向至 Studio。
+- 新增 `lingxigraph.examples.multi_agent_graph`：模型中立的多智能体展示图（并行 fan-out、
+  reducer 归并、嵌套研究子图），演示真正的多智能体图运行时。
+
+### 平台核心
+
 - 完成 MVP P0/P1 硬化：强类型 state/output/工具参数校验、结构化输出修复、工具权限/审批/
   secret/timeout，以及共享模型/工具/token/cost 预算。
 - graph registry 改为 ID+version 双键，manifest 支持同 ID 多版本；assistant/run/resume/Worker

@@ -31,6 +31,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("migrate", help="create or upgrade PostgreSQL schema")
     commands.add_parser("doctor", help="validate runtime configuration")
+
+    new = commands.add_parser("new", help="scaffold a new agent project")
+    new.add_argument("name", help="project name, e.g. my-agent")
+    new.add_argument("--dir", default=None, help="target directory (default: ./<name>)")
+    new.add_argument("--force", action="store_true", help="overwrite existing files")
+
+    dev = commands.add_parser(
+        "dev", help="run a local dev server (in-memory, embedded worker, Studio)"
+    )
+    dev.add_argument("--host", default="127.0.0.1")
+    dev.add_argument("--port", type=int, default=8124)
+    dev.add_argument("--manifest", default="lingxigraph.json")
+    dev.add_argument("--reload", action="store_true", help="restart on source changes")
+    dev.add_argument("--no-open", action="store_true", help="do not open a browser")
+
+    build = commands.add_parser("build", help="build the deployment container image")
+    build.add_argument("--tag", default=None, help="image tag (default: <project>:latest)")
+    build.add_argument("--wheel", action="store_true", help="build a Python wheel instead")
+
+    up = commands.add_parser("up", help="start the Docker Compose single-server stack")
+    up.add_argument("--file", default="docker-compose.yml")
+    up.add_argument("--detach", action="store_true", default=True)
+    up.add_argument("--foreground", action="store_true", help="stream logs (no -d)")
+    up.add_argument("--no-build", action="store_true", help="skip image build")
     return parser
 
 
@@ -50,6 +74,14 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_migrate())
     if args.command == "doctor":
         return _doctor()
+    if args.command == "new":
+        return _new(args)
+    if args.command == "dev":
+        return _dev(args)
+    if args.command == "build":
+        return _build(args)
+    if args.command == "up":
+        return _up(args)
     parser.print_help()
     return 2
 
@@ -100,6 +132,130 @@ def _server(args) -> int:
     )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
+
+
+def _new(args) -> int:
+    from .scaffold import package_name, scaffold
+
+    try:
+        pkg = package_name(args.name)
+    except ValueError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    destination = Path(args.dir) if args.dir else Path.cwd() / args.name
+    try:
+        written = scaffold(args.name, destination, force=args.force)
+    except FileExistsError as exc:
+        print(f"FAIL: {exc} already exists (use --force to overwrite)", file=sys.stderr)
+        return 1
+    print(f"Created {len(written)} files in {destination}")
+    print(f"  package: {pkg}")
+    print("\nNext steps:")
+    rel = destination if args.dir else args.name
+    print(f"  cd {rel}")
+    print("  pip install -e .")
+    print("  lingxigraph dev")
+    return 0
+
+
+def _dev(args) -> int:
+    """Run a zero-dependency local server: in-memory stores, embedded worker, Studio."""
+
+    _configure_observability()
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError("install lingxigraph[server] to run the dev server") from exc
+    from .server import GraphRegistry, create_app
+
+    os.environ.setdefault("LINGXIGRAPH_INSECURE_DEV_AUTH", "true")
+    manifest = Path(args.manifest)
+    if not manifest.exists():
+        print(f"FAIL: {manifest} not found — run `lingxigraph new` first", file=sys.stderr)
+        return 1
+    registry = GraphRegistry.from_manifest(manifest)
+    url = f"http://{args.host}:{args.port}/studio/"
+    print("LingxiGraph dev server (in-memory, embedded worker)")
+    print(f"  graphs:  {len(registry.list())}")
+    print(f"  studio:  {url}")
+    print(f"  api:     http://{args.host}:{args.port}/v1")
+    if not args.no_open:
+        _open_browser(url)
+
+    if args.reload:
+        # uvicorn's reloader needs an import string; expose a factory via env.
+        os.environ["LINGXIGRAPH_DEV_MANIFEST"] = str(manifest)
+        uvicorn.run(
+            "lingxigraph.cli:_dev_app",
+            factory=True,
+            host=args.host,
+            port=args.port,
+            reload=True,
+        )
+        return 0
+    app = create_app(registry=registry, embedded_worker=True)
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
+def _dev_app():
+    """Factory used by uvicorn --reload; reads the manifest from the environment."""
+
+    from .server import GraphRegistry, create_app
+
+    manifest = os.environ.get("LINGXIGRAPH_DEV_MANIFEST", "lingxigraph.json")
+    registry = GraphRegistry.from_manifest(manifest)
+    return create_app(registry=registry, embedded_worker=True)
+
+
+def _build(args) -> int:
+    import subprocess
+
+    project = Path.cwd().name
+    if args.wheel:
+        print("Building Python wheel…")
+        return subprocess.call([sys.executable, "-m", "build", "--wheel"])
+    tag = args.tag or f"{project}:latest"
+    if not Path("Dockerfile").exists():
+        print("FAIL: no Dockerfile in the current directory", file=sys.stderr)
+        return 1
+    print(f"Building image {tag}…")
+    return subprocess.call(["docker", "build", "-t", tag, "."])
+
+
+def _up(args) -> int:
+    import subprocess
+
+    compose_file = Path(args.file)
+    if not compose_file.exists():
+        print(f"FAIL: {compose_file} not found", file=sys.stderr)
+        return 1
+    command = ["docker", "compose", "-f", str(compose_file), "up"]
+    if not args.no_build:
+        command.append("--build")
+    if not args.foreground:
+        command.append("-d")
+    print(f"Starting stack from {compose_file}…")
+    code = subprocess.call(command)
+    if code == 0 and not args.foreground:
+        print("\nStack is starting. Studio: http://localhost:8124/studio/")
+    return code
+
+
+def _open_browser(url: str) -> None:
+    import threading
+    import webbrowser
+
+    def _open() -> None:
+        import time
+
+        time.sleep(1.0)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    threading.Thread(target=_open, daemon=True).start()
 
 
 async def _worker(args) -> int:

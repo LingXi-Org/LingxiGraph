@@ -136,6 +136,18 @@ def _callable_arity(action: Callable[..., Any]) -> int:
     return 2 if positional >= 2 else 1
 
 
+def _describe_callable(action: Callable[..., Any] | None) -> str | None:
+    """A stable human-readable label for a node's callable, for the debugger."""
+
+    if action is None:
+        return None
+    for attribute in ("__qualname__", "__name__"):
+        label = getattr(action, attribute, None)
+        if label:
+            return str(label)
+    return type(action).__name__
+
+
 def _callable_uses_runtime(action: Callable[..., Any]) -> bool:
     """Return whether the callable's second argument requests Runtime."""
 
@@ -667,19 +679,36 @@ class CompiledStateGraph:
         return True
 
     def get_graph(self, *, xray: bool = False) -> GraphInfo:
-        """Return a stable structural view suitable for tooling and diagrams."""
+        """Return a stable structural view suitable for tooling and diagrams.
 
-        del xray  # reserved for recursive subgraph expansion
-        node_infos = [NodeInfo(START)]
-        node_infos.extend(
-            NodeInfo(
-                name,
-                dict(spec.metadata or {}),
-                is_subgraph=spec.subgraph is not None,
+        With ``xray=True`` every subgraph node is recursively expanded and its
+        topology is attached to :attr:`NodeInfo.subgraph`, so tooling (and the
+        Studio graph explorer) can explain the compiled multi-agent graph down
+        to its nested nodes.
+        """
+
+        node_infos = [NodeInfo(START, kind="start")]
+        for name, spec in self.nodes.items():
+            is_subgraph = spec.subgraph is not None
+            expanded: GraphInfo | None = None
+            if is_subgraph and xray:
+                inner = getattr(spec.subgraph, "get_graph", None)
+                if callable(inner):
+                    try:
+                        expanded = inner(xray=True)
+                    except TypeError:
+                        expanded = inner()
+            node_infos.append(
+                NodeInfo(
+                    name,
+                    dict(spec.metadata or {}),
+                    is_subgraph=is_subgraph,
+                    kind="subgraph" if is_subgraph else "node",
+                    debug=self._node_debug(name, spec),
+                    subgraph=expanded,
+                )
             )
-            for name, spec in self.nodes.items()
-        )
-        node_infos.append(NodeInfo(END))
+        node_infos.append(NodeInfo(END, kind="end"))
         edges = [
             EdgeInfo(source, edge.target, label=edge.trigger if len(edge.sources) > 1 else None)
             for edge in self._edges
@@ -705,8 +734,38 @@ class CompiledStateGraph:
                 )
         return GraphInfo(tuple(node_infos), tuple(edges))
 
+    def _node_debug(self, name: str, spec: Any) -> dict[str, Any]:
+        """Execution semantics surfaced for the Studio debugger."""
+
+        retry = getattr(spec, "retry", None)
+        debug: dict[str, Any] = {
+            "callable": _describe_callable(getattr(spec, "action", None)),
+            "uses_runtime": bool(self._node_runtime.get(name, False)),
+        }
+        if getattr(spec, "timeout", None) is not None:
+            debug["timeout"] = spec.timeout
+        if getattr(spec, "max_concurrency", None) is not None:
+            debug["max_concurrency"] = spec.max_concurrency
+        if getattr(spec, "defer", False):
+            debug["defer"] = True
+        if getattr(spec, "cache", None) is not None:
+            debug["cache"] = True
+        if getattr(spec, "middleware", ()):
+            debug["middleware"] = len(spec.middleware)
+        if retry is not None:
+            debug["retry"] = {
+                "max_attempts": getattr(retry, "max_attempts", None),
+                "backoff": getattr(retry, "backoff_factor", None),
+            }
+        if getattr(spec, "subgraph", None) is not None:
+            debug["callable"] = getattr(spec.subgraph, "graph_name", debug.get("callable"))
+            debug["subgraph_persistence"] = getattr(
+                getattr(spec, "subgraph_persistence", None), "value", None
+            )
+        return debug
+
     def draw_mermaid(self, *, xray: bool = False) -> str:
-        return self.get_graph(xray=xray).draw_mermaid()
+        return self.get_graph(xray=xray).draw_mermaid(xray=xray)
 
     async def _run(
         self,

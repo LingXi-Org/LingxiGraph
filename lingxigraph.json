@@ -4,6 +4,10 @@
     "production-support": {
       "path": "lingxigraph.examples.production_graph:graph",
       "version": "1.0.0"
+    },
+    "multi-agent-research": {
+      "path": "lingxigraph.examples.multi_agent_graph:graph",
+      "version": "1.0.0"
     }
   }
 }
