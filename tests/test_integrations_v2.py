@@ -357,6 +357,10 @@ class CozeCompleteFeatureTests(unittest.TestCase):
                     "event": "conversation.message.completed",
                     "data": {"type": "follow_up", "content": "next?"},
                 }
+                yield {
+                    "event": "conversation.chat.completed",
+                    "data": {"usage": {"token_count": 9, "input_count": 4, "output_count": 5}},
+                }
 
         class AgentState(TypedDict):
             messages: Annotated[list[Any], add_messages]
@@ -380,6 +384,7 @@ class CozeCompleteFeatureTests(unittest.TestCase):
         self.assertEqual(final.additional_kwargs["reasoning_content"], "thinking...")
         self.assertEqual(final.additional_kwargs["follow_ups"], ("next?",))
         self.assertEqual(result["coze_suggestions"], ("next?",))
+        self.assertEqual(final.usage, {"token_count": 9, "input_count": 4, "output_count": 5})
 
     def test_verbose_and_function_call_deltas_do_not_leak_into_answer(self) -> None:
         # Coze multiplexes verbose (multi-agent jump), function_call, and
@@ -557,6 +562,79 @@ class CozeCompleteFeatureTests(unittest.TestCase):
                 "/v1/bot/get_online_info",
             ],
         )
+
+    def test_agent_node_non_stream_path_polls_and_extracts_usage(self) -> None:
+        # CozeAgentNode(stream=False) exercises the chat()/chat_retrieve() polling
+        # loop instead of SSE; usage should be extracted once the chat completes.
+        calls = {"retrieve": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v3/chat" and request.method == "POST":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "id": "chat-1",
+                            "conversation_id": "conv-1",
+                            "status": "in_progress",
+                        },
+                    },
+                )
+            if request.url.path == "/v3/chat/retrieve":
+                calls["retrieve"] += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "id": "chat-1",
+                            "conversation_id": "conv-1",
+                            "status": "completed",
+                            "usage": {
+                                "token_count": 12,
+                                "input_count": 5,
+                                "output_count": 7,
+                            },
+                        },
+                    },
+                )
+            if request.url.path == "/v3/chat/message/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": [
+                            {"role": "assistant", "type": "answer", "content": "polled answer"},
+                            {"role": "assistant", "type": "follow_up", "content": "and then?"},
+                        ],
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.url.path}")
+
+        class AgentState(TypedDict):
+            messages: Annotated[list[Any], add_messages]
+            coze_conversations: dict[str, str]
+
+        async def run() -> None:
+            client = AsyncCozeClient("token", transport=httpx.MockTransport(handler))
+            node = CozeAgentNode("bot", client=client, user_id="user", stream=False)
+            builder = StateGraph(AgentState)
+            builder.add_node("coze", node).add_edge(START, "coze").add_edge("coze", END)
+            result = await builder.compile().ainvoke(
+                {"messages": [HumanMessage("go")], "coze_conversations": {}}
+            )
+            final = result["messages"][-1]
+            self.assertEqual(final.content, "polled answer")
+            self.assertEqual(
+                final.usage, {"token_count": 12, "input_count": 5, "output_count": 7}
+            )
+            self.assertEqual(final.additional_kwargs["follow_ups"], ("and then?",))
+            self.assertEqual(result["coze_conversations"], {"bot": "conv-1"})
+            await client.aclose()
+
+        asyncio.run(run())
+        self.assertGreaterEqual(calls["retrieve"], 1)
 
 
 if __name__ == "__main__":
