@@ -1,0 +1,59 @@
+---
+title: "生产部署"
+description: "使用 Docker Compose 或 Helm 安全部署 Agent Server 与 Worker"
+---
+
+## 单服务器基线
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl http://localhost:8124/health
+curl http://localhost:8124/ready
+```
+
+默认 Compose 运行 PostgreSQL 16、Redis 7.2、迁移 Job，以及带内嵌 Worker 的 Agent Server。适合单机生产基线和预发布验证。生产前必须关闭不安全开发认证并配置 TLS/OIDC。
+
+## 独立扩展拓扑
+
+```bash
+lingxigraph doctor
+lingxigraph migrate
+lingxigraph server --host 0.0.0.0 --port 8124
+lingxigraph worker --health-port 8125 --drain-timeout 60
+```
+
+API 无状态，可水平扩展；Worker 根据 PostgreSQL pending queue age/depth 扩展。API 与 Worker 镜像必须包含相同的 `lingxigraph.json` 和图版本。
+
+## 发布顺序
+
+<Steps>
+  <Step title="构建与验证">构建不可变镜像，执行测试、SBOM、依赖/镜像扫描和签名；运行 `lingxigraph doctor`。</Step>
+  <Step title="迁移">使用独立 Job 运行 `lingxigraph migrate`。迁移必须向后兼容当前运行中的 API/Worker。</Step>
+  <Step title="滚动发布">先发布 Worker，再发布 Agent Server；保留旧 graph version，直到没有 run 固定到它。</Step>
+  <Step title="Canary">创建 canary run，检查状态、事件 sequence、checkpoint 与 trace。</Step>
+</Steps>
+
+## Kubernetes
+
+Helm Chart 位于 `deploy/helm/lingxigraph`：
+
+```bash
+helm upgrade --install lingxigraph deploy/helm/lingxigraph \
+  --namespace lingxigraph --create-namespace \
+  --values production-values.yaml
+```
+
+Chart 配置非 root UID 10001、只读根文件系统、RuntimeDefault seccomp、startup/readiness/liveness probe、HPA、PDB 和优雅终止。数据库、OIDC、provider token 使用 Secret 或外部 secret manager，不放在 ConfigMap。
+
+## 数据与恢复
+
+- PostgreSQL 必须启用 TLS、加密备份、PITR 和高可用；
+- Redis 不保存唯一业务状态，可清空重建；
+- 备份 `lingxigraph` schema 与迁移版本表；
+- 定期演练 Worker 强杀、Redis 重启、数据库短断连和 checkpoint 恢复；
+- dead-letter 修复后调用 `POST /v1/runs/{id}/redrive`，不要用 redrive 提交新输入。
+
+<Warning>
+删除 Compose volume 或 PostgreSQL schema 会永久删除 thread、run、event、checkpoint 和 Store 数据。备份并验证恢复流程后再执行。
+</Warning>

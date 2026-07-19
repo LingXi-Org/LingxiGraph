@@ -1,0 +1,78 @@
+---
+title: "Agents, messages, and tools"
+description: "Provider-neutral protocols, ReAct loops, tool policy, and structured output"
+---
+
+The LingxiGraph core defines neutral message, model, and tool protocols without depending on LangChain or a provider SDK. Use an official adapter or implement your own `ChatModel`.
+
+## Messages and models
+
+`MessagesState.messages` uses the `add_messages` reducer to upsert by stable ID while preserving order. It supports `SystemMessage`, `HumanMessage`, `AIMessage`, `ToolMessage`, streaming chunks, and `RemoveMessage`, all of which round-trip through typed JSON checkpoints.
+
+The minimal asynchronous model protocol is:
+
+```python
+class MyModel:
+    async def agenerate(self, messages, *, tools=None, config=None):
+        return AIMessage("result")
+
+    async def astream(self, messages, *, tools=None, config=None):
+        yield AIMessageChunk("res")
+        yield AIMessageChunk("ult")
+```
+
+## Typed tools
+
+```python
+from lingxigraph import Runtime, tool
+
+
+@tool(
+    permissions=("crm:write",),
+    secret_refs={"token": "crm/api-token"},
+    timeout=10,
+    requires_approval=True,
+)
+def update_ticket(
+    ticket_id: str,
+    status: str,
+    token: str,
+    runtime: Runtime,
+) -> dict:
+    return crm.update(
+        ticket_id,
+        status,
+        token=token,
+        idempotency_key=runtime.idempotency_key,
+    )
+```
+
+The decorator generates JSON Schema from ordinary annotated parameters. A secret resolver injects `token` at the call boundary, so it is never exposed to the model or stored in state. Before execution, LingxiGraph checks static permissions, optional dynamic `tool_authorize`, the argument schema, timeout, and approval result.
+
+## Prebuilt ReAct agent
+
+```python
+from lingxigraph import HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    [update_ticket],
+    system_prompt="Resolve support requests safely.",
+    secret_resolver=resolve_secret,
+)
+
+result = agent.invoke(
+    {"messages": [HumanMessage("Close ticket T-42")]},
+    {
+        "tool_permissions": ["crm:write"],
+        "max_model_calls": 8,
+        "max_tool_calls": 4,
+    },
+)
+```
+
+`create_agent` builds an `agent → tools → agent` loop with pre/post-model hooks, parallel tool calls, remaining-step handling, HITL, and structured-output repair. Parent and child graphs share model-call, tool-call, token, and cost budgets.
+
+<Tip>
+Permission answers “may this tool run?”, approval answers “is this invocation accepted?”, and idempotency answers “will retry duplicate the business effect?”. Production tools often need all three.
+</Tip>

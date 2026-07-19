@@ -1,0 +1,48 @@
+---
+title: "Security and observability"
+description: "Production hardening, tenant isolation, audit, metrics, logs, and alerts"
+---
+
+## Security checklist
+
+- Expose the API only through TLS ingress; keep PostgreSQL, Redis, OTLP, and remote agents on controlled networks.
+- Verify OIDC issuer, audience, JWKS, and token times; derive tenants only from verified claims.
+- Give the API database role RLS without `BYPASSRLS`; grant cross-tenant claim only to a separate worker role.
+- Run containers as UID/GID 10001 with read-only rootfs, no privilege escalation, dropped capabilities, and RuntimeDefault seccomp.
+- Review graph code like production code, then ship it through CI, SBOM, signing, and immutable images.
+- Resolve secrets only at call boundaries; never store them in state/checkpoints/events/cache/traces.
+- Configure tenant limits for active/queued runs, SSE, rate, and request/state/event size.
+- Combine permissions, dynamic authorization, HITL, timeouts, and idempotency for high-risk tools.
+
+The current release is not an online sandbox for untrusted Python. Run user code outside LingxiGraph in an isolated sandbox with least-privilege identity and controlled egress.
+
+## Audit and redaction
+
+Audit records contain actor, action, resource, result, trace ID, and non-sensitive metadata—not full prompts, state, messages, or credentials. Recursively redact fields such as `authorization`, `token`, `secret`, `password`, `api_key`, and `cookie` from logs and telemetry.
+
+## Health and metrics
+
+| Endpoint | Meaning |
+| --- | --- |
+| API `/health` | Process liveness and version |
+| API `/ready` | Repository, at least one graph, embedded worker readiness |
+| Worker `:8125/health` | Worker event-loop liveness |
+| Worker `:8125/ready` | Able to claim work; 503 while draining |
+| API `/metrics` | Prometheus text for the authenticated tenant |
+
+Core metrics include `lingxigraph_graphs`, `lingxigraph_runs` by status, `lingxigraph_queue_depth`, `lingxigraph_active_runs`, and `lingxigraph_run_events`.
+
+## Suggested alerts
+
+- Pending queue age p95 exceeds the target or grows continuously.
+- `failed`/`timed_out`/`dead_letter` rate or lease recovery spikes.
+- Checkpoint commit p95 or PostgreSQL connection/transaction saturation rises.
+- SSE disconnect rate or end-to-end event latency increases.
+- Treat Redis errors as warning and PostgreSQL errors as high priority.
+- Model/tool budget failures and tenant quotas trigger continuously.
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, processes export run/task/checkpoint spans. JSON logs should retain request ID, run ID, tenant, graph version, and trace/span ID without sensitive business content.
+
+## Vulnerability reporting
+
+Do not disclose unpatched vulnerabilities in a public issue. Contact maintainers privately through a GitHub Security advisory with affected versions, reproduction conditions, impact, and suggested mitigation. Avoid publishing a PoC until coordinated disclosure is complete.

@@ -1,0 +1,85 @@
+---
+title: "Python SDK"
+description: "使用同步或异步客户端管理所有 Agent Server 资源"
+---
+
+```bash
+pip install "lingxigraph[sdk]"
+```
+
+## 同步客户端
+
+```python
+from lingxigraph.sdk import LingxiGraphClient
+
+with LingxiGraphClient(
+    "https://agents.example.com",
+    token="...",
+    timeout=30,
+) as client:
+    graph = client.graphs.get("production-support")
+    assistant = client.assistants.create(
+        graph_id=graph["id"],
+        graph_version=graph["version"],
+        name="support",
+    )
+    thread = client.threads.create(metadata={"external_id": "ticket-42"})
+    run = client.runs.create(
+        assistant["id"],
+        thread_id=thread["id"],
+        input={"request": "reset access", "result": ""},
+        max_model_calls=8,
+    )
+
+    for event in client.runs.stream(run["id"]):
+        print(event["sequence"], event["kind"])
+
+    completed = client.runs.join(run["id"], timeout=120)
+    print(completed["output"])
+```
+
+可用资源方法：
+
+| Resource | 方法 |
+| --- | --- |
+| `graphs` | `list()`、`get(graph_id)` |
+| `assistants` | `create(**values)`、`list()`、`get()`、`update()`、`delete()` |
+| `threads` | `create()`、`list()`、`get()`、`update()`、`state()`、`history()`、`fork()`、`delete()` |
+| `runs` | `create()`、`get()`、`list(thread_id)`、`join()`、`stream()`、`cancel()`、`resume()` |
+| `store` | `batch(operations)`、`search(namespace, ...)` |
+| `schedules` | `create()`、`list()`、`update()`、`delete()` |
+
+Redrive 或尚未封装的端点可使用 `client.request(method, path, **kwargs)`。
+
+## 异步客户端
+
+```python
+from lingxigraph.sdk import AsyncLingxiGraphClient
+
+async with AsyncLingxiGraphClient(base_url, token=token) as client:
+    thread = await client.threads.create()
+    run = await client.runs.create(
+        assistant_id,
+        thread_id=thread["id"],
+        input={"request": "hello"},
+    )
+    async for event in client.runs.stream(run["id"]):
+        print(event)
+```
+
+异步资源与同步资源一一对应。不要在 async 事件循环中使用同步客户端。
+
+## 错误处理
+
+```python
+from lingxigraph.sdk import LingxiGraphAPIError
+
+try:
+    client.runs.get("missing")
+except LingxiGraphAPIError as exc:
+    print(exc.status_code, exc.code, exc.request_id)
+    if exc.retryable:
+        retry_with_backoff()
+```
+
+只根据 `status_code`、稳定 `code` 与 `retryable` 分支；`detail` 用于诊断，不是机器协议。SDK 不会自动重试创建 run；调用方应发送稳定 `Idempotency-Key`（可通过底层 `request`），防止网络重试重复入队。

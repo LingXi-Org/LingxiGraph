@@ -1,0 +1,80 @@
+---
+title: "Errors, idempotency, and SSE"
+description: "Handle problem details, run failures, event resume, and client retries"
+---
+
+## Problem details
+
+Non-2xx responses use `application/problem+json`:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Quota Exceeded",
+  "status": 429,
+  "detail": "tenant queued-run quota exceeded",
+  "code": "quota_exceeded",
+  "request_id": "01J...",
+  "retryable": true
+}
+```
+
+| Field | Purpose |
+| --- | --- |
+| `status` | HTTP category |
+| `code` | Stable machine code and preferred branch field |
+| `request_id` | Correlates server logs and traces |
+| `retryable` | Whether this operation can be retried with backoff |
+| `detail` | Human diagnostic prose; do not parse |
+
+Common stable codes include `idempotency_conflict`, `quota_exceeded`, and `join_timeout`, plus problem codes mapped from schema, authentication, concurrency, and resource-state failures. Treat new codes as an unknown error rather than failing to parse them.
+
+## Run business errors
+
+Successful creation returns `202 pending`. A later node/schema/provider error moves the resource to `failed`, `timed_out`, or `dead_letter` and populates:
+
+```json
+{
+  "status": "failed",
+  "error": {
+    "code": "invalid_update",
+    "message": "...",
+    "retryable": false
+  }
+}
+```
+
+The get/join HTTP request itself may still return 200. Clients must inspect both HTTP status and `run.status`.
+
+## SSE format and resume
+
+```text
+GET /v1/runs/{run_id}/stream
+Accept: text/event-stream
+Last-Event-ID: 17
+```
+
+```text
+id: 18
+event: node_completed
+data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{},"created_at":"..."}
+```
+
+- Events are persisted in PostgreSQL before delivery.
+- `sequence` increases from 1 within a run.
+- Reconnect with the last processed `Last-Event-ID`; the server starts at the next event.
+- Deduplicate on `(run_id, sequence)` to handle repeated delivery.
+- Lines beginning `: heartbeat` are keep-alive comments and should be ignored.
+- The server closes the stream when the run becomes terminal or `paused`.
+
+## Retry policy
+
+1. Use bounded exponential backoff only for `retryable=true`, network failure, 429, and transient 5xx.
+2. Honor `Retry-After`.
+3. Reuse the same `Idempotency-Key` and identical body when retrying run creation.
+4. Resume SSE from the last sequence; do not create a new run.
+5. Do not automatically redrive deterministic schema or tool-permission errors.
+
+<Warning>
+The same request key with a different body returns `409 idempotency_conflict`. Do not silently switch to a random key after conflict; that hides a caller bug and may duplicate business work.
+</Warning>

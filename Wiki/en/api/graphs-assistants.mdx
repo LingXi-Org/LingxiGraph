@@ -1,0 +1,65 @@
+---
+title: "Graphs and assistants API"
+description: "Discover trusted graph versions and create callable assistants"
+---
+
+## Graphs
+
+Graphs are registered by the deployment manifest, read-only, and uniquely identified by `(id, version)`.
+
+```bash
+GET /v1/graphs
+GET /v1/graphs/{graph_id}?graph_version=1.0.0
+GET /v1/graphs/{graph_id}/structure?graph_version=1.0.0&xray=true
+```
+
+GraphInfo fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id`, `version` | string | Stable graph ID and deployed version |
+| `schema_hash` | string | Compiled schema/plan hash |
+| `input_schema`, `output_schema` | object | JSON Schema |
+| `context_schema` | object/null | Context JSON Schema |
+
+`structure` returns nodes, edges, debug metadata, and Mermaid. `xray=true` recursively expands subgraphs.
+
+## Create an assistant
+
+```bash
+curl -X POST https://agents.example.com/v1/assistants \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "graph_id": "production-support",
+    "graph_version": "1.0.0",
+    "name": "support-prod",
+    "config": {"recursion_limit": 32},
+    "context": {"region": "cn"},
+    "metadata": {"owner": "support-platform"}
+  }'
+```
+
+| Request field | Required | Description |
+| --- | --- | --- |
+| `graph_id` | Yes | Registered graph ID |
+| `graph_version` | No | Registry default when omitted |
+| `name` | No | Human-readable name |
+| `config` | No | Default run configuration |
+| `context` | No | Default schema-validated context |
+| `metadata` | No | Platform search/governance metadata |
+
+## Manage assistants
+
+```text
+GET    /v1/assistants
+GET    /v1/assistants/{assistant_id}
+PATCH  /v1/assistants/{assistant_id}
+DELETE /v1/assistants/{assistant_id}
+```
+
+PATCH accepts `name`, `config`, `context`, and `metadata`. It cannot change the graph. Create a new assistant or switch a deployed default when adopting a new graph version.
+
+<Info>
+A run copies its assistant's graph ID/version/config/context when created. Later assistant edits cannot change queued, running, or paused runs.
+</Info>

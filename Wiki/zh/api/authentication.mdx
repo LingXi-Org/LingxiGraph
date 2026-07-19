@@ -1,0 +1,41 @@
+---
+title: "认证与授权"
+description: "OIDC/JWT、开发认证、tenant 派生和固定 RBAC"
+---
+
+除 `/health` 和 `/ready` 外，接口需要已验证的 OIDC bearer token 或受控开发认证。`/metrics` 也需要 `viewer` 权限。
+
+```bash
+curl https://agents.example.com/v1/graphs \
+  -H "Authorization: Bearer $LINGXIGRAPH_TOKEN"
+```
+
+## JWT 校验
+
+服务端验证 issuer、audience、JWKS 签名、`exp`、`iat` 与 `sub`。tenant 只从 `LINGXIGRAPH_TENANT_CLAIM` 指定的已验证 claim 派生，默认 `tenant_id`；角色从 `LINGXIGRAPH_ROLES_CLAIM` 派生，默认 `roles`。
+
+## 固定角色
+
+| 角色 | 权限摘要 |
+| --- | --- |
+| `viewer` | 读取 graph、assistant、thread、run、state、event、metrics |
+| `operator` | 创建 thread/run、resume/cancel/redrive、Store 与 Schedule 操作 |
+| `developer` | 创建、更新、删除 Assistant；读取 graph |
+| `tenant-admin` | 当前 tenant 内全部权限 |
+
+一个 endpoint 通常接受表中一个或多个角色；`tenant-admin` 始终覆盖本 tenant 权限。资源查询同时包含 tenant 条件，并由 PostgreSQL transaction-local `app.tenant_id` 激活 RLS。
+
+## 本地开发认证
+
+`lingxigraph dev` 设置 `LINGXIGRAPH_INSECURE_DEV_AUTH=true`。此时可使用：
+
+```bash
+curl http://localhost:8124/v1/graphs \
+  -H "X-Tenant-ID: acme"
+```
+
+也可通过 `X-API-Key` 使用配置的开发 key。开发认证必须绑定本机/受控网络，不能暴露到公网。
+
+<Warning>
+生产环境绝不能信任调用方自报的 `X-Tenant-ID`，也不能启用 `LINGXIGRAPH_INSECURE_DEV_AUTH=true`。API 数据库角色不得拥有 `BYPASSRLS`、superuser 或表 owner 权限。
+</Warning>

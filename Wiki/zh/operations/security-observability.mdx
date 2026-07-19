@@ -1,0 +1,48 @@
+---
+title: "安全与可观测性"
+description: "生产加固、租户隔离、审计、指标、日志与告警"
+---
+
+## 安全检查清单
+
+- API 只通过 TLS ingress 暴露，PostgreSQL/Redis/OTLP/远端 Agent 位于受控网络；
+- 验证 OIDC issuer、audience、JWKS 与 token 时间字段；tenant 只取自已验证 claim；
+- API 数据库角色启用 RLS 且无 `BYPASSRLS`，跨 tenant claim 仅授予独立 Worker 角色；
+- 容器使用 UID/GID 10001、只读 rootfs、禁用提权、丢弃 capabilities、RuntimeDefault seccomp；
+- 图代码走普通生产代码 review、CI、SBOM、签名和不可变镜像发布；
+- secret 只在调用边界解析，不进入 state/checkpoint/event/cache/trace；
+- 为 tenant 配置 active/queued run、SSE、request/state/event 大小和速率上限；
+- 高风险工具组合 permissions、动态 authorize、HITL、timeout 和幂等键。
+
+当前版本不提供不可信 Python 的在线沙箱。需要执行用户代码时，必须在 LingxiGraph 外部使用独立沙箱、最小权限身份和网络出口策略。
+
+## 审计与脱敏
+
+审计记录 actor、action、resource、result、trace ID 与非敏感 metadata，不记录完整 prompt、state、消息或凭据。日志与 telemetry 应递归脱敏 `authorization`、`token`、`secret`、`password`、`api_key`、`cookie` 等字段。
+
+## 健康与指标
+
+| Endpoint | 含义 |
+| --- | --- |
+| API `/health` | 进程存活和版本 |
+| API `/ready` | repository、至少一个 graph、内嵌 Worker 就绪 |
+| Worker `:8125/health` | Worker 事件循环存活 |
+| Worker `:8125/ready` | 可领取任务；drain 时为 503 |
+| API `/metrics` | 认证 tenant 的 Prometheus 文本指标 |
+
+核心指标包括 `lingxigraph_graphs`、按状态的 `lingxigraph_runs`、`lingxigraph_queue_depth`、`lingxigraph_active_runs`、`lingxigraph_run_events`。
+
+## 建议告警
+
+- pending queue age p95 超过目标或持续增长；
+- `failed`/`timed_out`/`dead_letter` 比率和 lease recovery 激增；
+- checkpoint commit p95、PostgreSQL 连接/事务饱和；
+- SSE 断线率和事件端到端延迟增长；
+- Redis 错误为警告，PostgreSQL 错误为高优先级；
+- 模型/工具预算超限与 tenant quota 持续触发。
+
+配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，进程会导出 run/task/checkpoint span。JSON 日志应保留 request ID、run ID、tenant、graph version 与 trace/span ID，但不记录业务敏感正文。
+
+## 漏洞报告
+
+不要在公开 issue 中披露未修复漏洞。通过 GitHub 仓库的 Security advisory 私下联系维护者，包含受影响版本、复现条件、影响评估与建议缓解；在协调披露完成前避免公开 PoC。

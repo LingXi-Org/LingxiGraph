@@ -1,0 +1,58 @@
+---
+title: "Store、Schedule 与互操作 API"
+description: "长期记忆、定时资源、A2A 和 MCP gateway"
+---
+
+## Store batch
+
+Store 为 checkpoint state 之外的跨 thread 长期数据提供 tenant 隔离的 namespace。批量接口接受 `StoreOperation` 对象数组：
+
+```bash
+curl -X POST https://agents.example.com/v1/store/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"operations":[
+    {"kind":"put","namespace":["users","u-42"],"key":"profile","value":{"tier":"gold"}},
+    {"kind":"get","namespace":["users","u-42"],"key":"profile"}
+  ]}'
+```
+
+常用 `kind` 为 `get`、`put`、`delete`、`search`。具体 operation 字段由后端 Store 实现校验；生产客户端应将相互依赖的操作放在同一批次，并检查响应 `results` 的顺序。
+
+```bash
+GET /v1/store/search?namespace=users/u-42&query=gold&limit=10&offset=0
+```
+
+`namespace` 使用 `/` 分段；`limit` 默认 10。语义查询需要 Store 配置 `Embedder`，否则按实现的文本/过滤能力执行。
+
+## Schedule
+
+```bash
+curl -X POST https://agents.example.com/v1/schedules \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assistant_id":"ASSISTANT_ID",
+    "cron":"0 9 * * 1-5",
+    "timezone":"Asia/Shanghai",
+    "input":{"job":"daily-review"},
+    "enabled":true,
+    "metadata":{"owner":"ops"}
+  }'
+```
+
+`POST/GET /v1/schedules` 创建/列出；`PATCH/DELETE /v1/schedules/{id}` 更新或删除。PATCH 可修改 `cron`、`timezone`、`input`、`enabled`、`metadata`。
+
+<Note>
+Schedule API 管理定时定义。部署时需确认所用版本/拓扑已启用 cron 执行器；未启用时资源会保存但不会自动创建 run。
+</Note>
+
+## A2A 与 MCP
+
+```text
+GET  /a2a/{assistant_id}/.well-known/agent-card.json
+POST /a2a/{assistant_id}   # A2A JSON-RPC
+POST /mcp                  # MCP JSON-RPC
+```
+
+Assistant metadata 设置 `mcp_expose: true` 时可暴露为 MCP tool；tool 名优先使用 `mcp_tool_name`，其次 `name`，最后为 Assistant ID。gateway 使用相同 tenant 与 RBAC 边界，远端结果仍经过 JSON serializer 和 schema 校验。

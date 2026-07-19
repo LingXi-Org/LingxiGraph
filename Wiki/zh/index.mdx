@@ -1,0 +1,46 @@
+---
+title: "LingxiGraph 文档"
+description: "构建可恢复、可流式观察、可在生产环境扩展的多智能体应用"
+---
+
+LingxiGraph 是模型供应商中立的耐久图运行时。它将 Agent 工作流表达为有类型的状态图，并提供 checkpoint、流式事件、人工审批、版本固定和多租户 Agent Server。
+
+<CardGroup cols={2}>
+  <Card title="安装与选择运行方式" icon="download" href="./quickstart/installation">
+    从零依赖嵌入式核心、本地开发服务器或完整生产栈中选择。
+  </Card>
+  <Card title="创建第一个图" icon="diagram-project" href="./quickstart/first-graph">
+    用 TypedDict、节点和边构建一个可执行状态图。
+  </Card>
+  <Card title="启动 Agent Server" icon="server" href="./quickstart/agent-server">
+    使用 Studio、REST、SSE 和 Python SDK 运行图。
+  </Card>
+  <Card title="浏览 API" icon="brackets-curly" href="./api/overview">
+    查看资源模型、认证、错误与完整端点清单。
+  </Card>
+</CardGroup>
+
+## 你可以构建什么
+
+- 带 checkpoint 和人工审批的长时间 Agent 工作流；
+- supervisor、handoff、swarm、group chat 与并行评审系统；
+- 具有稳定幂等键、预算、重试和 dead-letter 的可靠任务执行面；
+- 通过 Coze、OpenAI-compatible、A2A 或 MCP 接入的混合 Agent 网络；
+- 需要 OIDC、RBAC、tenant 隔离、RLS 与 OpenTelemetry 的企业平台。
+
+## 两层产品形态
+
+| 层 | 主要对象 | 何时使用 |
+| --- | --- | --- |
+| Python runtime | `StateGraph`、`CompiledGraph`、`Runtime`、checkpoint、Store | 嵌入现有服务、单进程执行、单元测试 |
+| Agent platform | Graph、Assistant、Thread、Run、Schedule、REST/SSE、Worker | 多租户控制面、队列、独立扩展与统一运维 |
+
+<Tip>
+第一次体验建议完成“安装 → 创建第一个图 → Agent Server”三篇快速入门，约需 10 分钟。
+</Tip>
+
+## 版本与兼容性
+
+本文档对应 LingxiGraph `2.0.0`，支持 Python 3.11–3.13。服务端公开接口位于 `/v1`；每个 run 固定 graph ID 与 version，部署新版本不会改变已排队或暂停的执行。
+
+需要理解底层保证时，请继续阅读[平台架构](./concepts/architecture)与[耐久执行](./concepts/durable-execution)。

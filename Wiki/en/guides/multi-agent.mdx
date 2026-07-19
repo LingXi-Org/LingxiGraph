@@ -1,0 +1,44 @@
+---
+title: "Multi-agent patterns"
+description: "Choose a supervisor, handoff, swarm, group chat, or parallel review"
+---
+
+Multi-agent is not one architecture. Choose a pattern based on control ownership, concurrency, and termination, then compose each agent as a subgraph or node.
+
+| Pattern | Control | Good for |
+| --- | --- | --- |
+| Supervisor | Central router selects the next agent | Clear roles and unified policy |
+| Manager as tools | Manager calls experts as tools | Expert capabilities with narrow output boundaries |
+| Handoff | Current agent transfers explicitly | Support routing and escalation |
+| Swarm | Persistent `active_agent` in state | Peer collaboration and dynamic ownership |
+| Group chat | Selector chooses speakers for bounded turns | Discussion, debate, consensus |
+| Plan-execute | Planner creates tasks for executors | Long work with an observable plan |
+| Parallel review | Fan out, then merge with a reducer | Multi-dimensional code, document, or risk review |
+
+## Handoff
+
+`create_handoff_tool()` produces `Command(scope=PARENT)`, allowing a child agent to return control to its immediate parent graph. State crossing the boundary must be explicit in `Command.update`; LingxiGraph never copies all child state implicitly.
+
+```python
+from lingxigraph.patterns import create_handoff_tool
+
+handoff_to_billing = create_handoff_tool(
+    "billing",
+    description="Transfer billing and refund questions",
+)
+```
+
+## Map-reduce fan-out
+
+A conditional edge can return multiple `Send(node, arg)` values, creating parallel tasks with private inputs. An `Annotated` reducer merges their results into shared state. Do not let parallel nodes write the same ordinary `LastValue` field.
+
+## Production guardrails
+
+- Give group chat a finite `max_turns` or deterministic termination rule.
+- Share `max_model_calls`, `max_tool_calls`, `max_tokens`, and `max_cost` across parent/child graphs.
+- Configure timeouts, retries, and cancellation propagation for remote agents.
+- Put only the next role's required data in a handoff.
+- Use stable idempotency keys for every side-effecting expert tool.
+- Preserve agent, namespace, and task path in event metadata for tracing.
+
+Runnable examples are available in `examples/multi_agent_supervisor.py`, `examples/map_reduce_send.py`, and `examples/subgraph_team_review.py`.

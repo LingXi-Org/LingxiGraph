@@ -1,0 +1,75 @@
+---
+title: "配置参考"
+description: "Agent Server、Worker、认证、Redis 与 OpenTelemetry 环境变量"
+---
+
+LingxiGraph 使用环境变量配置进程，使用 `lingxigraph.json` 注册可信图。敏感值应来自 secret manager 或编排平台 Secret。
+
+## 环境变量
+
+| 名称 | 必填 | 说明 |
+| --- | --- | --- |
+| `LINGXIGRAPH_POSTGRES_URL` | 生产是 | PostgreSQL DSN；Server、Worker、迁移共享 |
+| `LINGXIGRAPH_REDIS_URL` | 否 | Redis PubSub/cache/cancel 加速；故障可降级 |
+| `LINGXIGRAPH_OIDC_ISSUER` | 生产是 | 允许的 JWT issuer |
+| `LINGXIGRAPH_OIDC_AUDIENCE` | 生产是 | JWT audience |
+| `LINGXIGRAPH_OIDC_JWKS_URL` | 生产是 | 可信 JWKS endpoint |
+| `LINGXIGRAPH_TENANT_CLAIM` | 否 | tenant claim，默认 `tenant_id` |
+| `LINGXIGRAPH_ROLES_CLAIM` | 否 | roles claim，默认 `roles` |
+| `LINGXIGRAPH_INSECURE_DEV_AUTH` | 仅开发 | 设为 `true` 启用不安全认证 |
+| `LINGXIGRAPH_DEV_API_KEY` | 仅开发 | 开发 `X-API-Key` |
+| `LINGXIGRAPH_DEV_TENANT` | 仅开发 | 开发 key 的默认 tenant |
+| `LINGXIGRAPH_DEV_ROLES` | 仅开发 | 开发 key 的角色列表 |
+| `LINGXIGRAPH_LOG_LEVEL` | 否 | 日志级别，默认 `INFO` |
+| `LINGXIGRAPH_LOG_FORMAT` | 否 | `json`（默认）或文本 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 否 | 配置后启用 OTLP export |
+| `OTEL_SERVICE_NAME` | 否 | telemetry service name |
+
+## 图清单
+
+单版本：
+
+```json
+{
+  "$schema": "https://lingxigraph.dev/schemas/manifest-v1.json",
+  "graphs": {
+    "support": {
+      "path": "myapp.graphs:support_graph",
+      "version": "1.0.0"
+    }
+  }
+}
+```
+
+同一 ID 多版本：
+
+```json
+{
+  "graphs": {
+    "support": [
+      {"path": "myapp.graphs:support_v1", "version": "1.0.0"},
+      {"path": "myapp.graphs:support_v2", "version": "2.0.0"}
+    ]
+  }
+}
+```
+
+列表最后一项是新 Assistant 的默认版本。保留仍被 run 固定的旧版本。部署前运行：
+
+```bash
+lingxigraph doctor
+```
+
+它会导入清单、编译图并检查 JSON Schema 与关键生产配置。
+
+## CLI 进程参数
+
+```text
+lingxigraph server --host 0.0.0.0 --port 8124 --manifest lingxigraph.json [--embedded-worker]
+lingxigraph worker --manifest lingxigraph.json --health-host 0.0.0.0 --health-port 8125 --drain-timeout 60
+lingxigraph dev --host 127.0.0.1 --port 8124 --manifest lingxigraph.json [--reload] [--no-open]
+```
+
+<Warning>
+不要把数据库密码、OIDC secret、模型 token 或远端 Agent 凭据写入 manifest、graph state、context、event、trace 或 ConfigMap。
+</Warning>

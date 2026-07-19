@@ -1,0 +1,59 @@
+---
+title: "Production deployment"
+description: "Deploy Agent Server and workers safely with Docker Compose or Helm"
+---
+
+## Single-server baseline
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl http://localhost:8124/health
+curl http://localhost:8124/ready
+```
+
+The default Compose stack runs PostgreSQL 16, Redis 7.2, a migration job, and Agent Server with an embedded worker. It is suitable for a single-host baseline and staging. Disable insecure development auth and configure TLS/OIDC before production use.
+
+## Independently scaled topology
+
+```bash
+lingxigraph doctor
+lingxigraph migrate
+lingxigraph server --host 0.0.0.0 --port 8124
+lingxigraph worker --health-port 8125 --drain-timeout 60
+```
+
+The API is stateless and scales horizontally. Scale workers on PostgreSQL pending queue age/depth. API and worker images must contain the same `lingxigraph.json` and graph versions.
+
+## Release order
+
+<Steps>
+  <Step title="Build and validate">Build an immutable image; run tests, SBOM generation, dependency/image scans, signing, and `lingxigraph doctor`.</Step>
+  <Step title="Migrate">Run `lingxigraph migrate` as a separate job. Migrations must remain compatible with currently running API/worker versions.</Step>
+  <Step title="Roll out">Deploy workers first and Agent Server second. Keep an old graph version until no run remains pinned to it.</Step>
+  <Step title="Canary">Create a canary run and verify state, event sequence, checkpoints, and traces.</Step>
+</Steps>
+
+## Kubernetes
+
+The Helm chart is in `deploy/helm/lingxigraph`:
+
+```bash
+helm upgrade --install lingxigraph deploy/helm/lingxigraph \
+  --namespace lingxigraph --create-namespace \
+  --values production-values.yaml
+```
+
+The chart configures non-root UID 10001, read-only root filesystem, RuntimeDefault seccomp, startup/readiness/liveness probes, HPA, PDB, and graceful termination. Put database, OIDC, and provider credentials in Secrets or an external secret manager—not ConfigMaps.
+
+## Data and recovery
+
+- Enable TLS, encrypted backup, PITR, and high availability for PostgreSQL.
+- Redis contains no unique business state and can be rebuilt empty.
+- Back up the `lingxigraph` schema and migration version table.
+- Regularly test worker termination, Redis restart, brief database loss, and checkpoint recovery.
+- After fixing a dead letter, call `POST /v1/runs/{id}/redrive`; never use redrive to provide new input.
+
+<Warning>
+Deleting Compose volumes or the PostgreSQL schema permanently removes threads, runs, events, checkpoints, and Store data. Back up and verify recovery before doing so.
+</Warning>

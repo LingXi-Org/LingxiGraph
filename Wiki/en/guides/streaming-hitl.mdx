@@ -1,0 +1,72 @@
+---
+title: "Streaming and human approval"
+description: "Consume state, events, model messages, and custom progress in real time, then resume safely"
+---
+
+## Stream modes
+
+| Mode | Payload | Typical use |
+| --- | --- | --- |
+| `values` | Complete state after each commit | UI state mirrors, debugging |
+| `updates` | Node/superstep state deltas | Lightweight progress |
+| `events` | Lifecycle events with sequence and metadata | Tracing, audit, Studio |
+| `custom` | Raw values from `stream_writer(value)` | Tokens, business progress |
+| `messages` | `(AIMessageChunk/AIMessage, metadata)` | Chat token streams |
+
+```python
+async for mode, chunk in graph.astream(
+    input_state,
+    context={"tenant": "acme"},
+    stream_mode=["updates", "custom", "messages"],
+):
+    print(mode, chunk)
+```
+
+Custom output wakes the consumer immediately; it does not wait for the node to finish or the superstep to commit:
+
+```python
+def retrieve(state, runtime):
+    runtime.stream_writer({"stage": "searching"})
+    docs = search(state["query"])
+    runtime.stream_writer({"stage": "found", "count": len(docs)})
+    return {"documents": docs}
+```
+
+Streaming is an observation channel and does not participate in reducers. Closing the iterator cancels unfinished tasks and propagates the cancellation token.
+
+## Dynamic interrupts
+
+```python
+from lingxigraph import interrupt
+
+
+def approve(state):
+    decision = interrupt({
+        "kind": "approval",
+        "action": state["proposed_action"],
+    })
+    return {"approved": bool(decision["approved"])}
+```
+
+The graph needs a checkpointer and stable `thread_id`. At `interrupt()`, it saves a checkpoint and pauses. On resume, the node replays from its beginning, so side effects before the interrupt must also be idempotent.
+
+```python
+from lingxigraph import Command
+
+config = {"configurable": {"thread_id": "ticket-42"}}
+graph.invoke(initial, config=config)
+graph.invoke(Command(resume={"approved": True}), config=config)
+```
+
+In Agent Server, the original run becomes `paused`. Resume creates a new run pinned to the same graph/version/config/context:
+
+```bash
+curl -X POST http://localhost:8124/v1/runs/$RUN_ID/resume \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"resume":{"approved":true}}'
+```
+
+<Warning>
+Show reviewers only the fields they need. Never put secrets, tokens, or complete sensitive state in interrupts, events, or traces.
+</Warning>

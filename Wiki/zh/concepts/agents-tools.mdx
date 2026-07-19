@@ -1,0 +1,78 @@
+---
+title: "Agent、消息与工具"
+description: "模型中立协议、ReAct 循环、工具策略和结构化输出"
+---
+
+LingxiGraph 核心定义中立的消息、模型和工具协议，不依赖 LangChain 或厂商 SDK。你可以使用官方适配器，也可以实现自己的 `ChatModel`。
+
+## 消息与模型
+
+`MessagesState.messages` 使用 `add_messages` reducer，按稳定 ID upsert 并保持顺序。支持 `SystemMessage`、`HumanMessage`、`AIMessage`、`ToolMessage`、流式 chunk 与 `RemoveMessage`，且都能通过 JSON serializer 无损 checkpoint。
+
+模型的最小异步协议是：
+
+```python
+class MyModel:
+    async def agenerate(self, messages, *, tools=None, config=None):
+        return AIMessage("result")
+
+    async def astream(self, messages, *, tools=None, config=None):
+        yield AIMessageChunk("res")
+        yield AIMessageChunk("ult")
+```
+
+## 强类型工具
+
+```python
+from lingxigraph import Runtime, tool
+
+
+@tool(
+    permissions=("crm:write",),
+    secret_refs={"token": "crm/api-token"},
+    timeout=10,
+    requires_approval=True,
+)
+def update_ticket(
+    ticket_id: str,
+    status: str,
+    token: str,
+    runtime: Runtime,
+) -> dict:
+    return crm.update(
+        ticket_id,
+        status,
+        token=token,
+        idempotency_key=runtime.idempotency_key,
+    )
+```
+
+装饰器从普通参数的类型注解生成 JSON Schema。`token` 由 secret resolver 在调用边界注入，不会暴露给模型或进入 state。执行前会检查静态 permissions、可选的动态 `tool_authorize`、参数 schema、timeout 和审批结果。
+
+## 预制 ReAct Agent
+
+```python
+from lingxigraph import HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    [update_ticket],
+    system_prompt="Resolve support requests safely.",
+    secret_resolver=resolve_secret,
+)
+
+result = agent.invoke(
+    {"messages": [HumanMessage("Close ticket T-42")]},
+    {
+        "tool_permissions": ["crm:write"],
+        "max_model_calls": 8,
+        "max_tool_calls": 4,
+    },
+)
+```
+
+`create_agent` 构造 `agent → tools → agent` 循环，并支持 pre/post-model hook、并行工具调用、remaining-steps 收尾、HITL 和结构化输出修复。父子图共享模型调用、工具调用、token 与成本预算。
+
+<Tip>
+权限决定“是否允许调用”，审批决定“本次是否同意”，幂等键保证“重试不会重复产生业务效果”。三者解决不同问题，生产工具通常需要组合使用。
+</Tip>

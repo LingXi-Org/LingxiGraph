@@ -1,0 +1,41 @@
+---
+title: "Authentication and authorization"
+description: "OIDC/JWT, development auth, tenant derivation, and fixed RBAC"
+---
+
+Every endpoint except `/health` and `/ready` requires a verified OIDC bearer token or controlled development authentication. `/metrics` also requires `viewer` permission.
+
+```bash
+curl https://agents.example.com/v1/graphs \
+  -H "Authorization: Bearer $LINGXIGRAPH_TOKEN"
+```
+
+## JWT verification
+
+The server verifies issuer, audience, JWKS signature, `exp`, `iat`, and `sub`. The tenant is derived only from the verified claim named by `LINGXIGRAPH_TENANT_CLAIM` (default `tenant_id`). Roles come from `LINGXIGRAPH_ROLES_CLAIM` (default `roles`).
+
+## Fixed roles
+
+| Role | Summary |
+| --- | --- |
+| `viewer` | Read graphs, assistants, threads, runs, state, events, and metrics |
+| `operator` | Create threads/runs, resume/cancel/redrive, operate Store and schedules |
+| `developer` | Create, update, and delete assistants; read graphs |
+| `tenant-admin` | All permissions within the current tenant |
+
+An endpoint usually accepts one or more listed roles; `tenant-admin` covers every action in its tenant. Resource queries always include the tenant predicate, and transaction-local `app.tenant_id` activates PostgreSQL RLS.
+
+## Local development auth
+
+`lingxigraph dev` sets `LINGXIGRAPH_INSECURE_DEV_AUTH=true`. You can then use:
+
+```bash
+curl http://localhost:8124/v1/graphs \
+  -H "X-Tenant-ID: acme"
+```
+
+`X-API-Key` can also carry a configured development key. Keep development auth bound to localhost or a controlled network; never expose it publicly.
+
+<Warning>
+Production must never trust a caller-supplied `X-Tenant-ID` or enable `LINGXIGRAPH_INSECURE_DEV_AUTH=true`. The API database role must not have `BYPASSRLS`, superuser, or table-owner privileges.
+</Warning>

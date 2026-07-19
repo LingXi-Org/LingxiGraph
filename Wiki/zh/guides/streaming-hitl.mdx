@@ -1,0 +1,72 @@
+---
+title: "流式输出与人工审批"
+description: "实时消费状态、事件、模型消息和自定义进度，并安全恢复中断"
+---
+
+## 流模式
+
+| 模式 | 载荷 | 典型用途 |
+| --- | --- | --- |
+| `values` | 每次提交后的完整状态 | UI 状态镜像、调试 |
+| `updates` | 节点/超步状态增量 | 轻量进度更新 |
+| `events` | 带 sequence 和 metadata 的生命周期事件 | tracing、审计、Studio |
+| `custom` | `stream_writer(value)` 写入的原始值 | token、业务进度 |
+| `messages` | `(AIMessageChunk/AIMessage, metadata)` | 聊天 token 流 |
+
+```python
+async for mode, chunk in graph.astream(
+    input_state,
+    context={"tenant": "acme"},
+    stream_mode=["updates", "custom", "messages"],
+):
+    print(mode, chunk)
+```
+
+节点中的 custom 输出立即唤醒 consumer，无需等待节点完成或超步提交：
+
+```python
+def retrieve(state, runtime):
+    runtime.stream_writer({"stage": "searching"})
+    docs = search(state["query"])
+    runtime.stream_writer({"stage": "found", "count": len(docs)})
+    return {"documents": docs}
+```
+
+流是观察通道，不参与 reducer。consumer 主动关闭 iterator 时，运行时会取消未完成任务并传播 cancellation token。
+
+## 动态 interrupt
+
+```python
+from lingxigraph import interrupt
+
+
+def approve(state):
+    decision = interrupt({
+        "kind": "approval",
+        "action": state["proposed_action"],
+    })
+    return {"approved": bool(decision["approved"])}
+```
+
+图必须配置 checkpointer 和稳定 `thread_id`。调用到 `interrupt()` 时会保存 checkpoint 并返回暂停状态；恢复时节点从开头重放，因此 interrupt 之前的副作用也必须幂等。
+
+```python
+from lingxigraph import Command
+
+config = {"configurable": {"thread_id": "ticket-42"}}
+graph.invoke(initial, config=config)
+graph.invoke(Command(resume={"approved": True}), config=config)
+```
+
+Agent Server 中，原 run 进入 `paused`，恢复会创建一个固定相同 graph/version/config/context 的新 run：
+
+```bash
+curl -X POST http://localhost:8124/v1/runs/$RUN_ID/resume \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"resume":{"approved":true}}'
+```
+
+<Warning>
+只向审批者展示必要字段，不要把 secret、token 或完整敏感 state 放进 interrupt、event 或 trace。
+</Warning>

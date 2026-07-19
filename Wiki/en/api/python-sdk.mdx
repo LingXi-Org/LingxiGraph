@@ -1,0 +1,85 @@
+---
+title: "Python SDK"
+description: "Manage every Agent Server resource with synchronous or asynchronous clients"
+---
+
+```bash
+pip install "lingxigraph[sdk]"
+```
+
+## Synchronous client
+
+```python
+from lingxigraph.sdk import LingxiGraphClient
+
+with LingxiGraphClient(
+    "https://agents.example.com",
+    token="...",
+    timeout=30,
+) as client:
+    graph = client.graphs.get("production-support")
+    assistant = client.assistants.create(
+        graph_id=graph["id"],
+        graph_version=graph["version"],
+        name="support",
+    )
+    thread = client.threads.create(metadata={"external_id": "ticket-42"})
+    run = client.runs.create(
+        assistant["id"],
+        thread_id=thread["id"],
+        input={"request": "reset access", "result": ""},
+        max_model_calls=8,
+    )
+
+    for event in client.runs.stream(run["id"]):
+        print(event["sequence"], event["kind"])
+
+    completed = client.runs.join(run["id"], timeout=120)
+    print(completed["output"])
+```
+
+Available resource methods:
+
+| Resource | Methods |
+| --- | --- |
+| `graphs` | `list()`, `get(graph_id)` |
+| `assistants` | `create(**values)`, `list()`, `get()`, `update()`, `delete()` |
+| `threads` | `create()`, `list()`, `get()`, `update()`, `state()`, `history()`, `fork()`, `delete()` |
+| `runs` | `create()`, `get()`, `list(thread_id)`, `join()`, `stream()`, `cancel()`, `resume()` |
+| `store` | `batch(operations)`, `search(namespace, ...)` |
+| `schedules` | `create()`, `list()`, `update()`, `delete()` |
+
+Use `client.request(method, path, **kwargs)` for redrive or an endpoint not yet wrapped by a resource.
+
+## Asynchronous client
+
+```python
+from lingxigraph.sdk import AsyncLingxiGraphClient
+
+async with AsyncLingxiGraphClient(base_url, token=token) as client:
+    thread = await client.threads.create()
+    run = await client.runs.create(
+        assistant_id,
+        thread_id=thread["id"],
+        input={"request": "hello"},
+    )
+    async for event in client.runs.stream(run["id"]):
+        print(event)
+```
+
+Async resources mirror sync resources. Do not use the synchronous client inside an async event loop.
+
+## Error handling
+
+```python
+from lingxigraph.sdk import LingxiGraphAPIError
+
+try:
+    client.runs.get("missing")
+except LingxiGraphAPIError as exc:
+    print(exc.status_code, exc.code, exc.request_id)
+    if exc.retryable:
+        retry_with_backoff()
+```
+
+Branch only on `status_code`, stable `code`, and `retryable`. `detail` is diagnostic prose, not a machine protocol. The SDK does not automatically retry run creation. Send a stable `Idempotency-Key` through the underlying `request` method when network retries could enqueue twice.

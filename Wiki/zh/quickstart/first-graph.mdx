@@ -1,0 +1,99 @@
+---
+title: "创建第一个图"
+description: "定义状态、节点、边并观察流式更新"
+---
+
+本教程创建一个两节点支持流程：先规范化请求，再生成结果。它只使用嵌入式核心，不需要数据库或模型 API key。
+
+<Steps>
+  <Step title="创建文件">
+    新建 `support_graph.py`：
+
+    ```python
+    from typing import TypedDict
+
+    from lingxigraph import END, START, Runtime, StateGraph
+
+
+    class SupportState(TypedDict):
+        request: str
+        normalized: str
+        result: str
+
+
+    class AppContext(TypedDict):
+        tenant: str
+
+
+    def normalize(state: SupportState):
+        return {"normalized": state["request"].strip().lower()}
+
+
+    def resolve(state: SupportState, runtime: Runtime[AppContext]):
+        runtime.stream_writer({"stage": "resolved"})
+        return {
+            "result": f"{runtime.context['tenant']}: {state['normalized']}"
+        }
+
+
+    builder = StateGraph(
+        SupportState,
+        context_schema=AppContext,
+        name="support",
+        version="1.0.0",
+    )
+    builder.add_node("normalize", normalize)
+    builder.add_node("resolve", resolve, timeout=30)
+    builder.add_edge(START, "normalize")
+    builder.add_edge("normalize", "resolve")
+    builder.add_edge("resolve", END)
+    graph = builder.compile()
+    ```
+  </Step>
+
+  <Step title="同步调用">
+    在文件末尾加入：
+
+    ```python
+    initial = {"request": "  RESET ACCESS  ", "normalized": "", "result": ""}
+    print(graph.invoke(initial, context={"tenant": "acme"}))
+    ```
+
+    ```bash
+    python support_graph.py
+    ```
+  </Step>
+
+  <Step title="观察状态更新">
+    将调用替换为：
+
+    ```python
+    for update in graph.stream(
+        initial,
+        context={"tenant": "acme"},
+        stream_mode="updates",
+    ):
+        print(update)
+    ```
+
+    `updates` 模式按超步产生增量；`values` 产生完整状态；`events` 产生生命周期事件；`custom` 接收 `stream_writer` 写入的值。
+  </Step>
+</Steps>
+
+## 编译时发生了什么
+
+`compile()` 会校验可达性、边、状态 schema 和 reducer，并冻结不可变执行计划。默认字段使用 `LastValue`；并行节点写同一字段时，应使用 `Annotated[T, reducer]` 声明确定性归并策略。
+
+## 加入 checkpoint
+
+```python
+from lingxigraph import InMemorySaver
+
+graph = builder.compile(checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "ticket-123"}}
+result = graph.invoke(initial, config=config, context={"tenant": "acme"})
+snapshot = graph.get_state(config)
+print(snapshot.values)
+```
+
+`InMemorySaver` 适合测试；本地持久化使用 `SqliteSaver`，生产环境使用 `PostgresSaver`。继续阅读[耐久执行](../concepts/durable-execution)。

@@ -1,0 +1,70 @@
+---
+title: "安装"
+description: "根据嵌入式开发、Agent 开发或生产部署选择安装方式"
+---
+
+## 前置要求
+
+- Python 3.11、3.12 或 3.13；
+- 推荐使用 `venv`、uv、Poetry 等隔离环境；
+- 仅完整服务端部署需要 Docker、PostgreSQL 和 Redis。
+
+<Tabs>
+  <Tab title="pip">
+    ```bash
+    python -m venv .venv
+    # Linux/macOS
+    source .venv/bin/activate
+    # Windows PowerShell
+    .venv\Scripts\Activate.ps1
+
+    pip install lingxigraph
+    ```
+  </Tab>
+  <Tab title="uv">
+    ```bash
+    uv venv
+    uv pip install lingxigraph
+    ```
+  </Tab>
+  <Tab title="源码">
+    ```bash
+    git clone https://github.com/LingXi-Org/LingxiGraph.git
+    cd LingxiGraph
+    pip install -e ".[dev,all]"
+    ```
+  </Tab>
+</Tabs>
+
+## 可选依赖
+
+基础包无第三方运行时依赖。只安装当前场景需要的 extra：
+
+| Extra | 安装命令 | 内容 |
+| --- | --- | --- |
+| `server` | `pip install "lingxigraph[server]"` | FastAPI、Uvicorn、JWT、HTTP client |
+| `sdk` | `pip install "lingxigraph[sdk]"` | 同步/异步 Python HTTP SDK |
+| `postgres` | `pip install "lingxigraph[postgres]"` | PostgreSQL repository、checkpoint、Store |
+| `redis` | `pip install "lingxigraph[redis]"` | 缓存、PubSub、取消加速 |
+| `otel` | `pip install "lingxigraph[otel]"` | OpenTelemetry SDK 与 OTLP exporter |
+| `coze` | `pip install "lingxigraph[coze]"` | Coze Bot、Workflow、ChatModel |
+| `openai` | `pip install "lingxigraph[openai]"` | OpenAI-compatible ChatModel |
+| `all` | `pip install "lingxigraph[all]"` | 上述生产能力全集 |
+
+## 验证安装
+
+```bash
+lingxigraph --version
+python -c "from lingxigraph import StateGraph; print('LingxiGraph ready')"
+```
+
+<Note>
+`lingxigraph dev` 需要 `server` extra；`lingxigraph server` 在配置 PostgreSQL 时还需安装 `postgres`。使用 Dockerfile 构建的项目镜像已包含生产依赖。
+</Note>
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="嵌入式运行" icon="python" href="./first-graph">创建并调用第一个状态图。</Card>
+  <Card title="服务端运行" icon="server" href="./agent-server">脚手架项目并打开 Studio。</Card>
+</CardGroup>

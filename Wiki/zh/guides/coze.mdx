@@ -1,0 +1,50 @@
+---
+title: "Coze（扣子）集成"
+description: "把 Coze Bot、Workflow 和 ChatModel 接入耐久图"
+---
+
+```bash
+pip install "lingxigraph[coze]"
+```
+
+## Coze ChatModel
+
+```python
+import os
+
+from lingxigraph import create_agent
+from lingxigraph.integrations import AsyncCozeClient, CozeChatModel
+
+client = AsyncCozeClient(os.environ["COZE_API_TOKEN"])
+model = CozeChatModel("your_bot_id", client=client, user_id="user-001")
+agent = create_agent(model)
+```
+
+中国站默认 `https://api.coze.cn`。国际站、Coze Studio 或企业网关应显式设置 `base_url`。生产令牌可通过同步/异步 `token_provider` 动态获取，不要写入 state、context 或 checkpoint。
+
+## Bot 与 Workflow 节点
+
+- `CozeAgentNode` 将 `MessagesState` 转为 `additional_messages`，并可把 conversation ID 保存到用户声明的状态键；
+- `CozeWorkflowNode` 执行工作流，并将 Coze interrupt 映射为耐久暂停；
+- SSE delta 会立即转成 `AIMessageChunk`，可通过 `messages` 或 `events` 模式消费；
+- `requires_action` 可交给本地 `ToolNode`，或用 `hitl=True` 请求人工审批。
+
+Workflow 恢复值必须回显原事件信息：
+
+```python
+from lingxigraph import Command
+
+Command(resume={
+    "event_id": "event-id-from-interrupt",
+    "interrupt_type": 2,
+    "resume_data": "用户答案",
+})
+```
+
+## 可靠性语义
+
+客户端对网络错误、408/409/425/429/5xx 执行有上限指数退避，遵守 `Retry-After`，并在同一逻辑调用中复用 `X-Idempotency-Key`。SSE 重连发送 `Last-Event-ID` 并按事件 ID 去重。
+
+<Warning>
+Coze 外部调用仍是至少一次语义。远端成功但本地 checkpoint 尚未提交时进程退出，恢复可能重放调用。副作用工具必须使用 `runtime.idempotency_key` 在业务服务去重。
+</Warning>

@@ -1,0 +1,58 @@
+---
+title: "Store, schedules, and interop API"
+description: "Long-term memory, scheduled resources, A2A, and the MCP gateway"
+---
+
+## Store batch
+
+Store provides tenant-isolated, cross-thread long-term data outside checkpoint state. The batch endpoint accepts an array of `StoreOperation` objects:
+
+```bash
+curl -X POST https://agents.example.com/v1/store/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"operations":[
+    {"kind":"put","namespace":["users","u-42"],"key":"profile","value":{"tier":"gold"}},
+    {"kind":"get","namespace":["users","u-42"],"key":"profile"}
+  ]}'
+```
+
+Common `kind` values are `get`, `put`, `delete`, and `search`. The Store implementation validates operation-specific fields. Put dependent operations in one batch and interpret response `results` in request order.
+
+```bash
+GET /v1/store/search?namespace=users/u-42&query=gold&limit=10&offset=0
+```
+
+`namespace` is slash-delimited and `limit` defaults to 10. Semantic query requires an `Embedder`; otherwise search follows the configured Store's text/filter capabilities.
+
+## Schedules
+
+```bash
+curl -X POST https://agents.example.com/v1/schedules \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assistant_id":"ASSISTANT_ID",
+    "cron":"0 9 * * 1-5",
+    "timezone":"Asia/Shanghai",
+    "input":{"job":"daily-review"},
+    "enabled":true,
+    "metadata":{"owner":"ops"}
+  }'
+```
+
+`POST/GET /v1/schedules` creates/lists schedules. `PATCH/DELETE /v1/schedules/{id}` updates or deletes them. PATCH accepts `cron`, `timezone`, `input`, `enabled`, and `metadata`.
+
+<Note>
+The Schedule API manages definitions. Confirm that your version/topology enables a cron executor. Without one, resources are stored but do not create runs automatically.
+</Note>
+
+## A2A and MCP
+
+```text
+GET  /a2a/{assistant_id}/.well-known/agent-card.json
+POST /a2a/{assistant_id}   # A2A JSON-RPC
+POST /mcp                  # MCP JSON-RPC
+```
+
+An assistant with `mcp_expose: true` in metadata is exposed as an MCP tool. The tool name uses `mcp_tool_name`, then `name`, then assistant ID. Gateways share the same tenant and RBAC boundary; remote results still pass through typed JSON serialization and schema validation.

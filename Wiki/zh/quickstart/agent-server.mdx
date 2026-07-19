@@ -1,0 +1,72 @@
+---
+title: "Agent Server 快速入门"
+description: "脚手架项目，启动 Studio，并通过 API 执行图"
+---
+
+Agent Server 为图提供版本化 registry、Assistant、Thread、Run、REST/SSE、队列和 Studio。本地开发模式使用内存 repository 与内嵌 Worker，无需 PostgreSQL 或 Redis。
+
+<Steps>
+  <Step title="安装并创建项目">
+    ```bash
+    pip install "lingxigraph[server,sdk]"
+    lingxigraph new my-agent
+    cd my-agent
+    pip install -e .
+    ```
+
+    脚手架包含图模块、`lingxigraph.json`、Dockerfile 与 Compose 配置。Worker 只加载清单中受信任的 import path。
+  </Step>
+
+  <Step title="启动开发服务器">
+    ```bash
+    lingxigraph dev --reload
+    ```
+
+    - Studio：`http://localhost:8124/studio/`
+    - REST：`http://localhost:8124/v1`
+    - 健康检查：`http://localhost:8124/health`
+  </Step>
+
+  <Step title="通过 REST 创建运行">
+    开发模式启用了明确的不安全认证，可使用 `X-Tenant-ID`：
+
+    ```bash
+    curl -s http://localhost:8124/v1/graphs \
+      -H "X-Tenant-ID: acme"
+
+    curl -s -X POST http://localhost:8124/v1/assistants \
+      -H "Content-Type: application/json" \
+      -H "X-Tenant-ID: acme" \
+      -d '{"graph_id":"agent","name":"support"}'
+    ```
+
+    复制返回的 assistant `id`，再创建 thread 与 run。完整流程见 [Thread 与 Run API](../api/threads-runs)。
+  </Step>
+</Steps>
+
+<Warning>
+`LINGXIGRAPH_INSECURE_DEV_AUTH=true` 与 `X-Tenant-ID` 仅用于本机开发。生产环境必须配置 OIDC/JWT，并从已验证 token claim 派生 tenant。
+</Warning>
+
+## 使用 Docker Compose
+
+在本仓库根目录运行：
+
+```bash
+docker compose up --build
+```
+
+Compose 启动 PostgreSQL 16、Redis 7.2、迁移任务和带内嵌 Worker 的 API。数据写入命名 volume。停止服务使用 `docker compose down`；只有确认不再需要数据时才添加 `-v`。
+
+## CLI 速查
+
+| 命令 | 作用 |
+| --- | --- |
+| `lingxigraph new <name>` | 创建项目脚手架 |
+| `lingxigraph dev [--reload]` | 启动本地内存栈与 Studio |
+| `lingxigraph doctor` | 校验清单与生产配置 |
+| `lingxigraph migrate` | 创建或升级 PostgreSQL schema |
+| `lingxigraph server` | 启动 Agent Server |
+| `lingxigraph worker` | 启动队列 Worker 与健康端口 |
+| `lingxigraph build` | 构建镜像；`--wheel` 构建 wheel |
+| `lingxigraph up` | 启动 Compose 单服务器栈 |

@@ -1,0 +1,46 @@
+---
+title: "LingxiGraph documentation"
+description: "Build resumable, observable, production-scale multi-agent applications"
+---
+
+LingxiGraph is a provider-neutral durable graph runtime. It represents agent workflows as typed state graphs and adds checkpoints, streaming events, human approval, version pinning, and a multi-tenant Agent Server.
+
+<CardGroup cols={2}>
+  <Card title="Install and choose a runtime" icon="download" href="./quickstart/installation">
+    Choose the dependency-free embedded core, local development server, or complete production stack.
+  </Card>
+  <Card title="Build your first graph" icon="diagram-project" href="./quickstart/first-graph">
+    Create an executable state graph from TypedDict schemas, nodes, and edges.
+  </Card>
+  <Card title="Start Agent Server" icon="server" href="./quickstart/agent-server">
+    Run graphs through Studio, REST, SSE, and the Python SDK.
+  </Card>
+  <Card title="Browse the API" icon="brackets-curly" href="./api/overview">
+    Explore resource models, authentication, errors, and every endpoint.
+  </Card>
+</CardGroup>
+
+## What you can build
+
+- Long-running agent workflows with checkpoints and human approval.
+- Supervisor, handoff, swarm, group-chat, and parallel-review systems.
+- Reliable task execution with stable idempotency keys, budgets, retries, and dead letters.
+- Hybrid agent networks connected through Coze, OpenAI-compatible APIs, A2A, or MCP.
+- Enterprise platforms that require OIDC, RBAC, tenant isolation, RLS, and OpenTelemetry.
+
+## Two product layers
+
+| Layer | Primary objects | Use it for |
+| --- | --- | --- |
+| Python runtime | `StateGraph`, `CompiledGraph`, `Runtime`, checkpoints, Store | Embedding in a service, single-process execution, unit tests |
+| Agent platform | Graph, Assistant, Thread, Run, Schedule, REST/SSE, Worker | Multi-tenant control planes, queues, independent scaling, unified operations |
+
+<Tip>
+For a first evaluation, follow Installation → Build your first graph → Agent Server. It takes about ten minutes.
+</Tip>
+
+## Version and compatibility
+
+This documentation targets LingxiGraph `2.0.0` on Python 3.11–3.13. Public server endpoints live under `/v1`. Each run pins a graph ID and version, so a deployment cannot change queued or paused work.
+
+Continue with [Architecture](./concepts/architecture) and [Durable execution](./concepts/durable-execution) when you need the underlying guarantees.

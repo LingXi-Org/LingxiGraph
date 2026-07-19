@@ -1,0 +1,51 @@
+---
+title: "Contributing"
+description: "Development setup, quality gates, and the bilingual documentation workflow"
+---
+
+Thank you for contributing to LingxiGraph. Discuss major design changes in an issue first. Small, focused fixes can go directly to a pull request.
+
+## Development setup
+
+```bash
+git clone https://github.com/LingXi-Org/LingxiGraph.git
+cd LingxiGraph
+python -m venv .venv
+# After activating the environment
+pip install -e ".[dev,all]"
+```
+
+## Required checks
+
+```bash
+pytest
+ruff check src tests
+mypy src/lingxigraph
+python -m compileall -q src tests
+python -m build
+```
+
+The branch-coverage gate is 80%. Changes involving PostgreSQL, Redis, RLS, or recovery should run Docker/Testcontainers integration tests. New public behavior needs tests, type annotations, README/docs updates, and a `CHANGELOG.md` entry.
+
+## Documentation
+
+The bilingual Mintlify source is in `Wiki/`:
+
+```bash
+cd Wiki
+npx mintlify dev
+npx mintlify broken-links
+```
+
+Every user-facing page keeps the same relative path under `zh/` and `en/`. Update both languages in the same PR as a code/API change. Examples must be copyable; development-only authentication and dangerous operations must be called out explicitly.
+
+## Pull request standard
+
+- Keep one clear objective and explain motivation, behavior, and compatibility.
+- Do not commit secrets, generated caches, virtual environments, or local configuration.
+- Preserve the provider-neutral core; avoid new base-package dependencies unless essential.
+- Use backward-compatible database migrations and document rollout/rollback.
+- Include tenant-isolation and sensitive-data negative tests for security changes.
+- Request review after every CI check passes.
+
+Our collaboration standard is respectful, professional, and grounded in technical evidence. Report security issues through the [private process](./operations/security-observability#vulnerability-reporting).

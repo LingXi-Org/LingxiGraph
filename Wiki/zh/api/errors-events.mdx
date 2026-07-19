@@ -1,0 +1,80 @@
+---
+title: "错误、幂等与 SSE"
+description: "处理 problem details、run 失败、事件续传与客户端重试"
+---
+
+## Problem details
+
+非 2xx 响应使用 `application/problem+json`：
+
+```json
+{
+  "type": "about:blank",
+  "title": "Quota Exceeded",
+  "status": 429,
+  "detail": "tenant queued-run quota exceeded",
+  "code": "quota_exceeded",
+  "request_id": "01J...",
+  "retryable": true
+}
+```
+
+| 字段 | 用途 |
+| --- | --- |
+| `status` | HTTP 类别 |
+| `code` | 稳定机器码，业务分支的首选字段 |
+| `request_id` | 与服务端日志/trace 关联 |
+| `retryable` | 当前操作是否可使用退避重试 |
+| `detail` | 人类诊断信息，不要解析 |
+
+常见稳定码包括 `idempotency_conflict`、`quota_exceeded`、`join_timeout` 以及由 schema、认证、并发和资源状态映射的 problem code。错误码新增时客户端应安全地归入未知错误，而不是失败解析。
+
+## Run 业务错误
+
+创建 run 成功返回 `202 pending`。之后的节点/schema/provider 错误会使资源变为 `failed`、`timed_out` 或 `dead_letter`，并写入：
+
+```json
+{
+  "status": "failed",
+  "error": {
+    "code": "invalid_update",
+    "message": "...",
+    "retryable": false
+  }
+}
+```
+
+查询和 join 请求本身仍可返回 200。客户端必须同时检查 HTTP 状态与 `run.status`。
+
+## SSE 格式与续传
+
+```text
+GET /v1/runs/{run_id}/stream
+Accept: text/event-stream
+Last-Event-ID: 17
+```
+
+```text
+id: 18
+event: node_completed
+data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{},"created_at":"..."}
+```
+
+- 事件在发送前写入 PostgreSQL；
+- `sequence` 在 run 内从 1 单调递增；
+- 重连时发送最后已处理的 `Last-Event-ID`，服务端从下一条继续；
+- 客户端按 `(run_id, sequence)` 去重，处理重复交付；
+- 以 `: heartbeat` 开头的行是保活注释，应忽略；
+- run 到达 terminal 或 `paused` 后，服务端关闭流。
+
+## 重试策略
+
+1. 只对 `retryable=true`、网络故障、429 和临时 5xx 使用有界指数退避；
+2. 遵守 `Retry-After`；
+3. 创建 run 重试复用相同 `Idempotency-Key` 与完全相同请求；
+4. SSE 重连复用最后 sequence，不创建新 run；
+5. 不自动 redrive 确定性 schema/tool 权限错误。
+
+<Warning>
+请求 key 相同但 body 不同会返回 `409 idempotency_conflict`。不要在冲突后随机换 key 并静默重试，否则可能掩盖调用方 bug 并产生重复业务操作。
+</Warning>

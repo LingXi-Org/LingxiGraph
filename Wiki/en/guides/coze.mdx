@@ -1,0 +1,50 @@
+---
+title: "Coze integration"
+description: "Connect Coze Bot, Workflow, and ChatModel to durable graphs"
+---
+
+```bash
+pip install "lingxigraph[coze]"
+```
+
+## Coze ChatModel
+
+```python
+import os
+
+from lingxigraph import create_agent
+from lingxigraph.integrations import AsyncCozeClient, CozeChatModel
+
+client = AsyncCozeClient(os.environ["COZE_API_TOKEN"])
+model = CozeChatModel("your_bot_id", client=client, user_id="user-001")
+agent = create_agent(model)
+```
+
+The China endpoint defaults to `https://api.coze.cn`. Set `base_url` explicitly for the international service, Coze Studio, or an enterprise gateway. In production, retrieve rotating credentials through a sync/async `token_provider`; never store them in state, context, or checkpoints.
+
+## Bot and Workflow nodes
+
+- `CozeAgentNode` converts `MessagesState` to `additional_messages` and can save a conversation ID in a user-declared state field.
+- `CozeWorkflowNode` runs a workflow and maps Coze interrupts to durable pauses.
+- SSE deltas immediately become `AIMessageChunk` values consumed through `messages` or `events` mode.
+- `requires_action` can execute through local `ToolNode` or request human approval with `hitl=True`.
+
+A Workflow resume must echo the original event information:
+
+```python
+from lingxigraph import Command
+
+Command(resume={
+    "event_id": "event-id-from-interrupt",
+    "interrupt_type": 2,
+    "resume_data": "The user's answer",
+})
+```
+
+## Reliability semantics
+
+The client applies bounded exponential backoff to network errors and 408/409/425/429/5xx, honors `Retry-After`, and reuses `X-Idempotency-Key` within one logical call. SSE reconnects send `Last-Event-ID` and deduplicate by event ID.
+
+<Warning>
+External Coze calls still have at-least-once semantics. Recovery may replay a call if the process exits after remote success but before local checkpoint commit. Side-effecting tools must deduplicate `runtime.idempotency_key` in the business service.
+</Warning>

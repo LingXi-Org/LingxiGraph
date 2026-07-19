@@ -1,0 +1,87 @@
+---
+title: "Thread 与 Run API"
+description: "创建持久会话、执行、等待、取消、恢复和 redrive"
+---
+
+## Thread
+
+```bash
+curl -X POST https://agents.example.com/v1/threads \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"metadata":{"external_id":"ticket-42"}}'
+```
+
+Thread 只接受 `metadata`。使用 `GET/PATCH/DELETE /v1/threads/{thread_id}` 读取、替换 metadata 或删除；删除同时清理可用 checkpointer 中的 thread checkpoint。
+
+状态接口：
+
+```text
+GET  /v1/threads/{thread_id}/state?checkpoint_id=...
+GET  /v1/threads/{thread_id}/history
+POST /v1/threads/{thread_id}/fork
+```
+
+Fork body 为 `{"checkpoint_id":"...","values":{},"as_node":"..."}`；字段均可选。响应是新 lineage 的 runtime config。
+
+## 创建 Run
+
+```bash
+curl -X POST https://agents.example.com/v1/threads/$THREAD_ID/runs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: ticket-42-resolution-v1" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assistant_id": "ASSISTANT_ID",
+    "input": {"request":"reset access","result":""},
+    "durability": "sync",
+    "multitask_strategy": "enqueue",
+    "run_timeout": 120,
+    "max_model_calls": 8,
+    "max_tool_calls": 4,
+    "max_tokens": 12000,
+    "max_cost": 1.5,
+    "metadata": {"requester":"portal"}
+  }'
+```
+
+无状态执行使用 `POST /v1/runs`，body 相同但不产生 thread checkpoint lineage。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `assistant_id` | 必填 | 要执行的 Assistant |
+| `input` | null | 必须满足 graph input schema |
+| `context`、`config` | `{}` | 与 Assistant 默认值合并 |
+| `resume`、`update`、`goto` | null | 高级恢复/控制流输入 |
+| `durability` | `sync` | `sync`、`async`、`exit` |
+| `multitask_strategy` | `enqueue` | `enqueue`、`reject`、`cancel_previous` |
+| `run_timeout` | null | 整个 run 的秒数截止 |
+| `max_*` | null | model/tool/token/cost 共享预算，正数 |
+
+`Idempotency-Key` 长度 1–255，在 tenant 内唯一。同 key + 同请求返回原 run；同 key + 不同请求返回 `409 idempotency_conflict`。
+
+## 查询与等待
+
+```text
+GET /v1/runs/{run_id}
+GET /v1/threads/{thread_id}/runs
+GET /v1/runs/{run_id}/join?timeout=30
+```
+
+`join` 的 timeout 必须大于 0 且不超过 300 秒。尚未到达 terminal/paused 时返回 `408 join_timeout`，客户端可继续请求。
+
+## 取消、恢复与 redrive
+
+```text
+POST /v1/runs/{run_id}/cancel
+POST /v1/runs/{run_id}/resume    {"resume": ..., "update": {...}, "goto": "..."}
+POST /v1/runs/{run_id}/redrive
+```
+
+- cancel 是协作式请求，通常先返回 `cancelling`；节点和 provider 应响应 cancellation token；
+- 只有 `paused` run 可 resume；响应是新 run，`metadata.resumed_from_run_id` 指向原 run；
+- 只有 `failed` 或 `dead_letter` 可 redrive；保留原 input/config/version 并重新入队。
+
+<Warning>
+Redrive 不是“修改输入后重试”。业务输入或 graph version 改变时应创建新 run，并使用新的幂等键。
+</Warning>

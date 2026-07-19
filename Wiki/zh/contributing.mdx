@@ -1,0 +1,51 @@
+---
+title: "贡献指南"
+description: "开发环境、质量门槛和双语文档贡献流程"
+---
+
+感谢参与 LingxiGraph。提交前请先在 issue/讨论中说明重大设计变更；小型修复可直接提交聚焦的 pull request。
+
+## 开发环境
+
+```bash
+git clone https://github.com/LingXi-Org/LingxiGraph.git
+cd LingxiGraph
+python -m venv .venv
+# 激活环境后
+pip install -e ".[dev,all]"
+```
+
+## 必要检查
+
+```bash
+pytest
+ruff check src tests
+mypy src/lingxigraph
+python -m compileall -q src tests
+python -m build
+```
+
+分支覆盖率门槛为 80%。涉及 PostgreSQL、Redis、RLS 或故障恢复的更改应运行 Docker/Testcontainers 集成测试。新增公共行为需要测试、类型注解、README/文档与 `CHANGELOG.md`。
+
+## 文档
+
+双语 Mintlify 源位于 `Wiki/`：
+
+```bash
+cd Wiki
+npx mintlify dev
+npx mintlify broken-links
+```
+
+每个面向用户的页面在 `zh/` 与 `en/` 保持相同相对路径。代码/API 改动应在同一 PR 更新两种语言；示例必须能复制执行，开发专用认证和危险操作必须显式标注。
+
+## Pull request 标准
+
+- 只包含一个清晰目标，说明动机、行为变化与兼容性；
+- 不提交 secret、生成缓存、虚拟环境或本机配置；
+- 保持 provider-neutral 核心，无必要不要向基础包增加依赖；
+- 数据库变更使用向后兼容迁移，说明 rollout/rollback；
+- 安全相关更改包含 tenant 越权和敏感数据负面测试；
+- 所有 CI 检查通过后请求 review。
+
+行为准则以尊重、专业和技术事实为基础。安全问题请遵循[私下报告流程](./operations/security-observability#漏洞报告)。

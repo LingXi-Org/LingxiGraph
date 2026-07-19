@@ -1,0 +1,70 @@
+---
+title: "Installation"
+description: "Choose an installation for embedded development, agent development, or production"
+---
+
+## Prerequisites
+
+- Python 3.11, 3.12, or 3.13.
+- An isolated environment created with `venv`, uv, Poetry, or an equivalent tool.
+- Docker, PostgreSQL, and Redis only for the complete server deployment.
+
+<Tabs>
+  <Tab title="pip">
+    ```bash
+    python -m venv .venv
+    # Linux/macOS
+    source .venv/bin/activate
+    # Windows PowerShell
+    .venv\Scripts\Activate.ps1
+
+    pip install lingxigraph
+    ```
+  </Tab>
+  <Tab title="uv">
+    ```bash
+    uv venv
+    uv pip install lingxigraph
+    ```
+  </Tab>
+  <Tab title="Source">
+    ```bash
+    git clone https://github.com/LingXi-Org/LingxiGraph.git
+    cd LingxiGraph
+    pip install -e ".[dev,all]"
+    ```
+  </Tab>
+</Tabs>
+
+## Optional dependencies
+
+The core package has no third-party runtime dependencies. Install only the extras your application needs:
+
+| Extra | Command | Includes |
+| --- | --- | --- |
+| `server` | `pip install "lingxigraph[server]"` | FastAPI, Uvicorn, JWT, HTTP client |
+| `sdk` | `pip install "lingxigraph[sdk]"` | Sync and async Python HTTP SDK |
+| `postgres` | `pip install "lingxigraph[postgres]"` | PostgreSQL repository, checkpoints, Store |
+| `redis` | `pip install "lingxigraph[redis]"` | Cache, PubSub, cancellation acceleration |
+| `otel` | `pip install "lingxigraph[otel]"` | OpenTelemetry SDK and OTLP exporter |
+| `coze` | `pip install "lingxigraph[coze]"` | Coze Bot, Workflow, and ChatModel |
+| `openai` | `pip install "lingxigraph[openai]"` | OpenAI-compatible ChatModel |
+| `all` | `pip install "lingxigraph[all]"` | Complete production feature set |
+
+## Verify the installation
+
+```bash
+lingxigraph --version
+python -c "from lingxigraph import StateGraph; print('LingxiGraph ready')"
+```
+
+<Note>
+`lingxigraph dev` requires the `server` extra. `lingxigraph server` also needs `postgres` when a PostgreSQL URL is configured. Project images built from the supplied Dockerfile include production dependencies.
+</Note>
+
+## Next step
+
+<CardGroup cols={2}>
+  <Card title="Embedded runtime" icon="python" href="./first-graph">Create and invoke your first state graph.</Card>
+  <Card title="Server runtime" icon="server" href="./agent-server">Scaffold a project and open Studio.</Card>
+</CardGroup>

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "LingxiGraph",
+  "description": "Durable graph runtime for production multi-agent systems",
+  "colors": {
+    "primary": "#0F766E",
+    "light": "#14B8A6",
+    "dark": "#5EEAD4"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "languages": [
+      {
+        "language": "zh",
+        "groups": [
+          {
+            "group": "开始使用",
+            "pages": ["zh/index", "zh/quickstart/installation", "zh/quickstart/first-graph", "zh/quickstart/agent-server"]
+          },
+          {
+            "group": "核心概念",
+            "pages": ["zh/concepts/architecture", "zh/concepts/durable-execution", "zh/concepts/agents-tools"]
+          },
+          {
+            "group": "开发指南",
+            "pages": ["zh/guides/streaming-hitl", "zh/guides/multi-agent", "zh/guides/coze", "zh/guides/deployment"]
+          },
+          {
+            "group": "API 参考",
+            "pages": ["zh/api/overview", "zh/api/authentication", "zh/api/graphs-assistants", "zh/api/threads-runs", "zh/api/store-schedules", "zh/api/python-sdk", "zh/api/errors-events"]
+          },
+          {
+            "group": "运维与项目",
+            "pages": ["zh/operations/configuration", "zh/operations/security-observability", "zh/contributing"]
+          }
+        ]
+      },
+      {
+        "language": "en",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": ["en/index", "en/quickstart/installation", "en/quickstart/first-graph", "en/quickstart/agent-server"]
+          },
+          {
+            "group": "Core concepts",
+            "pages": ["en/concepts/architecture", "en/concepts/durable-execution", "en/concepts/agents-tools"]
+          },
+          {
+            "group": "Guides",
+            "pages": ["en/guides/streaming-hitl", "en/guides/multi-agent", "en/guides/coze", "en/guides/deployment"]
+          },
+          {
+            "group": "API reference",
+            "pages": ["en/api/overview", "en/api/authentication", "en/api/graphs-assistants", "en/api/threads-runs", "en/api/store-schedules", "en/api/python-sdk", "en/api/errors-events"]
+          },
+          {
+            "group": "Operations and project",
+            "pages": ["en/operations/configuration", "en/operations/security-observability", "en/contributing"]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {"label": "GitHub", "href": "https://github.com/LingXi-Org/LingxiGraph"},
+      {"label": "Changelog", "href": "https://github.com/LingXi-Org/LingxiGraph/blob/main/CHANGELOG.md"}
+    ],
+    "primary": {"type": "button", "label": "Open Studio", "href": "http://localhost:8124/studio/"}
+  },
+  "footer": {
+    "socials": {"github": "https://github.com/LingXi-Org/LingxiGraph"}
+  }
+}

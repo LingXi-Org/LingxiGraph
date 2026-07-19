@@ -1,0 +1,65 @@
+---
+title: "Graph 与 Assistant API"
+description: "发现受信图版本，并创建可调用 Assistant"
+---
+
+## Graph
+
+Graph 由部署清单注册，只读且由 `(id, version)` 唯一标识。
+
+```bash
+GET /v1/graphs
+GET /v1/graphs/{graph_id}?graph_version=1.0.0
+GET /v1/graphs/{graph_id}/structure?graph_version=1.0.0&xray=true
+```
+
+GraphInfo 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id`、`version` | string | 稳定图 ID 与部署版本 |
+| `schema_hash` | string | 编译 schema/计划 hash |
+| `input_schema`、`output_schema` | object | JSON Schema |
+| `context_schema` | object/null | context JSON Schema |
+
+`structure` 返回节点、边、debug metadata 和 Mermaid；`xray=true` 递归展开子图。
+
+## 创建 Assistant
+
+```bash
+curl -X POST https://agents.example.com/v1/assistants \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "graph_id": "production-support",
+    "graph_version": "1.0.0",
+    "name": "support-prod",
+    "config": {"recursion_limit": 32},
+    "context": {"region": "cn"},
+    "metadata": {"owner": "support-platform"}
+  }'
+```
+
+| 请求字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `graph_id` | 是 | 已注册图 ID |
+| `graph_version` | 否 | 省略时使用 registry 默认版本 |
+| `name` | 否 | 人类可读名称 |
+| `config` | 否 | 默认运行配置 |
+| `context` | 否 | 默认、经 schema 校验的上下文 |
+| `metadata` | 否 | 平台检索/治理元数据 |
+
+## 管理 Assistant
+
+```text
+GET    /v1/assistants
+GET    /v1/assistants/{assistant_id}
+PATCH  /v1/assistants/{assistant_id}
+DELETE /v1/assistants/{assistant_id}
+```
+
+PATCH 可包含 `name`、`config`、`context`、`metadata`。不能通过 PATCH 更换 graph；需要新图版本时创建新 Assistant 或使用部署策略切换默认版本。
+
+<Info>
+Run 创建时会复制 Assistant 的 graph ID/version/config/context。之后修改 Assistant 不会改变已经排队、运行或暂停的 run。
+</Info>

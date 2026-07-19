@@ -1,0 +1,99 @@
+---
+title: "Build your first graph"
+description: "Define state, nodes, and edges, then observe streamed updates"
+---
+
+This tutorial builds a two-node support flow that normalizes a request and produces a result. It uses only the embedded core—no database or model API key is required.
+
+<Steps>
+  <Step title="Create the file">
+    Create `support_graph.py`:
+
+    ```python
+    from typing import TypedDict
+
+    from lingxigraph import END, START, Runtime, StateGraph
+
+
+    class SupportState(TypedDict):
+        request: str
+        normalized: str
+        result: str
+
+
+    class AppContext(TypedDict):
+        tenant: str
+
+
+    def normalize(state: SupportState):
+        return {"normalized": state["request"].strip().lower()}
+
+
+    def resolve(state: SupportState, runtime: Runtime[AppContext]):
+        runtime.stream_writer({"stage": "resolved"})
+        return {
+            "result": f"{runtime.context['tenant']}: {state['normalized']}"
+        }
+
+
+    builder = StateGraph(
+        SupportState,
+        context_schema=AppContext,
+        name="support",
+        version="1.0.0",
+    )
+    builder.add_node("normalize", normalize)
+    builder.add_node("resolve", resolve, timeout=30)
+    builder.add_edge(START, "normalize")
+    builder.add_edge("normalize", "resolve")
+    builder.add_edge("resolve", END)
+    graph = builder.compile()
+    ```
+  </Step>
+
+  <Step title="Invoke synchronously">
+    Add this at the end of the file:
+
+    ```python
+    initial = {"request": "  RESET ACCESS  ", "normalized": "", "result": ""}
+    print(graph.invoke(initial, context={"tenant": "acme"}))
+    ```
+
+    ```bash
+    python support_graph.py
+    ```
+  </Step>
+
+  <Step title="Observe state updates">
+    Replace the invocation with:
+
+    ```python
+    for update in graph.stream(
+        initial,
+        context={"tenant": "acme"},
+        stream_mode="updates",
+    ):
+        print(update)
+    ```
+
+    `updates` yields superstep deltas; `values` yields complete state; `events` yields lifecycle events; `custom` receives values written through `stream_writer`.
+  </Step>
+</Steps>
+
+## What compilation does
+
+`compile()` validates reachability, edges, state schemas, and reducers, then freezes an immutable execution plan. Fields use `LastValue` by default. When parallel nodes write the same field, declare a deterministic merge function with `Annotated[T, reducer]`.
+
+## Add checkpoints
+
+```python
+from lingxigraph import InMemorySaver
+
+graph = builder.compile(checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "ticket-123"}}
+result = graph.invoke(initial, config=config, context={"tenant": "acme"})
+snapshot = graph.get_state(config)
+print(snapshot.values)
+```
+
+Use `InMemorySaver` for tests, `SqliteSaver` for local persistence, and `PostgresSaver` in production. Continue with [Durable execution](../concepts/durable-execution).

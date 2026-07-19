@@ -1,0 +1,72 @@
+---
+title: "Agent Server quickstart"
+description: "Scaffold a project, start Studio, and execute a graph through the API"
+---
+
+Agent Server adds a versioned graph registry, assistants, threads, runs, REST/SSE, a queue, and Studio. Local development uses an in-memory repository and embedded worker, so PostgreSQL and Redis are not required.
+
+<Steps>
+  <Step title="Install and scaffold">
+    ```bash
+    pip install "lingxigraph[server,sdk]"
+    lingxigraph new my-agent
+    cd my-agent
+    pip install -e .
+    ```
+
+    The project includes a graph module, `lingxigraph.json`, Dockerfile, and Compose configuration. Workers load only trusted import paths declared in the manifest.
+  </Step>
+
+  <Step title="Start the development server">
+    ```bash
+    lingxigraph dev --reload
+    ```
+
+    - Studio: `http://localhost:8124/studio/`
+    - REST: `http://localhost:8124/v1`
+    - Health: `http://localhost:8124/health`
+  </Step>
+
+  <Step title="Create a run through REST">
+    Development mode enables explicit insecure authentication, so you can send `X-Tenant-ID`:
+
+    ```bash
+    curl -s http://localhost:8124/v1/graphs \
+      -H "X-Tenant-ID: acme"
+
+    curl -s -X POST http://localhost:8124/v1/assistants \
+      -H "Content-Type: application/json" \
+      -H "X-Tenant-ID: acme" \
+      -d '{"graph_id":"agent","name":"support"}'
+    ```
+
+    Copy the returned assistant `id`, then create a thread and run. See [Threads and runs](../api/threads-runs) for the complete flow.
+  </Step>
+</Steps>
+
+<Warning>
+`LINGXIGRAPH_INSECURE_DEV_AUTH=true` and `X-Tenant-ID` are for local development only. Production must use OIDC/JWT and derive the tenant from a verified token claim.
+</Warning>
+
+## Use Docker Compose
+
+From the repository root:
+
+```bash
+docker compose up --build
+```
+
+Compose starts PostgreSQL 16, Redis 7.2, a migration job, and the API with an embedded worker. Named volumes hold data. Use `docker compose down` to stop; add `-v` only when you intentionally want to delete the data.
+
+## CLI reference
+
+| Command | Purpose |
+| --- | --- |
+| `lingxigraph new <name>` | Scaffold a project |
+| `lingxigraph dev [--reload]` | Start the in-memory stack and Studio |
+| `lingxigraph doctor` | Validate the manifest and production configuration |
+| `lingxigraph migrate` | Create or upgrade the PostgreSQL schema |
+| `lingxigraph server` | Start Agent Server |
+| `lingxigraph worker` | Start a queue worker and health endpoint |
+| `lingxigraph build` | Build an image; `--wheel` builds a wheel |
+| `lingxigraph up` | Start the single-server Compose stack |

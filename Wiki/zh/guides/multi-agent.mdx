@@ -1,0 +1,44 @@
+---
+title: "多智能体模式"
+description: "选择 supervisor、handoff、swarm、group chat 或并行评审"
+---
+
+多智能体不是单一架构。先根据控制权、并发和终止条件选择模式，再把每个 Agent 作为子图或节点组合。
+
+| 模式 | 控制权 | 适合 |
+| --- | --- | --- |
+| Supervisor | 中央路由器选择下一个 Agent | 角色清晰、需要统一策略 |
+| Manager as tools | Manager 把专家当工具调用 | 输出边界清晰的专家能力 |
+| Handoff | 当前 Agent 显式交接 | 客服转接、分层升级 |
+| Swarm | `active_agent` 在状态中持久化 | 对等协作、动态所有权 |
+| Group chat | selector 在有限轮次内选 speaker | 讨论、辩论、共识 |
+| Plan-execute | Planner 生成任务，executor 执行 | 长任务与可观察计划 |
+| Parallel review | fan-out 后 reducer 汇总 | 代码/文档/风险多维评审 |
+
+## Handoff
+
+`create_handoff_tool()` 产生 `Command(scope=PARENT)`，让子 Agent 把控制权交回直接父图。跨图传递的状态必须明确写入 `Command.update`，不会隐式复制子图全部状态。
+
+```python
+from lingxigraph.patterns import create_handoff_tool
+
+handoff_to_billing = create_handoff_tool(
+    "billing",
+    description="Transfer billing and refund questions",
+)
+```
+
+## Map-reduce fan-out
+
+条件边可返回多个 `Send(node, arg)`，为同一节点创建私有输入的并行任务。结果通过 `Annotated` reducer 合并回共享状态。不要让并行节点写同一个普通 `LastValue` 字段。
+
+## 生产护栏
+
+- 为 group chat 设置有限 `max_turns` 或确定性 termination；
+- 父子图共享 `max_model_calls`、`max_tool_calls`、`max_tokens`、`max_cost`；
+- 为远端 Agent 设置 timeout、retry 和取消传播；
+- handoff 状态只包含下一个角色需要的数据；
+- 所有带副作用的专家工具使用稳定幂等键；
+- 在 event metadata 中保留 agent、namespace 与 task path，便于追踪。
+
+仓库的 `examples/multi_agent_supervisor.py`、`examples/map_reduce_send.py` 和 `examples/subgraph_team_review.py` 提供可运行示例。

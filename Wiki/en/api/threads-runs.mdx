@@ -1,0 +1,87 @@
+---
+title: "Threads and runs API"
+description: "Create persistent sessions, execute, wait, cancel, resume, and redrive"
+---
+
+## Threads
+
+```bash
+curl -X POST https://agents.example.com/v1/threads \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"metadata":{"external_id":"ticket-42"}}'
+```
+
+A thread accepts only `metadata`. Use `GET/PATCH/DELETE /v1/threads/{thread_id}` to read, replace metadata, or delete it. Deletion also removes thread checkpoints from the configured checkpointer when supported.
+
+State endpoints:
+
+```text
+GET  /v1/threads/{thread_id}/state?checkpoint_id=...
+GET  /v1/threads/{thread_id}/history
+POST /v1/threads/{thread_id}/fork
+```
+
+The fork body is `{"checkpoint_id":"...","values":{},"as_node":"..."}`; every field is optional. The response is the runtime config for the new lineage.
+
+## Create a run
+
+```bash
+curl -X POST https://agents.example.com/v1/threads/$THREAD_ID/runs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: ticket-42-resolution-v1" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assistant_id": "ASSISTANT_ID",
+    "input": {"request":"reset access","result":""},
+    "durability": "sync",
+    "multitask_strategy": "enqueue",
+    "run_timeout": 120,
+    "max_model_calls": 8,
+    "max_tool_calls": 4,
+    "max_tokens": 12000,
+    "max_cost": 1.5,
+    "metadata": {"requester":"portal"}
+  }'
+```
+
+Use `POST /v1/runs` for stateless execution. The body is identical, but no thread checkpoint lineage is created.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `assistant_id` | Required | Assistant to execute |
+| `input` | null | Must satisfy the graph input schema |
+| `context`, `config` | `{}` | Merged with assistant defaults |
+| `resume`, `update`, `goto` | null | Advanced resume/control-flow inputs |
+| `durability` | `sync` | `sync`, `async`, or `exit` |
+| `multitask_strategy` | `enqueue` | `enqueue`, `reject`, or `cancel_previous` |
+| `run_timeout` | null | Whole-run deadline in seconds |
+| `max_*` | null | Positive shared model/tool/token/cost budgets |
+
+`Idempotency-Key` is 1–255 characters and unique within a tenant. Same key + same request returns the original run; same key + different request returns `409 idempotency_conflict`.
+
+## Read and wait
+
+```text
+GET /v1/runs/{run_id}
+GET /v1/threads/{thread_id}/runs
+GET /v1/runs/{run_id}/join?timeout=30
+```
+
+Join timeout must be greater than 0 and no more than 300 seconds. If the run is not terminal or paused, the endpoint returns `408 join_timeout`; clients may continue waiting.
+
+## Cancel, resume, and redrive
+
+```text
+POST /v1/runs/{run_id}/cancel
+POST /v1/runs/{run_id}/resume    {"resume": ..., "update": {...}, "goto": "..."}
+POST /v1/runs/{run_id}/redrive
+```
+
+- Cancellation is cooperative and usually returns `cancelling` first; nodes and providers should honor the cancellation token.
+- Only a `paused` run can resume. The response is a new run whose `metadata.resumed_from_run_id` points to the original.
+- Only `failed` or `dead_letter` runs can redrive. Redrive preserves input/config/version and re-enqueues the run.
+
+<Warning>
+Redrive does not mean “retry with edited input.” When business input or graph version changes, create a new run with a new idempotency key.
+</Warning>
