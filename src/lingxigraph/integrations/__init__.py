@@ -6,7 +6,15 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"AsyncCozeClient", "CozeAgentNode", "CozeChatModel", "CozeWorkflowNode"}:
+    if name in {
+        "AsyncCozeClient",
+        "CozeAgentNode",
+        "CozeChatModel",
+        "CozeWorkflowNode",
+        "file_object",
+        "image_object",
+        "text_object",
+    }:
         from . import coze
 
         return getattr(coze, name)
@@ -23,4 +31,7 @@ __all__ = [
     "CozeChatModel",
     "CozeWorkflowNode",
     "OpenAICompatChatModel",
+    "file_object",
+    "image_object",
+    "text_object",
 ]
