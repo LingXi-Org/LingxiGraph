@@ -9,7 +9,7 @@
 [![CI](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml/badge.svg)](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-16A34A.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-0F766E.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.0.1-0F766E.svg)](CHANGELOG.md)
 
 </div>
 
