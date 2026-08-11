@@ -58,6 +58,20 @@ from .runtime import (
     get_stream_writer,
 )
 from .serialization import JsonSerializer, SerializationError, Serializer
+from .skills import (
+    FilesystemSkillSource,
+    SkillError,
+    SkillMetadata,
+    SkillNotFoundError,
+    SkillRegistry,
+    SkillResource,
+    SkillResourceError,
+    SkillSource,
+    SkillSpec,
+    SkillValidationError,
+    SkillValidationIssue,
+    validate_skill,
+)
 from .store import (
     AsyncPostgresStore,
     AsyncStore,
@@ -117,6 +131,7 @@ __all__ = [
     "EdgeInfo",
     "Embedder",
     "ExecutionBudget",
+    "FilesystemSkillSource",
     "END",
     "EmptyInputError",
     "EphemeralValue",
@@ -155,6 +170,16 @@ __all__ = [
     "Send",
     "SerializationError",
     "Serializer",
+    "SkillError",
+    "SkillMetadata",
+    "SkillNotFoundError",
+    "SkillRegistry",
+    "SkillResource",
+    "SkillResourceError",
+    "SkillSource",
+    "SkillSpec",
+    "SkillValidationError",
+    "SkillValidationIssue",
     "SqliteSaver",
     "StateGraph",
     "StateSnapshot",
@@ -183,5 +208,6 @@ __all__ = [
     "tool",
     "tools_condition",
     "validate_json_schema",
+    "validate_skill",
     "task",
 ]

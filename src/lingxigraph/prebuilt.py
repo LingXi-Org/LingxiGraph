@@ -19,6 +19,7 @@ from .messages import (
 )
 from .models import ChatModel
 from .runtime import Runtime
+from .skills import SkillInput, as_skill_registry
 from .tools import ToolNode, ToolSpec, as_tool_spec, tools_condition, validate_json_schema
 from .types import interrupt
 
@@ -32,6 +33,7 @@ def create_agent(
     model: ChatModel,
     tools: Sequence[ToolSpec | Callable[..., Any]] = (),
     *,
+    skills: SkillInput = None,
     system_prompt: str | SystemMessage | None = None,
     state_schema: type = AgentState,
     response_format: Mapping[str, Any] | type | None = None,
@@ -47,7 +49,11 @@ def create_agent(
 ):
     """Build a durable ReAct-style loop over the neutral ``ChatModel`` protocol."""
 
-    specs = tuple(as_tool_spec(item) for item in tools)
+    skill_registry = as_skill_registry(skills)
+    skill_specs = skill_registry.tool_specs() if skill_registry is not None else ()
+    specs = (*tuple(as_tool_spec(item) for item in tools), *skill_specs)
+    if len({spec.name for spec in specs}) != len(specs):
+        raise ValueError("tool names must be unique, including Agent Skills runtime tools")
     approvals = set(interrupt_on or ())
     if isinstance(interrupt_on, Mapping):
         approvals = {key for key, enabled in interrupt_on.items() if enabled}
@@ -57,9 +63,17 @@ def create_agent(
 
     async def call_model(state: Mapping[str, Any], runtime: Runtime[Any]) -> Mapping[str, Any]:
         messages = list(state.get("messages", ()))
+        system_messages: list[SystemMessage] = []
         if system_prompt is not None:
-            prompt = system_prompt if isinstance(system_prompt, SystemMessage) else SystemMessage(system_prompt)
-            messages = [prompt, *messages]
+            prompt = (
+                system_prompt
+                if isinstance(system_prompt, SystemMessage)
+                else SystemMessage(system_prompt)
+            )
+            system_messages.append(prompt)
+        if skill_registry is not None:
+            system_messages.append(SystemMessage(skill_registry.catalog_prompt()))
+        messages = [*system_messages, *messages]
         runtime.consume_model_call()
         stream = getattr(model, "astream", None)
         if callable(stream):
@@ -72,7 +86,11 @@ def create_agent(
             response = await model.agenerate(messages, tools=specs)
             runtime.emit_message(response, {"node": "agent"})
         runtime.consume_model_usage(response.usage)
-        if runtime.remaining_steps is not None and runtime.remaining_steps < 2 and response.tool_calls:
+        if (
+            runtime.remaining_steps is not None
+            and runtime.remaining_steps < 2
+            and response.tool_calls
+        ):
             response = AIMessage(
                 "Unable to complete tool calls within the remaining graph steps.",
                 response_metadata={"finish_reason": "remaining_steps"},
@@ -134,6 +152,7 @@ def create_agent(
             ToolNode(specs, authorize=tool_authorize, secret_resolver=secret_resolver),
         )
     if response_format is not None:
+
         async def structured_response(
             state: Mapping[str, Any], runtime: Runtime[Any]
         ) -> Mapping[str, Any]:
