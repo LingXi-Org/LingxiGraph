@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.1.0
+
+### Agent Skills Runtime
+
+- 新增符合开放 Agent Skills 规范的 `SKILL.md` runtime，包括 `SkillSource`、
+  `FilesystemSkillSource`、`SkillRegistry`、发现、严格验证与 progressive disclosure。
+- `create_agent()` / `create_react_agent()` 新增向后兼容的 keyword-only `skills=` 参数；初始
+  上下文只注入经 XML 转义的 name 与 description，完整指令和资源仅通过
+  `read_skill` / `read_skill_resource` 按需读取。
+- Skill 工具沿用现有 Tool Calling、tool budget、timeout、动态授权、HITL、流式事件与
+  checkpoint 路径；`allowed-tools` 仅为提示，不能创建能力或绕过权限。
+- 资源访问仅限 `references/`、`scripts/` 与 `assets/` 中的普通文件，包含 traversal、
+  symlink、junction、reparse point、特殊文件与大小限制防护；不提供脚本执行 API。
+- 新增中英文概念/API/安全/迁移文档、完整 `skills/hello` 以及离线 ReAct 动态加载示例。
+- 产品包、MCP serverInfo、Helm chart/image 与脚手架依赖元数据升级至 2.1.0。
+
 ## 2.0.1
 
 - Coze 集成补齐开发者文档全量能力：`AsyncCozeClient.upload_file` 走 `/v1/files/upload`

@@ -52,7 +52,22 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
-      - run: ruff check src tests
+      - run: ruff check src tests examples/react_agent_skills.py skills/hello/scripts/hello.py
+      - name: Check formatting of changed Python files
+        run: >-
+          ruff format --check
+          src/lingxigraph/__init__.py
+          src/lingxigraph/prebuilt.py
+          src/lingxigraph/protocols/mcp.py
+          src/lingxigraph/scaffold.py
+          src/lingxigraph/skills.py
+          src/lingxigraph/version.py
+          tests/test_agent_server.py
+          tests/test_skills.py
+          examples/react_agent_skills.py
+          skills/hello/scripts/hello.py
+      - name: Validate bundled Agent Skill
+        run: python -m skills_ref.cli validate skills/hello
       - run: mypy --ignore-missing-imports src/lingxigraph
       - run: coverage run --branch -m unittest discover -s tests -v
       - run: coverage report --fail-under=80

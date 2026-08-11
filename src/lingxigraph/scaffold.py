@@ -106,7 +106,7 @@ builder.add_edge("respond", END)
 graph = builder.compile()
 '''
 
-_MANIFEST = '''{{
+_MANIFEST = """{{
   "$schema": "https://lingxigraph.dev/schemas/manifest-v1.json",
   "graphs": {{
     "{pkg}": {{
@@ -115,9 +115,9 @@ _MANIFEST = '''{{
     }}
   }}
 }}
-'''
+"""
 
-_COMPOSE = '''name: {project}
+_COMPOSE = """name: {project}
 
 x-runtime: &runtime
   build:
@@ -184,9 +184,9 @@ services:
 volumes:
   postgres-data:
   redis-data:
-'''
+"""
 
-_DOCKERFILE = '''FROM python:3.11-slim
+_DOCKERFILE = """FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
@@ -202,9 +202,9 @@ USER 10001
 
 ENTRYPOINT ["lingxigraph"]
 CMD ["server", "--host", "0.0.0.0", "--port", "8124", "--embedded-worker"]
-'''
+"""
 
-_PYPROJECT = '''[build-system]
+_PYPROJECT = """[build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
@@ -213,19 +213,19 @@ name = "{pkg}"
 version = "1.0.0"
 description = "{project} — a LingxiGraph multi-agent deployment"
 requires-python = ">=3.11"
-dependencies = ["lingxigraph[all]>=2.0.0"]
+dependencies = ["lingxigraph[all]>=2.1.0,<3"]
 
 [tool.setuptools]
 packages = ["{pkg}"]
-'''
+"""
 
-_REQUIREMENTS = "lingxigraph[all]>=2.0.0\n"
+_REQUIREMENTS = "lingxigraph[all]>=2.1.0,<3\n"
 
 _DOCKERIGNORE = ".git\n.venv\n__pycache__\n*.pyc\ndist\nbuild\n"
 
 _GITIGNORE = "__pycache__/\n*.pyc\n.venv/\ndist/\nbuild/\n.env\n"
 
-_README = '''# {project}
+_README = """# {project}
 
 A [LingxiGraph](https://lingxigraph.dev) multi-agent deployment.
 
@@ -258,7 +258,7 @@ lingxigraph build
 - `{pkg}/graph.py` — your trusted agent graph.
 - `lingxigraph.json` — the manifest the Worker imports at deploy time.
 - `docker-compose.yml` — single-server production topology.
-'''
+"""
 
 
 __all__ = ["package_name", "render", "scaffold"]
