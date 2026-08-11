@@ -2,6 +2,11 @@
 
 LingxiGraph 2.0 在零依赖核心中定义消息、工具和模型协议，不绑定 LangChain 或任何模型厂商。
 
+2.1.0 增加开放 Agent Skills Runtime。`create_agent(model, tools=..., skills=...)` 接受目录、
+`SkillSource` 或 `SkillRegistry`，只把 name+description catalog 注入模型。模型需要时调用
+`read_skill` 加载完整 `SKILL.md`，再按需读取 `references/`、`scripts/` 或 `assets/`。
+这两个读取能力仍是普通 `ToolSpec`，共享授权、预算、timeout、流式和 checkpoint 语义。
+
 `MessagesState` 的 `messages` 使用 `add_messages` reducer：按 ID 更新、保持顺序，并支持
 `RemoveMessage`。系统、人类、AI、工具消息和流式 chunk 都能经 JSON serializer v2 无损
 进入 SQLite/PostgreSQL checkpoint。

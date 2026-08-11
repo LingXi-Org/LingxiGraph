@@ -22,6 +22,7 @@ It is designed for long-running agents that need human approval, parallel collab
 - **Deterministic graph runtime** — Pregel-style `plan → execute → commit` supersteps with deterministic merging of parallel updates.
 - **Durable execution** — typed checkpoints, pending writes, history, replay, forks, and deeply nested subgraph namespaces.
 - **Provider-neutral agents** — neutral messages and `ChatModel`, typed tools, a prebuilt ReAct loop, HITL approval, and structured output.
+- **Open Agent Skills** — native `SKILL.md`, progressive disclosure, extensible `SkillSource`, and safe resource reads.
 - **Multi-agent patterns** — supervisor, handoff, swarm, group chat, plan-and-execute, parallel review, and map-reduce.
 - **Production control plane** — version pinning, PostgreSQL leases, idempotency, dead-letter/redrive, budgets, quotas, and cooperative cancellation.
 - **Open interfaces** — REST, resumable SSE, Python SDK, A2A, MCP, Coze, and OpenAI-compatible adapters.
@@ -116,6 +117,28 @@ result = agent.invoke(
 )
 ```
 
+## Agent Skills
+
+LingxiGraph reads the open Agent Skills directory format directly and introduces no private manifest.
+At startup, the agent sees only each Skill's `name` and `description`; it loads `SKILL.md` and resources
+through ordinary `read_skill` and `read_skill_resource` tool calls. DeepSeek and other
+OpenAI-compatible models therefore require no Skill-specific adapter.
+
+```python
+from lingxigraph import FilesystemSkillSource, HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    tools=[search],
+    skills=FilesystemSkillSource("skills"),
+)
+result = agent.invoke({"messages": [HumanMessage("Greet me in Chinese")]})
+```
+
+A Skill's experimental `allowed-tools` value is advisory and cannot bypass tool permissions, dynamic
+authorization, HITL, timeout, or budgets. See [`skills/hello/SKILL.md`](skills/hello/SKILL.md) and
+[`examples/react_agent_skills.py`](examples/react_agent_skills.py) for a complete offline example.
+
 Install official adapters only when needed:
 
 ```bash
@@ -151,6 +174,7 @@ The complete bilingual documentation lives in the prominent [`Wiki/`](Wiki/READM
 | [Build your first graph](Wiki/en/quickstart/first-graph.mdx) | [创建第一个图](Wiki/zh/quickstart/first-graph.mdx) |
 | [Agent Server](Wiki/en/quickstart/agent-server.mdx) | [Agent Server](Wiki/zh/quickstart/agent-server.mdx) |
 | [Core concepts](Wiki/en/concepts/architecture.mdx) | [核心概念](Wiki/zh/concepts/architecture.mdx) |
+| [Agent Skills](Wiki/en/concepts/agent-skills.mdx) | [Agent Skills](Wiki/zh/concepts/agent-skills.mdx) |
 | [REST / SSE API](Wiki/en/api/overview.mdx) | [REST / SSE API](Wiki/zh/api/overview.mdx) |
 | [Production deployment](Wiki/en/guides/deployment.mdx) | [生产部署](Wiki/zh/guides/deployment.mdx) |
 

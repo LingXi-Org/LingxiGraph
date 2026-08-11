@@ -1,0 +1,54 @@
+---
+title: "Agent Skills Runtime"
+description: "使用开放 Agent Skills 规范为 ReAct Agent 渐进加载说明与资源。"
+---
+
+# Agent Skills Runtime
+
+LingxiGraph 2.1.0 直接读取开放 Agent Skills 目录，不定义私有 Skill 格式。每个 Skill 至少包含
+带 YAML frontmatter 的 `SKILL.md`，并可选包含 `scripts/`、`references/` 和 `assets/`。
+
+```text
+skills/hello/
+├── SKILL.md
+├── scripts/
+├── references/
+└── assets/
+```
+
+## 渐进披露
+
+`create_agent(..., skills=...)` 创建时只把每个 Skill 的 `name` 和 `description` 放入模型上下文。
+模型判断 Skill 与任务相关后调用 `read_skill` 获取完整 `SKILL.md`，再按需调用
+`read_skill_resource`。完整说明、路径和资源不会在启动时批量注入。
+
+```python
+from lingxigraph import FilesystemSkillSource, HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    tools=[search],
+    skills=FilesystemSkillSource("skills"),
+)
+result = agent.invoke({"messages": [HumanMessage("用中文问候我")]})
+```
+
+`skills=` 也接受单个目录、目录序列、`SkillSource` 或 `SkillRegistry`。路径既可以指向单个
+Skill，也可以指向包含多个直接子 Skill 的目录。显式 source 中存在无效或重名 Skill 时构建失败。
+
+## 标准字段
+
+`name` 和 `description` 必填；`license`、`compatibility`、`metadata`、`allowed-tools` 可选。
+`SKILL.md` 优先使用大写文件名，同时兼容 reference implementation 支持的小写 `skill.md`。
+项目开发依赖中的 `skills-ref` 会交叉验证示例，运行时核心仍保持零依赖。
+
+## 安全边界
+
+- 只允许读取 `references/`、`scripts/`、`assets/` 下的普通文件。
+- 拒绝绝对路径、`..`、symlink、junction/reparse point、特殊文件和越界解析。
+- 默认限制 `SKILL.md` 为 256 KiB、单资源为 1 MiB。
+- LingxiGraph 不提供 Skill 脚本执行工具；读取脚本不会运行它。
+- `allowed-tools` 只是实验性能力提示，不能创建工具或绕过 `ToolSpec.permissions`、
+  `tool_authorize`、HITL、timeout 与运行预算。
+
+完整离线示例见 `examples/react_agent_skills.py`，标准 Skill 见 `skills/hello/`。
