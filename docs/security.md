@@ -34,6 +34,16 @@ password、api_key 和 cookie 字段。
 
 如需运行不可信代码，必须在 LingxiGraph 之外使用独立沙箱、最小权限身份和网络出口策略。
 
+## Agent Skills
+
+Skill source 是应用部署时显式授予的只读内容边界。filesystem source 只读取
+`references/`、`scripts/`、`assets/` 内的普通文件，并拒绝 traversal、绝对路径、symlink、
+junction/reparse point、特殊文件和超限内容。LingxiGraph 不提供 Skill 脚本执行 API。
+
+`allowed-tools` 是开放规范中的实验性提示，不会映射为授权。Skill 提及的工具仍必须由应用
+显式传给 Agent，并继续经过 `ToolSpec.permissions`、`tool_authorize`、HITL、timeout、预算与
+runtime permission 检查。
+
 ## PostgreSQL 加固
 
 - TLS、磁盘加密、PITR、独立 API/Worker/迁移角色和最小 schema grants。

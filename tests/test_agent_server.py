@@ -61,9 +61,7 @@ class AgentServerTests(unittest.TestCase):
                 [node["id"] for node in structure.json()["nodes"]],
                 ["__start__", "double", "__end__"],
             )
-            assistant = client.post(
-                "/v1/assistants", headers=acme, json={"graph_id": "double"}
-            )
+            assistant = client.post("/v1/assistants", headers=acme, json={"graph_id": "double"})
             self.assertEqual(assistant.status_code, 201, assistant.text)
             thread = client.post("/v1/threads", headers=acme, json={})
             self.assertEqual(thread.status_code, 201, thread.text)
@@ -78,9 +76,7 @@ class AgentServerTests(unittest.TestCase):
 
             self.assertEqual(result.json()["status"], "succeeded", result.text)
             self.assertEqual(result.json()["output"], {"value": 6})
-            self.assertEqual(
-                client.get(f"/v1/runs/{run_id}", headers=other).status_code, 404
-            )
+            self.assertEqual(client.get(f"/v1/runs/{run_id}", headers=other).status_code, 404)
             events = asyncio.run(app.state.repository.list_events("acme", run_id))
             self.assertEqual(events[0].kind, "run_started")
             self.assertEqual(events[-1].kind, "run_completed")
@@ -89,9 +85,7 @@ class AgentServerTests(unittest.TestCase):
             )
             state = client.get(f"/v1/threads/{thread.json()['id']}/state", headers=acme)
             self.assertEqual(state.json()["values"], {"value": 6})
-            history = client.get(
-                f"/v1/threads/{thread.json()['id']}/history", headers=acme
-            )
+            history = client.get(f"/v1/threads/{thread.json()['id']}/history", headers=acme)
             self.assertGreaterEqual(len(history.json()), 1)
             forked = client.post(
                 f"/v1/threads/{thread.json()['id']}/fork",
@@ -108,9 +102,7 @@ class AgentServerTests(unittest.TestCase):
             self.assertNotIn("id: 1\n", resumed_stream.text)
 
     def test_rbac_rejects_viewer_mutation(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         with TestClient(app) as client:
             response = client.post(
                 "/v1/assistants",
@@ -120,9 +112,7 @@ class AgentServerTests(unittest.TestCase):
             self.assertEqual(response.status_code, 403)
 
     def test_resource_store_schedule_and_cancel_lifecycle(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme", "x-request-id": "request-123"}
         with TestClient(app) as client:
             self.assertEqual(client.get("/health").json()["status"], "ok")
@@ -131,9 +121,7 @@ class AgentServerTests(unittest.TestCase):
             self.assertEqual(
                 client.get("/v1/graphs/double", headers=headers).json()["id"], "double"
             )
-            self.assertEqual(
-                client.get("/v1/graphs/missing", headers=headers).status_code, 404
-            )
+            self.assertEqual(client.get("/v1/graphs/missing", headers=headers).status_code, 404)
             missing = client.get("/v1/graphs/missing", headers=headers)
             self.assertEqual(missing.headers["content-type"], "application/problem+json")
             self.assertEqual(missing.json()["code"], "not_found")
@@ -196,9 +184,7 @@ class AgentServerTests(unittest.TestCase):
                 404,
             )
             self.assertEqual(
-                client.get(
-                    f"/v1/threads/{thread['id']}/state", headers=headers
-                ).status_code,
+                client.get(f"/v1/threads/{thread['id']}/state", headers=headers).status_code,
                 404,
             )
             self.assertEqual(
@@ -383,9 +369,8 @@ class AgentServerTests(unittest.TestCase):
                 headers=headers,
                 json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
             )
-            self.assertEqual(
-                initialized.json()["result"]["serverInfo"]["name"], "LingxiGraph"
-            )
+            self.assertEqual(initialized.json()["result"]["serverInfo"]["name"], "LingxiGraph")
+            self.assertEqual(initialized.json()["result"]["serverInfo"]["version"], "2.1.0")
             tools = client.post(
                 "/mcp",
                 headers=headers,

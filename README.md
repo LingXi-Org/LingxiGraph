@@ -9,7 +9,7 @@
 [![CI](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml/badge.svg)](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-16A34A.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.1-0F766E.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.1.0-0F766E.svg)](CHANGELOG.md)
 
 </div>
 
@@ -22,6 +22,7 @@ LingxiGraph 把普通 Python 函数组装成可持久化、可恢复、可流式
 - **确定性图运行时**：Pregel 风格 `plan → execute → commit` 超步；并行任务按编译计划确定性归并。
 - **耐久执行**：typed checkpoint、pending writes、历史、replay、fork 与任意深度子图 namespace。
 - **模型中立 Agent 层**：中立消息、`ChatModel`、强类型工具、ReAct 预制件、HITL 审批与结构化输出。
+- **开放 Agent Skills**：原生 `SKILL.md`、渐进披露、可扩展 `SkillSource` 与安全资源读取。
 - **多智能体模式**：supervisor、handoff、swarm、group chat、plan-execute、parallel review 与 map-reduce。
 - **生产控制面**：版本固定、PostgreSQL 租约队列、幂等键、dead-letter/redrive、预算、配额和协作式取消。
 - **开放协议**：REST、可续传 SSE、Python SDK、A2A、MCP、Coze 与 OpenAI-compatible 适配器。
@@ -116,6 +117,27 @@ result = agent.invoke(
 )
 ```
 
+## Agent Skills
+
+LingxiGraph 原生读取开放 Agent Skills 目录，不定义私有格式。Agent 启动时只看到每个 Skill 的
+`name` 和 `description`；需要时通过普通 Tool Calling 调用 `read_skill` 和
+`read_skill_resource`，因此 DeepSeek 等 OpenAI-compatible 模型无需专用适配。
+
+```python
+from lingxigraph import FilesystemSkillSource, HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    tools=[search],
+    skills=FilesystemSkillSource("skills"),
+)
+result = agent.invoke({"messages": [HumanMessage("用中文问候我")]})
+```
+
+Skill 中的 `allowed-tools` 只作为提示，不能绕过工具权限、动态授权、HITL、timeout 或预算。
+完整示例见 [`skills/hello/SKILL.md`](skills/hello/SKILL.md) 与
+[`examples/react_agent_skills.py`](examples/react_agent_skills.py)。
+
 官方适配器按需安装：
 
 ```bash
@@ -151,6 +173,7 @@ PostgreSQL 是队列、事件与状态的真相来源。Redis 仅用于缓存、
 | [创建第一个图](Wiki/zh/quickstart/first-graph.mdx) | [Build your first graph](Wiki/en/quickstart/first-graph.mdx) |
 | [Agent Server](Wiki/zh/quickstart/agent-server.mdx) | [Agent Server](Wiki/en/quickstart/agent-server.mdx) |
 | [核心概念](Wiki/zh/concepts/architecture.mdx) | [Core concepts](Wiki/en/concepts/architecture.mdx) |
+| [Agent Skills](Wiki/zh/concepts/agent-skills.mdx) | [Agent Skills](Wiki/en/concepts/agent-skills.mdx) |
 | [REST / SSE API](Wiki/zh/api/overview.mdx) | [REST / SSE API](Wiki/en/api/overview.mdx) |
 | [生产部署](Wiki/zh/guides/deployment.mdx) | [Production deployment](Wiki/en/guides/deployment.mdx) |
 | [安全与可观测性](Wiki/zh/operations/security-observability.mdx) | [Security and observability](Wiki/en/operations/security-observability.mdx) |

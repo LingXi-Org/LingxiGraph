@@ -1,0 +1,58 @@
+---
+title: "Agent Skills Runtime"
+description: "Progressively load instructions and resources using the open Agent Skills format."
+---
+
+# Agent Skills Runtime
+
+LingxiGraph 2.1.0 reads the open Agent Skills directory format directly and does not introduce a
+private Skill manifest. Each Skill contains a YAML-frontmatter `SKILL.md` and may bundle `scripts/`,
+`references/`, and `assets/`.
+
+```text
+skills/hello/
+├── SKILL.md
+├── scripts/
+├── references/
+└── assets/
+```
+
+## Progressive disclosure
+
+At construction, `create_agent(..., skills=...)` exposes only each Skill's `name` and `description`.
+When a Skill becomes relevant, the model calls `read_skill` for the complete `SKILL.md`, followed by
+`read_skill_resource` only for a resource it needs. Instructions, locations, and resources are not
+eagerly injected.
+
+```python
+from lingxigraph import FilesystemSkillSource, HumanMessage, create_agent
+
+agent = create_agent(
+    model,
+    tools=[search],
+    skills=FilesystemSkillSource("skills"),
+)
+result = agent.invoke({"messages": [HumanMessage("Greet me in Chinese")]})
+```
+
+`skills=` also accepts a path, a sequence of paths, a `SkillSource`, or a `SkillRegistry`. A path may
+identify one Skill or a root whose direct children are Skills. Invalid and duplicate explicitly
+configured Skills fail agent construction with aggregated diagnostics.
+
+## Standard fields
+
+`name` and `description` are required. `license`, `compatibility`, `metadata`, and `allowed-tools`
+are optional. Uppercase `SKILL.md` is preferred; lowercase `skill.md` is accepted for compatibility
+with the reference implementation. CI cross-validates fixtures with the dev-only `skills-ref`
+package while the runtime core retains zero dependencies.
+
+## Security boundary
+
+- Only regular files below `references/`, `scripts/`, or `assets/` are readable.
+- Absolute paths, `..`, symlinks, junctions/reparse points, special files, and resolved escapes fail.
+- Defaults limit `SKILL.md` to 256 KiB and each resource to 1 MiB.
+- LingxiGraph exposes no Skill script executor; reading a script never runs it.
+- Experimental `allowed-tools` is advisory and cannot create tools or bypass `ToolSpec.permissions`,
+  `tool_authorize`, HITL, timeout, or runtime budgets.
+
+See `examples/react_agent_skills.py` for an offline example and `skills/hello/` for a complete Skill.

@@ -113,3 +113,10 @@ with LingxiGraphClient(
 ```
 
 客户端只能根据 `code` 和 `retryable` 分支，不应解析自然语言 detail。
+
+## Agent Skills Python API
+
+核心公开 `SkillMetadata`、`SkillSpec`、`SkillResource`、`SkillSource`、
+`FilesystemSkillSource`、`SkillRegistry` 和 `validate_skill()`。启用 `skills=` 后，ReAct Agent
+增加 `read_skill(skill_name)` 与 `read_skill_resource(skill_name, path)` 两个标准 Tool Calling
+能力；它们不是 REST 管理端点，也不会自动执行 `scripts/`。

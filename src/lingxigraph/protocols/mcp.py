@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from ..runtime import Runtime
 from ..server.models import RunCreate, enum_value
+from ..version import __version__
 
 
 @dataclass(slots=True)
@@ -107,7 +108,7 @@ class MCPGateway:
                 result = {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "LingxiGraph", "version": "1.0.0"},
+                    "serverInfo": {"name": "LingxiGraph", "version": __version__},
                 }
             elif method == "tools/list":
                 result = {
