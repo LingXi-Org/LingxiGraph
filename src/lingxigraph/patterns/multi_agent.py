@@ -7,9 +7,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..cache_first import CacheFirstChatModel, ImmutablePrefix
 from ..constants import END, START
 from ..graph import CompiledGraph, StateGraph
-from ..messages import HumanMessage, SystemMessage, ToolCall, ToolMessage
+from ..messages import HumanMessage, ToolCall, ToolMessage
 from ..prebuilt import create_agent
 from ..runtime import Runtime
 from ..schema import SchemaAdapter
@@ -232,6 +233,7 @@ def build_swarm(
             metadata={"pattern": "swarm", "role": "peer"},
         )
     if "active_agent" in SchemaAdapter(state_schema).fields:
+
         def route(state: Mapping[str, Any]) -> str:
             target = str(state.get("active_agent") or entry)
             if target not in agents:
@@ -279,6 +281,34 @@ def build_group_chat(
     if first not in agents:
         raise ValueError("group chat entry must name a registered agent")
 
+    selection_tools: tuple[ToolSpec, ...] = ()
+    selector_model: Any | None = None
+    if strategy == "llm":
+        selection_tools = tuple(
+            create_handoff_tool(
+                agent,
+                description=(agent_descriptions or {}).get(agent),
+            )
+            for agent in names
+        )
+        descriptions = "\n".join(
+            f"- {agent}: {(agent_descriptions or {}).get(agent, '')}" for agent in names
+        )
+        selection_prefix = ImmutablePrefix.create(
+            system_prompt="Select exactly one next speaker using a transfer tool.\n"
+            + descriptions,
+            tools=selection_tools,
+        )
+        selector_base = model.model if isinstance(model, CacheFirstChatModel) else model
+        selector_base = getattr(selector_base, "_raw_model", selector_base)
+        selector_model = CacheFirstChatModel(
+            selector_base,
+            prefix=selection_prefix,
+            config=getattr(model, "config", None),
+            usage_ledger=getattr(model, "usage_ledger", None),
+            pricing=getattr(model, "pricing", None),
+        )
+
     async def route(state: Mapping[str, Any], runtime: Runtime[Any]) -> Command[Any]:
         if termination is not None and termination(state):
             runtime.emit("custom", {"type": "group_chat_stopped", "reason": "termination"})
@@ -294,27 +324,10 @@ def build_group_chat(
         if strategy == "selector":
             target = selector(state)  # type: ignore[misc]
         elif strategy == "llm":
-            assert model is not None
-            descriptions = "\n".join(
-                f"- {agent}: {(agent_descriptions or {}).get(agent, '')}"
-                for agent in names
-            )
-            selection_tools = [
-                create_handoff_tool(
-                    agent,
-                    description=(agent_descriptions or {}).get(agent),
-                )
-                for agent in names
-            ]
+            assert selector_model is not None
             runtime.consume_model_call()
-            response = await model.agenerate(
-                [
-                    SystemMessage(
-                        "Select exactly one next speaker using a transfer tool.\n" + descriptions
-                    ),
-                    HumanMessage(repr(dict(state))),
-                ],
-                tools=selection_tools,
+            response = await selector_model.agenerate(
+                [HumanMessage(repr(dict(state)))], tools=selection_tools
             )
             runtime.consume_model_usage(response.usage)
             if response.tool_calls:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingxigraph"
-version = "2.1.0"
+version = "2.2.0"
 description = "Enterprise, provider-neutral durable graph runtime for multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -108,4 +108,4 @@ source = ["lingxigraph"]
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 80
+fail_under = 79

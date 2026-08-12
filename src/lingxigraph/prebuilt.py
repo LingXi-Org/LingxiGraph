@@ -6,6 +6,13 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, TypedDict
 
+from .cache_first import (
+    CacheFirstChatModel,
+    CacheFirstConfig,
+    ImmutablePrefix,
+    PrefixDriftError,
+    UsageLedger,
+)
 from .constants import END, START
 from .graph import StateGraph
 from .messages import (
@@ -35,6 +42,13 @@ def create_agent(
     *,
     skills: SkillInput = None,
     system_prompt: str | SystemMessage | None = None,
+    prefix: ImmutablePrefix | None = None,
+    few_shots: Sequence[AnyMessage] = (),
+    pinned_constraints: Sequence[str] = (),
+    cache_first: CacheFirstConfig | Mapping[str, Any] | bool | None = None,
+    usage_ledger: UsageLedger | None = None,
+    pricing: Mapping[str, Any] | None = None,
+    summarizer: Callable[..., Any] | None = None,
     state_schema: type = AgentState,
     response_format: Mapping[str, Any] | type | None = None,
     pre_model_hook: Callable[..., Any] | None = None,
@@ -60,22 +74,62 @@ def create_agent(
     approvals.update(spec.name for spec in specs if spec.requires_approval)
     if structured_retries < 0:
         raise ValueError("structured_retries must be non-negative")
+    if cache_first is False:
+        cache_config = CacheFirstConfig(enabled=False)
+    else:
+        cache_config = CacheFirstConfig.from_mapping(cache_first)
+    effective_ledger = (
+        usage_ledger if usage_ledger is not None else getattr(model, "usage_ledger", None)
+    )
+    effective_pricing = pricing if pricing is not None else getattr(model, "pricing", None)
+
+    legacy_prompt = ""
+    if system_prompt is not None:
+        legacy_prompt = str(
+            system_prompt.content if isinstance(system_prompt, SystemMessage) else system_prompt
+        )
+    if skill_registry is not None:
+        skill_catalog = skill_registry.catalog_prompt(
+            max_skills=cache_config.progressive_tool_limit
+        )
+        legacy_prompt = "\n\n".join(item for item in (legacy_prompt, skill_catalog) if item)
+    if prefix is None:
+        prefix = ImmutablePrefix.create(
+            system_prompt=legacy_prompt,
+            tools=specs,
+            few_shots=few_shots,
+            pinned_constraints=pinned_constraints,
+        )
+    else:
+        expected_catalog = prefix.tool_catalog
+        actual_catalog = ImmutablePrefix.create(tools=specs).tool_catalog
+        if expected_catalog.fingerprint != actual_catalog.fingerprint:
+            raise ValueError(
+                "explicit ImmutablePrefix tool catalog does not match create_agent tools: "
+                f"expected={expected_catalog.fingerprint}, actual={actual_catalog.fingerprint}"
+            )
+    if isinstance(model, CacheFirstChatModel):
+        if model.prefix.fingerprint != prefix.fingerprint and cache_config.enabled:
+            raise PrefixDriftError(model.prefix.drift_against(prefix))
+        cache_model = model
+    else:
+        underlying_model = getattr(model, "_raw_model", model)
+        cache_model = CacheFirstChatModel(
+            underlying_model,
+            prefix=prefix,
+            config=cache_config,
+            usage_ledger=effective_ledger,
+            pricing=effective_pricing,
+            active_skill_ids=tuple(item.name for item in skill_registry.discover())
+            if skill_registry is not None
+            else (),
+            summarizer=summarizer,
+        )
 
     async def call_model(state: Mapping[str, Any], runtime: Runtime[Any]) -> Mapping[str, Any]:
         messages = list(state.get("messages", ()))
-        system_messages: list[SystemMessage] = []
-        if system_prompt is not None:
-            prompt = (
-                system_prompt
-                if isinstance(system_prompt, SystemMessage)
-                else SystemMessage(system_prompt)
-            )
-            system_messages.append(prompt)
-        if skill_registry is not None:
-            system_messages.append(SystemMessage(skill_registry.catalog_prompt()))
-        messages = [*system_messages, *messages]
         runtime.consume_model_call()
-        stream = getattr(model, "astream", None)
+        stream = getattr(cache_model, "astream", None)
         if callable(stream):
             chunks = []
             async for chunk in stream(messages, tools=specs):
@@ -83,7 +137,7 @@ def create_agent(
                 runtime.emit_message(chunk, {"node": "agent"})
             response = merge_chunks(chunks)
         else:
-            response = await model.agenerate(messages, tools=specs)
+            response = await cache_model.agenerate(messages, tools=specs)
             runtime.emit_message(response, {"node": "agent"})
         runtime.consume_model_usage(response.usage)
         if (
@@ -149,7 +203,13 @@ def create_agent(
     if specs:
         graph.add_node(
             "tools",
-            ToolNode(specs, authorize=tool_authorize, secret_resolver=secret_resolver),
+            ToolNode(
+                specs,
+                authorize=tool_authorize,
+                secret_resolver=secret_resolver,
+                read_only_concurrency=cache_config.read_only_concurrency,
+                read_only_batch_size=cache_config.read_only_batch_size,
+            ),
         )
     if response_format is not None:
 
@@ -158,9 +218,25 @@ def create_agent(
         ) -> Mapping[str, Any]:
             messages = list(state.get("messages", ()))
             error: Exception | None = None
+            underlying_model = getattr(cache_model.model, "_raw_model", cache_model.model)
+            structured_model = CacheFirstChatModel(
+                underlying_model,
+                prefix=prefix.evolve(tools=()),
+                config=cache_config,
+                usage_ledger=usage_ledger
+                if usage_ledger is not None
+                else getattr(cache_model, "usage_ledger", effective_ledger),
+                pricing=pricing
+                if pricing is not None
+                else getattr(cache_model, "pricing", effective_pricing),
+                active_skill_ids=tuple(item.name for item in skill_registry.discover())
+                if skill_registry is not None
+                else (),
+                summarizer=summarizer,
+            )
             for attempt in range(structured_retries + 1):
                 runtime.consume_model_call()
-                response = await model.agenerate(
+                response = await structured_model.agenerate(
                     messages,
                     tools=None,
                     response_format=response_format,

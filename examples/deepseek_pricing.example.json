@@ -1,0 +1,12 @@
+{
+  "pricing": {
+    "deepseek-chat": {
+      "currency": "USD",
+      "input_miss_per_1m": 0.0,
+      "input_hit_per_1m": 0.0,
+      "cache_write_per_1m": 0.0,
+      "output_per_1m": 0.0
+    }
+  },
+  "note": "Replace zero placeholders with the provider price snapshot used for the benchmark."
+}

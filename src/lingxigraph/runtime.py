@@ -30,6 +30,17 @@ class ExecutionBudget:
     model_calls: int = 0
     tokens: int = 0
     cost: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_requests: int = 0
+    cache_metrics_requests: int = 0
+    usage_total_tokens: int = 0
+    token_savings: int = 0
+    estimated_cost: float = 0.0
+    estimated_cost_savings: float = 0.0
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     def consume_tool_call(self, name: str) -> None:
@@ -56,10 +67,20 @@ class ExecutionBudget:
             self.model_calls = next_calls
 
     def consume_model_usage(self, usage: Mapping[str, Any]) -> None:
+        from .cache_first import normalize_usage
         from .errors import BudgetExceededError
 
         token_value = usage.get("total_tokens", usage.get("total_token_count", 0)) or 0
-        cost_value = usage.get("cost", usage.get("total_cost", 0.0)) or 0.0
+        normalized = normalize_usage(usage)
+        if normalized.total_tokens is not None:
+            token_value = normalized.total_tokens
+        cost_value = (
+            usage.get(
+                "cost",
+                usage.get("total_cost", usage.get("estimated_cost", 0.0)),
+            )
+            or 0.0
+        )
         tokens = int(token_value)
         cost = float(cost_value)
         if tokens < 0 or cost < 0 or not math.isfinite(cost):
@@ -77,9 +98,64 @@ class ExecutionBudget:
                 )
             self.tokens = next_tokens
             self.cost = next_cost
+            self.cache_requests += 1
+            self.usage_total_tokens += tokens
+            self.prompt_tokens += int(normalized.prompt_tokens or 0)
+            self.completion_tokens += int(normalized.completion_tokens or 0)
+            self.cache_hit_tokens += int(normalized.cache_hit_tokens or 0)
+            self.cache_miss_tokens += int(normalized.cache_miss_tokens or 0)
+            self.cache_write_tokens += int(normalized.cache_write_tokens or 0)
+            self.token_savings += int(normalized.token_savings or 0)
+            self.estimated_cost += float(normalized.estimated_cost or 0.0)
+            self.estimated_cost_savings += float(normalized.estimated_cost_savings or 0.0)
+            if normalized.provider_metrics_available:
+                self.cache_metrics_requests += 1
+
+    def cache_snapshot(self) -> dict[str, int | float | None]:
+        """Return the small, privacy-safe telemetry projection for checkpoints."""
+
+        with self._lock:
+            denominator = self.cache_hit_tokens + self.cache_miss_tokens
+            return {
+                "version": 1,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.usage_total_tokens,
+                "cache_hit_tokens": self.cache_hit_tokens,
+                "cache_miss_tokens": self.cache_miss_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+                "cache_requests": self.cache_requests,
+                "cache_metrics_requests": self.cache_metrics_requests,
+                "cache_hit_rate": self.cache_hit_tokens / denominator if denominator else None,
+                "total_input_token_hit_rate": (
+                    self.cache_hit_tokens / self.prompt_tokens if self.prompt_tokens else None
+                ),
+                "token_savings": self.token_savings,
+                "estimated_cost": self.estimated_cost,
+                "estimated_cost_savings": self.estimated_cost_savings,
+            }
+
+    def restore_cache_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Hydrate cumulative cache counters from checkpoint metadata."""
+
+        with self._lock:
+            self.usage_total_tokens = int(snapshot.get("total_tokens", 0) or 0)
+            self.prompt_tokens = int(snapshot.get("prompt_tokens", 0) or 0)
+            self.completion_tokens = int(snapshot.get("completion_tokens", 0) or 0)
+            self.cache_hit_tokens = int(snapshot.get("cache_hit_tokens", 0) or 0)
+            self.cache_miss_tokens = int(snapshot.get("cache_miss_tokens", 0) or 0)
+            self.cache_write_tokens = int(snapshot.get("cache_write_tokens", 0) or 0)
+            self.cache_requests = int(snapshot.get("cache_requests", 0) or 0)
+            self.cache_metrics_requests = int(snapshot.get("cache_metrics_requests", 0) or 0)
+            self.token_savings = int(snapshot.get("token_savings", 0) or 0)
+            self.estimated_cost = float(snapshot.get("estimated_cost", 0.0) or 0.0)
+            self.estimated_cost_savings = float(
+                snapshot.get("estimated_cost_savings", 0.0) or 0.0
+            )
 
     def snapshot(self) -> dict[str, int | float | None]:
         with self._lock:
+            denominator = self.cache_hit_tokens + self.cache_miss_tokens
             return {
                 "model_calls": self.model_calls,
                 "tool_calls": self.tool_calls,
@@ -89,6 +165,21 @@ class ExecutionBudget:
                 "max_tool_calls": self.max_tool_calls,
                 "max_tokens": self.max_tokens,
                 "max_cost": self.max_cost,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "cache_hit_tokens": self.cache_hit_tokens,
+                "cache_miss_tokens": self.cache_miss_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+                "cache_requests": self.cache_requests,
+                "cache_metrics_requests": self.cache_metrics_requests,
+                "usage_total_tokens": self.usage_total_tokens,
+                "token_savings": self.token_savings,
+                "estimated_cost": self.estimated_cost,
+                "estimated_cost_savings": self.estimated_cost_savings,
+                "cache_hit_rate": self.cache_hit_tokens / denominator if denominator else None,
+                "total_input_token_hit_rate": (
+                    self.cache_hit_tokens / self.prompt_tokens if self.prompt_tokens else None
+                ),
             }
 
 
