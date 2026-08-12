@@ -666,19 +666,34 @@ class SkillRegistry:
             raise SkillNotFoundError(f"unknown skill {name!r}")
         return source.read_resource(name, path)
 
-    def catalog_prompt(self) -> str:
+    def catalog_prompt(self, *, max_skills: int | None = None) -> str:
+        metadata = self._metadata
+        if max_skills is not None:
+            if max_skills <= 0:
+                raise ValueError("max_skills must be positive when configured")
+            metadata = metadata[:max_skills]
         lines = [
             "The following Agent Skills are available. Use read_skill only when a skill is relevant, "
             "then use read_skill_resource only for a referenced resource you actually need.",
             "<available_skills>",
         ]
-        for skill in self._metadata:
+        for skill in metadata:
             lines.extend(
                 [
                     "<skill>",
                     f"<name>{html.escape(skill.name)}</name>",
                     f"<description>{html.escape(skill.description)}</description>",
                     "</skill>",
+                ]
+            )
+        if max_skills is not None and len(self._metadata) > max_skills:
+            lines.extend(
+                [
+                    f"<additional_skill_count>{len(self._metadata) - max_skills}</additional_skill_count>",
+                    "<additional_skill_names>"
+                    + ", ".join(skill.name for skill in self._metadata[max_skills:])
+                    + "</additional_skill_names>",
+                    "Use read_skill with an exact additional skill name when it is relevant.",
                 ]
             )
         lines.append("</available_skills>")

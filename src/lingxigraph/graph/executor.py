@@ -165,9 +165,11 @@ def _callable_uses_runtime(action: Callable[..., Any]) -> bool:
         return False
     parameter = positional[1]
     annotation = parameter.annotation
-    return parameter.name == "runtime" or annotation is Runtime or getattr(
-        annotation, "__origin__", None
-    ) is Runtime
+    return (
+        parameter.name == "runtime"
+        or annotation is Runtime
+        or getattr(annotation, "__origin__", None) is Runtime
+    )
 
 
 class CompiledStateGraph:
@@ -377,12 +379,16 @@ class CompiledStateGraph:
             ):
                 if "events" in modes:
                     yield ("events", event)
-                if event.kind in {EventKind.RUN_STARTED, EventKind.STATE_UPDATED, EventKind.RUN_COMPLETED}:
+                if event.kind in {
+                    EventKind.RUN_STARTED,
+                    EventKind.STATE_UPDATED,
+                    EventKind.RUN_COMPLETED,
+                }:
                     if isinstance(event.data.get("state"), Mapping):
                         current_state = copy.deepcopy(dict(event.data["state"]))
                 if event.kind in {EventKind.NODE_COMPLETED, EventKind.NODE_CACHED}:
-                    pending_updates[str(event.data.get("task_id") or event.task_id)] = copy.deepcopy(
-                        event.data.get("update", {})
+                    pending_updates[str(event.data.get("task_id") or event.task_id)] = (
+                        copy.deepcopy(event.data.get("update", {}))
                     )
                 if event.kind is EventKind.STATE_UPDATED:
                     if "updates" in modes:
@@ -391,7 +397,11 @@ class CompiledStateGraph:
                     if "values" in modes:
                         value = current_state
                         if _project and self._output_keys is not None:
-                            value = {key: item for key, item in value.items() if key in self._output_keys}
+                            value = {
+                                key: item
+                                for key, item in value.items()
+                                if key in self._output_keys
+                            }
                         yield ("values", copy.deepcopy(value))
                 elif event.kind is EventKind.INTERRUPT_RAISED:
                     markers = event.data.get("interrupts", ())
@@ -485,9 +495,7 @@ class CompiledStateGraph:
 
         return iterate()
 
-    def get_state(
-        self, config: Mapping[str, Any], *, subgraphs: bool = False
-    ) -> StateSnapshot:
+    def get_state(self, config: Mapping[str, Any], *, subgraphs: bool = False) -> StateSnapshot:
         del subgraphs
         if self.checkpointer is None:
             raise ValueError("get_state() requires a graph compiled with a checkpointer")
@@ -582,10 +590,7 @@ class CompiledStateGraph:
             run_id=item.checkpoint.run_id,
             channel_versions={
                 **dict(item.checkpoint.channel_versions),
-                **{
-                    key: item.checkpoint.channel_versions.get(key, 0) + 1
-                    for key in values
-                },
+                **{key: item.checkpoint.channel_versions.get(key, 0) + 1 for key in values},
             },
             tasks=item.checkpoint.tasks,
         )
@@ -791,29 +796,34 @@ class CompiledStateGraph:
         limits = {**dict(config.get("configurable", {})), **config}
         self._run_budgets[run_id] = parent_budget or ExecutionBudget(
             max_tool_calls=(
-                int(limits["max_tool_calls"]) if limits.get("max_tool_calls") is not None else None
+                int(limits["max_tool_calls"])
+                if limits.get("max_tool_calls") is not None
+                else None
             ),
             max_model_calls=(
                 int(limits["max_model_calls"])
                 if limits.get("max_model_calls") is not None
                 else None
             ),
-            max_tokens=(int(limits["max_tokens"]) if limits.get("max_tokens") is not None else None),
-            max_cost=(float(limits["max_cost"]) if limits.get("max_cost") is not None else None),
+            max_tokens=(
+                int(limits["max_tokens"]) if limits.get("max_tokens") is not None else None
+            ),
+            max_cost=(
+                float(limits["max_cost"]) if limits.get("max_cost") is not None else None
+            ),
         )
         node_semaphores = {
-            name: asyncio.Semaphore(limit)
-            for name, limit in self._concurrency_limits.items()
+            name: asyncio.Semaphore(limit) for name, limit in self._concurrency_limits.items()
         }
-        checkpoint_writer = (
-            _AsyncCheckpointWriter() if durability is Durability.ASYNC else None
-        )
+        checkpoint_writer = _AsyncCheckpointWriter() if durability is Durability.ASYNC else None
         configurable = config.get("configurable", {})
         namespace_value = configurable.get("checkpoint_ns", "")
         namespace = tuple(part for part in str(namespace_value).split("|") if part)
         thread_id = self._thread_id(config)
         run_timeout = config.get("run_timeout")
-        if run_timeout is not None and (not isinstance(run_timeout, (int, float)) or run_timeout <= 0):
+        if run_timeout is not None and (
+            not isinstance(run_timeout, (int, float)) or run_timeout <= 0
+        ):
             raise ValueError("run_timeout must be a positive number")
         deadline = (
             datetime.now(UTC) + timedelta(seconds=float(run_timeout))
@@ -828,6 +838,10 @@ class CompiledStateGraph:
         if self.checkpointer is not None:
             self._require_thread_id(config)
             latest = await self._aget_tuple(config)
+            if latest is not None:
+                cache_snapshot = latest.metadata.get("lingxigraph.cache_first")
+                if isinstance(cache_snapshot, Mapping):
+                    self._run_budgets[run_id].restore_cache_snapshot(cache_snapshot)
 
         state: dict[str, Any]
         active: tuple[str, ...]
@@ -919,7 +933,9 @@ class CompiledStateGraph:
             state_digest = hashlib.sha256(self.serializer.dumps(state)).hexdigest()[:20]
         except Exception:
             state_digest = hashlib.sha256(repr(state).encode("utf-8")).hexdigest()[:20]
-        base_checkpoint_id = parent_checkpoint_id or f"input:{self.schema_hash[:12]}:{state_digest}"
+        base_checkpoint_id = (
+            parent_checkpoint_id or f"input:{self.schema_hash[:12]}:{state_digest}"
+        )
 
         if stream_mode == "events":
             yield self._event(
@@ -931,7 +947,11 @@ class CompiledStateGraph:
                 data={"state": copy.deepcopy(state)},
             )
 
-        if latest is not None and latest.checkpoint.pending_interrupts and not is_resume_command:
+        if (
+            latest is not None
+            and latest.checkpoint.pending_interrupts
+            and not is_resume_command
+        ):
             markers = latest.checkpoint.pending_interrupts
             if stream_mode == "values":
                 yield self._interrupt_output(state, markers)
@@ -981,9 +1001,7 @@ class CompiledStateGraph:
                         f"{executed_steps} supersteps"
                     )
 
-                deferred_now = {
-                    node for node in active if self.nodes[node].defer
-                }
+                deferred_now = {node for node in active if self.nodes[node].defer}
                 non_deferred = tuple(node for node in active if node not in deferred_now)
                 if deferred_now and (non_deferred or sends):
                     pending_deferred.update(deferred_now)
@@ -1233,9 +1251,7 @@ class CompiledStateGraph:
                     for item in outcomes
                     if isinstance(item, _TaskResult) and item.interrupt is None
                 ]
-                await self._put_pending_results(
-                    config, base_checkpoint_id, tasks, successful
-                )
+                await self._put_pending_results(config, base_checkpoint_id, tasks, successful)
                 failure = next(
                     (item for item in outcomes if isinstance(item, BaseException)), None
                 )
@@ -1331,7 +1347,9 @@ class CompiledStateGraph:
                 if stream_mode == "events":
                     for result in results:
                         yield self._event(
-                            EventKind.NODE_CACHED if result.cached else EventKind.NODE_COMPLETED,
+                            EventKind.NODE_CACHED
+                            if result.cached
+                            else EventKind.NODE_COMPLETED,
                             run_id,
                             step=step,
                             node=result.task.node,
@@ -1856,7 +1874,9 @@ class CompiledStateGraph:
                     else await call
                 )
                 if cache_key is not None and isinstance(result, Mapping):
-                    await self._cache_set(cache_key, result, spec.cache.ttl if spec.cache else None)
+                    await self._cache_set(
+                        cache_key, result, spec.cache.ttl if spec.cache else None
+                    )
                 return result
             except TimeoutError as exc:
                 raise GraphTimeoutError(
@@ -1899,9 +1919,7 @@ class CompiledStateGraph:
         child = spec.subgraph
         assert isinstance(child, CompiledStateGraph)
         shared = [key for key in child.channels if key in self.channels]
-        subinput = {
-            key: copy.deepcopy(state[key]) for key in shared if key in state
-        }
+        subinput = {key: copy.deepcopy(state[key]) for key in shared if key in state}
         child_config: dict[str, Any] = {
             key: value for key, value in config.items() if key != "configurable"
         }
@@ -1966,9 +1984,7 @@ class CompiledStateGraph:
             else:
                 context.call_index = len(context.resume_values)
                 try:
-                    result = await self._invoke_child(
-                        runnable, subinput, child_config, runtime
-                    )
+                    result = await self._invoke_child(runnable, subinput, child_config, runtime)
                 except _ParentCommand as signal:
                     return Command(
                         update=signal.command.update,
@@ -2106,6 +2122,13 @@ class CompiledStateGraph:
     ) -> str | None:
         if self.checkpointer is None:
             return None
+        persisted_metadata = dict(metadata)
+        budget = self._run_budgets.get(run_id or "")
+        if budget is not None:
+            # Keep only counters and fingerprints/diagnostics supplied by the
+            # caller; never put prompts, tool results, or message content into
+            # checkpoint telemetry.
+            persisted_metadata["lingxigraph.cache_first"] = budget.cache_snapshot()
         checkpoint = Checkpoint(
             id=str(uuid4()),
             ts=_utc_now(),
@@ -2136,9 +2159,9 @@ class CompiledStateGraph:
             },
         ):
             if writer is not None:
-                writer.enqueue(lambda: self._aput(config, checkpoint, metadata))
+                writer.enqueue(lambda: self._aput(config, checkpoint, persisted_metadata))
             else:
-                await self._aput(config, checkpoint, metadata)
+                await self._aput(config, checkpoint, persisted_metadata)
         return checkpoint.id
 
     def _make_runtime(
@@ -2221,9 +2244,7 @@ class CompiledStateGraph:
         selected = argument
         if spec.cache.key_fields and isinstance(argument, Mapping):
             selected = {
-                key: argument.get(key)
-                for key in spec.cache.key_fields
-                if key in argument
+                key: argument.get(key) for key in spec.cache.key_fields if key in argument
             }
         elif isinstance(argument, Mapping):
             # Node state is deliberately exposed as an immutable mappingproxy,

@@ -370,7 +370,7 @@ class AgentServerTests(unittest.TestCase):
                 json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
             )
             self.assertEqual(initialized.json()["result"]["serverInfo"]["name"], "LingxiGraph")
-            self.assertEqual(initialized.json()["result"]["serverInfo"]["version"], "2.1.0")
+            self.assertEqual(initialized.json()["result"]["serverInfo"]["version"], "2.2.0")
             tools = client.post(
                 "/mcp",
                 headers=headers,

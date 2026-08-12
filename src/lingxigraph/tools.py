@@ -33,6 +33,7 @@ class ToolSpec:
     permissions: tuple[str, ...] = ()
     requires_approval: bool = False
     secret_refs: Mapping[str, str] = field(default_factory=dict)
+    read_only: bool = False
 
     def as_function_schema(self) -> dict[str, Any]:
         return {
@@ -68,6 +69,7 @@ def _make_spec(
     permissions: Sequence[str] = (),
     requires_approval: bool = False,
     secret_refs: Mapping[str, str] | None = None,
+    read_only: bool = False,
 ) -> ToolSpec:
     if timeout is not None and timeout <= 0:
         raise ValueError("tool timeout must be positive or None")
@@ -112,6 +114,7 @@ def _make_spec(
         permissions=tuple(permissions),
         requires_approval=requires_approval,
         secret_refs=dict(secret_refs or {}),
+        read_only=bool(read_only),
     )
 
 
@@ -124,6 +127,7 @@ def tool(
     permissions: Sequence[str] = (),
     requires_approval: bool = False,
     secret_refs: Mapping[str, str] | None = None,
+    read_only: bool = False,
 ) -> ToolSpec | Callable[[Callable[..., Any]], ToolSpec]:
     """Decorate a typed Python callable as a serializable JSON-schema tool."""
 
@@ -139,6 +143,7 @@ def tool(
             permissions=permissions,
             requires_approval=requires_approval,
             secret_refs=secret_refs,
+            read_only=read_only,
         )
 
     def decorate(func: Callable[..., Any]) -> ToolSpec:
@@ -150,6 +155,7 @@ def tool(
             permissions=permissions,
             requires_approval=requires_approval,
             secret_refs=secret_refs,
+            read_only=read_only,
         )
 
     return decorate
@@ -206,6 +212,8 @@ class ToolNode:
         on_error: bool | Callable[[Exception], str] = True,
         authorize: Callable[[ToolSpec, ToolCall, Runtime[Any] | None], bool | Any] | None = None,
         secret_resolver: Callable[[str], Any] | None = None,
+        read_only_concurrency: int = 4,
+        read_only_batch_size: int = 4,
     ) -> None:
         specs = [as_tool_spec(item) for item in tools]
         if len({item.name for item in specs}) != len(specs):
@@ -216,13 +224,41 @@ class ToolNode:
         self.on_error = on_error
         self.authorize = authorize
         self.secret_resolver = secret_resolver
+        if read_only_concurrency <= 0 or read_only_batch_size <= 0:
+            raise ValueError("read_only_concurrency and read_only_batch_size must be positive")
+        self.read_only_concurrency = read_only_concurrency
+        self.read_only_batch_size = read_only_batch_size
 
     async def __call__(self, state: Mapping[str, Any]) -> Mapping[str, Any] | Command[Any]:
         messages = state.get(self.messages_key, ())
         if not messages or not isinstance(messages[-1], AIMessage):
             raise InvalidUpdateError("ToolNode requires the last message to be an AIMessage")
         calls = messages[-1].tool_calls
-        results = await asyncio.gather(*(self._execute(call) for call in calls))
+        indexed: list[ToolMessage | Command[Any] | None] = [None] * len(calls)
+        index = 0
+        while index < len(calls):
+            spec = self._by_name.get(calls[index].name)
+            if spec is not None and spec.read_only:
+                end = index
+                while end < len(calls):
+                    candidate = self._by_name.get(calls[end].name)
+                    if candidate is None or not candidate.read_only:
+                        break
+                    end += 1
+                batch_width = min(self.read_only_batch_size, self.read_only_concurrency)
+                for start in range(index, end, batch_width):
+                    batch_end = min(end, start + batch_width)
+                    batch_calls = calls[start:batch_end]
+                    results = await asyncio.gather(
+                        *(self._execute(call) for call in batch_calls),
+                        return_exceptions=False,
+                    )
+                    indexed[start:batch_end] = results
+                index = end
+                continue
+            indexed[index] = await self._execute(calls[index])
+            index += 1
+        results = [item for item in indexed if item is not None]
         commands = [result for result in results if isinstance(result, Command)]
         if commands:
             if len(results) != 1:

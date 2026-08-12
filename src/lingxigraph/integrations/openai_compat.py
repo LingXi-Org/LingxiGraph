@@ -8,6 +8,13 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 from uuid import uuid4
 
+from ..cache_first import (
+    CacheFirstChatModel,
+    CacheFirstConfig,
+    ImmutablePrefix,
+    UsageLedger,
+    canonicalize_tools,
+)
 from ..messages import (
     AIMessage,
     AIMessageChunk,
@@ -17,7 +24,7 @@ from ..messages import (
     ToolMessage,
 )
 from ..runtime import get_runtime
-from ..tools import ToolSpec, as_tool_spec
+from ..tools import ToolSpec
 from ._http import should_retry_status, sleep_before_retry
 
 try:
@@ -34,7 +41,15 @@ def _message(value: AnyMessage) -> dict[str, Any]:
             {
                 "id": call.id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": json.dumps(call.args)},
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(
+                        call.args,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
             }
             for call in value.tool_calls
         ]
@@ -56,7 +71,9 @@ def _tool_calls(raw_calls: Sequence[Mapping[str, Any]]) -> tuple[ToolCall, ...]:
             arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
         except json.JSONDecodeError:
             arguments = {"raw": arguments}
-        calls.append(ToolCall(str(function.get("name", "")), dict(arguments), str(raw.get("id", ""))))
+        calls.append(
+            ToolCall(str(function.get("name", "")), dict(arguments), str(raw.get("id", "")))
+        )
     return tuple(calls)
 
 
@@ -72,15 +89,37 @@ class OpenAICompatChatModel:
         default_options: Mapping[str, Any] | None = None,
         max_retries: int = 3,
         retry_base: float = 0.5,
+        immutable_prefix: ImmutablePrefix | None = None,
+        cache_first: CacheFirstConfig | Mapping[str, Any] | bool | None = None,
+        usage_ledger: UsageLedger | None = None,
+        pricing: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
+        self.provider_id = "openai-compatible"
+        self.base_url = base_url.rstrip("/")
+        self.endpoint_format = f"chat-completions:{self.base_url}/chat/completions"
+        self.immutable_prefix = immutable_prefix
+        if cache_first is False:
+            self.cache_first_config = CacheFirstConfig(enabled=False)
+        elif cache_first is None and immutable_prefix is not None:
+            self.cache_first_config = CacheFirstConfig(verify_mode="strict")
+        elif cache_first is None:
+            # No explicit prefix is the backwards-compatible inference mode:
+            # warn on unstable/changed prefixes but keep sending the request.
+            self.cache_first_config = CacheFirstConfig(verify_mode="warn")
+        else:
+            self.cache_first_config = CacheFirstConfig.from_mapping(cache_first)
+        self.usage_ledger = usage_ledger
+        self.pricing = dict(pricing or {})
+        self._raw_model = _RawOpenAIModel(self)
+        self._compat_wrapper: CacheFirstChatModel | None = None
         self._options = dict(default_options or {})
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
         self.max_retries = max_retries
         self.retry_base = retry_base
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
+            base_url=self.base_url,
             headers={"Authorization": f"Bearer {api_key or os.getenv('OPENAI_API_KEY', '')}"},
             timeout=timeout,
             transport=transport,
@@ -105,7 +144,9 @@ class OpenAICompatChatModel:
                     headers=self._request_headers(operation_key),
                 )
                 if should_retry_status(response.status_code) and attempt < self.max_retries:
-                    await sleep_before_retry(attempt + 1, response.headers, base=self.retry_base)
+                    await sleep_before_retry(
+                        attempt + 1, response.headers, base=self.retry_base
+                    )
                     continue
                 response.raise_for_status()
                 return response
@@ -115,16 +156,55 @@ class OpenAICompatChatModel:
                 await sleep_before_retry(attempt + 1, base=self.retry_base)
         raise AssertionError("unreachable")
 
-    def _payload(self, messages: Sequence[AnyMessage], tools: Sequence[Any] | None, **kwargs: Any) -> dict[str, Any]:
-        payload = {"model": self.model, "messages": [_message(item) for item in messages], **self._options, **kwargs}
+    def _payload(
+        self, messages: Sequence[AnyMessage], tools: Sequence[Any] | None, **kwargs: Any
+    ) -> dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "messages": [_message(item) for item in messages],
+            **self._options,
+            **kwargs,
+        }
         if tools:
-            payload["tools"] = [
-                (item if isinstance(item, Mapping) else as_tool_spec(item).as_function_schema())
-                for item in tools
-            ]
+            payload["tools"] = [dict(item) for item in canonicalize_tools(tools)]
         return payload
 
-    async def agenerate(
+    def _inferred_prefix(
+        self,
+        messages: Sequence[AnyMessage],
+        tools: Sequence[Any] | None,
+    ) -> ImmutablePrefix:
+        if self.immutable_prefix is not None:
+            return self.immutable_prefix
+        leading: list[str] = []
+        for message in messages:
+            if message.type != "system":
+                break
+            leading.append(str(message.content))
+        return ImmutablePrefix.create(
+            system_prompt="\n\n".join(leading),
+            tools=tools or (),
+        )
+
+    def _cache_wrapper(
+        self,
+        messages: Sequence[AnyMessage],
+        tools: Sequence[Any] | None,
+    ) -> CacheFirstChatModel:
+        prefix = self._inferred_prefix(messages, tools)
+        if self._compat_wrapper is None:
+            self._compat_wrapper = CacheFirstChatModel(
+                self._raw_model,
+                prefix=prefix,
+                config=self.cache_first_config,
+                usage_ledger=self.usage_ledger,
+                pricing=self.pricing,
+                provider_id=self.provider_id,
+                endpoint_format=self.endpoint_format,
+            )
+        return self._compat_wrapper
+
+    async def _agenerate_raw(
         self,
         messages: Sequence[AnyMessage],
         *,
@@ -138,11 +218,30 @@ class OpenAICompatChatModel:
         return AIMessage(
             message.get("content") or "",
             tool_calls=_tool_calls(message.get("tool_calls", ())),
-            usage=dict(payload.get("usage", {})),
-            response_metadata={"finish_reason": choice.get("finish_reason"), "model": payload.get("model")},
+            usage=dict(payload.get("usage") or {}),
+            response_metadata={
+                "finish_reason": choice.get("finish_reason"),
+                "model": payload.get("model"),
+            },
         )
 
-    async def astream(
+    async def agenerate(
+        self,
+        messages: Sequence[AnyMessage],
+        *,
+        tools: Sequence[ToolSpec | Any] | None = None,
+        **kwargs: Any,
+    ) -> AIMessage:
+        if not self.cache_first_config.enabled:
+            return await self._agenerate_raw(messages, tools=tools, **kwargs)
+        effective_tools = tools
+        if self.immutable_prefix is None and tools is None:
+            effective_tools = ()
+        return await self._cache_wrapper(messages, tools).agenerate(
+            messages, tools=effective_tools, **kwargs
+        )
+
+    async def _astream_raw(
         self,
         messages: Sequence[AnyMessage],
         *,
@@ -207,8 +306,11 @@ class OpenAICompatChatModel:
                                 "finish_reason": choice.get("finish_reason"),
                             },
                         )
-                        if value.content or value.tool_call_chunks or value.usage or choice.get(
-                            "finish_reason"
+                        if (
+                            value.content
+                            or value.tool_call_chunks
+                            or value.usage
+                            or choice.get("finish_reason")
                         ):
                             emitted = True
                             yield value
@@ -218,8 +320,44 @@ class OpenAICompatChatModel:
                     raise
                 await sleep_before_retry(attempt + 1, base=self.retry_base)
 
+    async def astream(
+        self,
+        messages: Sequence[AnyMessage],
+        *,
+        tools: Sequence[ToolSpec | Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[AIMessageChunk]:
+        if not self.cache_first_config.enabled:
+            async for chunk in self._astream_raw(messages, tools=tools, **kwargs):
+                yield chunk
+            return
+        effective_tools = tools
+        if self.immutable_prefix is None and tools is None:
+            effective_tools = ()
+        async for chunk in self._cache_wrapper(messages, tools).astream(
+            messages, tools=effective_tools, **kwargs
+        ):
+            yield chunk
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
 
 __all__ = ["OpenAICompatChatModel"]
+
+
+class _RawOpenAIModel:
+    """Small recursion-free view used by ``CacheFirstChatModel``."""
+
+    def __init__(self, parent: OpenAICompatChatModel) -> None:
+        self._parent = parent
+        self.model = parent.model
+        self.provider_id = parent.provider_id
+        self.endpoint_format = parent.endpoint_format
+
+    async def agenerate(self, messages, *, tools=None, **kwargs):
+        return await self._parent._agenerate_raw(messages, tools=tools, **kwargs)
+
+    async def astream(self, messages, *, tools=None, **kwargs):
+        async for chunk in self._parent._astream_raw(messages, tools=tools, **kwargs):
+            yield chunk
