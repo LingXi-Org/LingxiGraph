@@ -6,7 +6,7 @@ on:
       tag:
         description: Annotated release tag to publish
         required: true
-      default: v2.2.0
+        default: v2.2.0
         type: string
       repository:
         description: Package index
