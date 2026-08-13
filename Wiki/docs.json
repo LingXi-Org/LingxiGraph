@@ -24,7 +24,7 @@
           },
           {
             "group": "开发指南",
-            "pages": ["zh/guides/streaming-hitl", "zh/guides/multi-agent", "zh/guides/coze", "zh/guides/deployment"]
+            "pages": ["zh/guides/streaming-hitl", "zh/guides/multi-agent", "zh/guides/coze", "zh/guides/cache-first", "zh/guides/deployment"]
           },
           {
             "group": "API 参考",
@@ -49,7 +49,7 @@
           },
           {
             "group": "Guides",
-            "pages": ["en/guides/streaming-hitl", "en/guides/multi-agent", "en/guides/coze", "en/guides/deployment"]
+            "pages": ["en/guides/streaming-hitl", "en/guides/multi-agent", "en/guides/coze", "en/guides/cache-first", "en/guides/deployment"]
           },
           {
             "group": "API reference",

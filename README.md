@@ -9,7 +9,7 @@
 [![CI](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml/badge.svg)](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-16A34A.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.1.0-0F766E.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.0-0F766E.svg)](CHANGELOG.md)
 
 </div>
 
@@ -23,6 +23,7 @@ LingxiGraph 把普通 Python 函数组装成可持久化、可恢复、可流式
 - **耐久执行**：typed checkpoint、pending writes、历史、replay、fork 与任意深度子图 namespace。
 - **模型中立 Agent 层**：中立消息、`ChatModel`、强类型工具、ReAct 预制件、HITL 审批与结构化输出。
 - **开放 Agent Skills**：原生 `SKILL.md`、渐进披露、可扩展 `SkillSource` 与安全资源读取。
+- **稳定 Prompt 前缀**：cache-first 请求投影、prefix drift 诊断、usage 归一化、历史清理与上下文压缩。
 - **多智能体模式**：supervisor、handoff、swarm、group chat、plan-execute、parallel review 与 map-reduce。
 - **生产控制面**：版本固定、PostgreSQL 租约队列、幂等键、dead-letter/redrive、预算、配额和协作式取消。
 - **开放协议**：REST、可续传 SSE、Python SDK、A2A、MCP、Coze 与 OpenAI-compatible 适配器。
@@ -138,6 +139,15 @@ Skill 中的 `allowed-tools` 只作为提示，不能绕过工具权限、动态
 完整示例见 [`skills/hello/SKILL.md`](skills/hello/SKILL.md) 与
 [`examples/react_agent_skills.py`](examples/react_agent_skills.py)。
 
+## Cache-first Prompt
+
+2.2.0 将 system prompt、固定约束、few-shot 和 canonical tool schema 固定为
+`ImmutablePrefix`，把用户消息、检索结果、workspace 状态和 tool result 留在动态后缀。通过
+`CacheFirstConfig` 可以启用 prefix drift 校验、history hygiene、context compaction、统一
+cache usage 统计和 `cache_telemetry`。现有 `create_agent(model, tools, system_prompt=...)` 调用
+继续兼容；详细配置见[稳定 Prompt 前缀指南](Wiki/zh/guides/cache-first.mdx)和
+[2.2.0 迁移说明](docs/migration-2.2.md)。
+
 官方适配器按需安装：
 
 ```bash
@@ -174,6 +184,7 @@ PostgreSQL 是队列、事件与状态的真相来源。Redis 仅用于缓存、
 | [Agent Server](Wiki/zh/quickstart/agent-server.mdx) | [Agent Server](Wiki/en/quickstart/agent-server.mdx) |
 | [核心概念](Wiki/zh/concepts/architecture.mdx) | [Core concepts](Wiki/en/concepts/architecture.mdx) |
 | [Agent Skills](Wiki/zh/concepts/agent-skills.mdx) | [Agent Skills](Wiki/en/concepts/agent-skills.mdx) |
+| [稳定 Prompt 前缀](Wiki/zh/guides/cache-first.mdx) | [Cache-first prompt prefixes](Wiki/en/guides/cache-first.mdx) |
 | [REST / SSE API](Wiki/zh/api/overview.mdx) | [REST / SSE API](Wiki/en/api/overview.mdx) |
 | [生产部署](Wiki/zh/guides/deployment.mdx) | [Production deployment](Wiki/en/guides/deployment.mdx) |
 | [安全与可观测性](Wiki/zh/operations/security-observability.mdx) | [Security and observability](Wiki/en/operations/security-observability.mdx) |

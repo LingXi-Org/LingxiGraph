@@ -9,7 +9,7 @@
 [![CI](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml/badge.svg)](https://github.com/LingXi-Org/LingxiGraph/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-16A34A.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.1.0-0F766E.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.0-0F766E.svg)](CHANGELOG.md)
 
 </div>
 
@@ -23,6 +23,7 @@ It is designed for long-running agents that need human approval, parallel collab
 - **Durable execution** — typed checkpoints, pending writes, history, replay, forks, and deeply nested subgraph namespaces.
 - **Provider-neutral agents** — neutral messages and `ChatModel`, typed tools, a prebuilt ReAct loop, HITL approval, and structured output.
 - **Open Agent Skills** — native `SKILL.md`, progressive disclosure, extensible `SkillSource`, and safe resource reads.
+- **Stable prompt prefixes** — cache-first request projection, prefix-drift diagnostics, normalized usage, history hygiene, and context compaction.
 - **Multi-agent patterns** — supervisor, handoff, swarm, group chat, plan-and-execute, parallel review, and map-reduce.
 - **Production control plane** — version pinning, PostgreSQL leases, idempotency, dead-letter/redrive, budgets, quotas, and cooperative cancellation.
 - **Open interfaces** — REST, resumable SSE, Python SDK, A2A, MCP, Coze, and OpenAI-compatible adapters.
@@ -139,6 +140,15 @@ A Skill's experimental `allowed-tools` value is advisory and cannot bypass tool 
 authorization, HITL, timeout, or budgets. See [`skills/hello/SKILL.md`](skills/hello/SKILL.md) and
 [`examples/react_agent_skills.py`](examples/react_agent_skills.py) for a complete offline example.
 
+## Cache-first prompts
+
+Version 2.2.0 keeps system instructions, pinned constraints, few-shot examples, and canonical tool
+schemas in an `ImmutablePrefix`, while user messages, retrievals, workspace state, and tool results
+remain in the dynamic suffix. `CacheFirstConfig` enables prefix-drift verification, history hygiene,
+context compaction, normalized cache usage, and the `cache_telemetry` channel. Existing
+`create_agent(model, tools, system_prompt=...)` calls remain compatible. See the [cache-first prompt
+guide](Wiki/en/guides/cache-first.mdx) and [2.2.0 migration guide](docs/migration-2.2.md).
+
 Install official adapters only when needed:
 
 ```bash
@@ -175,6 +185,7 @@ The complete bilingual documentation lives in the prominent [`Wiki/`](Wiki/READM
 | [Agent Server](Wiki/en/quickstart/agent-server.mdx) | [Agent Server](Wiki/zh/quickstart/agent-server.mdx) |
 | [Core concepts](Wiki/en/concepts/architecture.mdx) | [核心概念](Wiki/zh/concepts/architecture.mdx) |
 | [Agent Skills](Wiki/en/concepts/agent-skills.mdx) | [Agent Skills](Wiki/zh/concepts/agent-skills.mdx) |
+| [Cache-first prompt prefixes](Wiki/en/guides/cache-first.mdx) | [稳定 Prompt 前缀](Wiki/zh/guides/cache-first.mdx) |
 | [REST / SSE API](Wiki/en/api/overview.mdx) | [REST / SSE API](Wiki/zh/api/overview.mdx) |
 | [Production deployment](Wiki/en/guides/deployment.mdx) | [生产部署](Wiki/zh/guides/deployment.mdx) |
 

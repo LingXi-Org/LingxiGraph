@@ -1,0 +1,145 @@
+---
+title: "Cache-first prompt prefixes"
+description: "Keep model request prefixes stable to reduce repeated-context cost and improve long-turn performance."
+---
+
+LingxiGraph 2.2.0 splits model requests into an immutable hot prefix and a per-turn request suffix.
+The prefix is the right place for system instructions, pinned constraints, few-shot examples, and
+canonical tool schemas. User messages, retrievals, timestamps, workspace state, and tool results
+remain in the suffix. Providers that support prompt caching can then reuse stable context without
+changing the raw messages stored in checkpoints.
+
+## Quick start
+
+```python
+from lingxigraph import CacheFirstConfig, HumanMessage, ImmutablePrefix, create_agent, tool
+from lingxigraph.integrations import OpenAICompatChatModel
+
+
+@tool
+def search(query: str) -> str:
+    """Search the internal knowledge base."""
+    return f"results for {query}"
+
+
+prefix = ImmutablePrefix.create(
+    system_prompt="You are a precise repository assistant.",
+    pinned_constraints=("Use supplied evidence only.",),
+    tools=[search],
+)
+model = OpenAICompatChatModel(
+    "deepseek-chat",
+    base_url="https://api.deepseek.com/v1",
+    immutable_prefix=prefix,
+    cache_first=CacheFirstConfig(
+        verify_mode="strict",
+        context_window_tokens=128_000,
+        max_output_tokens=1_024,
+    ),
+)
+agent = create_agent(model, [search], prefix=prefix)
+result = agent.invoke({"messages": [HumanMessage("Find the reset policy")]})
+```
+
+The existing `create_agent` form with `system_prompt` remains supported and automatically creates an
+`ImmutablePrefix`. Without an explicit prefix, Skills metadata and tools participate in prefix
+construction. The legacy `OpenAICompatChatModel` constructor also remains compatible; without an
+explicit prefix it uses `warn` mode and infers leading system messages.
+
+## Prefix stability and drift
+
+Explicit prefixes use strict verification by default. If the model, provider, endpoint, tool catalog,
+active Skill set, or prefix content changes, `PrefixDriftError` reports the expected and actual
+fingerprints, changed sections, revision, tool catalog diff, and a remediation suggestion. Keep
+timestamps, retrievals, and workspace snippets in the suffix rather than the immutable prefix.
+
+Use `verify_mode="warn"` during development or when accommodating an older integration. Set
+`verify_mode="off"` to disable drift verification. Set `cache_first=False` to disable the complete
+path. Verification only affects the request projection; it never rewrites graph state.
+
+## Usage, pricing, and telemetry
+
+`AIMessage.usage` preserves provider fields and adds normalized fields:
+
+- `cache_hit_tokens`, `cache_miss_tokens`, and `cache_write_tokens`;
+- `cache_hit_rate`, `cacheable_token_hit_rate`, and `total_input_token_hit_rate`;
+- `token_savings`, `estimated_cost`, and `estimated_cost_savings`.
+
+DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` take precedence, followed by
+OpenAI's `prompt_tokens_details.cached_tokens` and compatible Anthropic cache fields. If a provider
+reports only one side of a hit/miss pair, the rate remains `None` instead of being presented as a
+fabricated 100%. Pricing is application configuration through `pricing`; cost remains `None` when no
+price is configured.
+
+Use `InMemoryUsageLedger` for process-local counters, or implement `UsageLedger` for SQLite, Redis, or
+a database. Checkpoint metadata stores only non-sensitive counters, rates, fingerprints, and
+diagnostics; it does not store complete prompts or tool results. The same projection is available on
+the runtime `cache_telemetry` custom channel.
+
+## History hygiene and compaction
+
+Before transport, cache-first copies and repairs the model-history projection: it removes orphaned or
+duplicate tool results, incomplete multi-tool blocks, and cross-turn pairings, then orders results by
+the original tool-call order. ANSI text, base64/data URLs, repeated noise, oversized JSON, tool args,
+and cumulative tool-result tokens are bounded according to `CacheFirstConfig`. The original
+checkpointed `messages` are never changed.
+
+When input tokens plus `max_output_tokens` exceed a context or hard cap, only dynamic history is
+compacted. The immutable prefix, latest goal, key conclusions, errors/TODOs, and the most recent
+complete tool block are retained. The default summary is deterministic and local; a `summarizer`
+callback can be supplied and failures fall back to the local summary. Summary requests never enter the
+main request prefix.
+
+## Skills and MCP progressive discovery
+
+With Agent Skills enabled, the fixed `read_skill` / `read_skill_resource` schemas do not grow with Skill
+content. When the number of Skills exceeds `progressive_tool_limit`, the catalog prompt carries only a
+bounded metadata set and loads the body on demand.
+
+For a large MCP catalog, use fixed progressive-discovery tools:
+
+```python
+from lingxigraph.protocols import MCPToolset
+
+mcp_tools = MCPToolset("https://mcp.example.test/rpc").progressive_tools()
+# Fixed schemas: mcp_search, mcp_describe, mcp_call, mcp_refresh_catalog
+agent = create_agent(model, mcp_tools)
+```
+
+Remote schemas and search results remain dynamic tool results, so every turn does not need the full
+catalog. Use `MCPToolset.catalog_fingerprint` to observe catalog changes and keep the catalog stable
+within cache-sensitive threads.
+
+## DeepSeek benchmark
+
+Install `lingxigraph[openai]` and set `DEEPSEEK_API_KEY`:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "..."
+python scripts/benchmark_deepseek_cache.py `
+  --pricing-file examples/deepseek_pricing.example.json `
+  --output artifacts/deepseek-cache.json
+```
+
+The benchmark fixes the endpoint, model, temperature, and output budget. It compares an intentionally
+unstable baseline with cold, warm-up, and steady-state turns, recording hit/miss tokens, cost, TTFT,
+full latency, fingerprints, and provider diagnostics. DeepSeek context caching is best-effort; TTL,
+routing, model-version, and provider-side variance can lower the hit rate, and the report marks that
+variance instead of treating missing usage as a hit.
+
+## Wrapping a custom ChatModel
+
+A provider-neutral custom `ChatModel` needs no protocol changes. Wrap it at the boundary:
+
+```python
+from lingxigraph import CacheFirstChatModel
+
+model = CacheFirstChatModel(
+    custom_model,
+    prefix=prefix,
+    config=CacheFirstConfig(),
+)
+```
+
+The wrapper implements the existing `agenerate` and optional `astream` methods while preserving raw
+provider usage and adding the normalized cache-first projection.

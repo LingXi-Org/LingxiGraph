@@ -1,0 +1,136 @@
+---
+title: "Cache-first 稳定 Prompt 前缀"
+description: "稳定模型请求前缀，降低重复上下文的 token 成本并改善长对话性能。"
+---
+
+LingxiGraph 2.2.0 将模型请求拆成不可变的热前缀和每轮变化的动态后缀。前缀适合放置
+system prompt、固定约束、few-shot 示例和 canonical tool schema；用户消息、检索结果、时间、
+workspace 状态和 tool result 保留在后缀。这样可以让支持 prompt cache 的 provider 更容易复用
+稳定上下文，同时不改变 checkpoint 中保存的原始消息。
+
+## 快速接入
+
+```python
+from lingxigraph import CacheFirstConfig, HumanMessage, ImmutablePrefix, create_agent, tool
+from lingxigraph.integrations import OpenAICompatChatModel
+
+
+@tool
+def search(query: str) -> str:
+    """Search the internal knowledge base."""
+    return f"results for {query}"
+
+
+prefix = ImmutablePrefix.create(
+    system_prompt="You are a precise repository assistant.",
+    pinned_constraints=("Use supplied evidence only.",),
+    tools=[search],
+)
+model = OpenAICompatChatModel(
+    "deepseek-chat",
+    base_url="https://api.deepseek.com/v1",
+    immutable_prefix=prefix,
+    cache_first=CacheFirstConfig(
+        verify_mode="strict",
+        context_window_tokens=128_000,
+        max_output_tokens=1_024,
+    ),
+)
+agent = create_agent(model, [search], prefix=prefix)
+result = agent.invoke({"messages": [HumanMessage("Find the reset policy")]})
+```
+
+`create_agent` 仍支持原有的 `system_prompt` 调用方式，并会自动构造 `ImmutablePrefix`。
+不传显式 prefix 时，Skills catalog 和 tools 也会参与前缀构造。`OpenAICompatChatModel` 的
+旧构造方式保持可用；没有显式 prefix 时采用 `warn` 模式推断连续的 leading system messages。
+
+## Prefix 稳定性与漂移
+
+显式 prefix 默认使用严格校验。模型、provider、endpoint、tool catalog、active Skill 集合或
+prefix 内容改变时，`PrefixDriftError` 会提供 expected/actual fingerprint、changed sections、
+revision、tool catalog diff 和修复建议。将时间戳、检索内容和 workspace 片段放入后缀，避免把
+易变数据写入不可变前缀。
+
+在开发或兼容旧集成时，可以配置 `verify_mode="warn"`；`verify_mode="off"` 会关闭漂移校验。
+显式关闭整个路径使用 `cache_first=False`。漂移校验只影响请求投影，不会改写 graph state。
+
+## Usage、成本与 telemetry
+
+`AIMessage.usage` 保留 provider 原始字段，并追加以下统一字段：
+
+- `cache_hit_tokens`、`cache_miss_tokens`、`cache_write_tokens`；
+- `cache_hit_rate`、`cacheable_token_hit_rate`、`total_input_token_hit_rate`；
+- `token_savings`、`estimated_cost`、`estimated_cost_savings`。
+
+DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 优先；其次识别 OpenAI 的
+`prompt_tokens_details.cached_tokens` 和兼容的 Anthropic cache 字段。provider 只报告 hit 或
+miss 一侧时，命中率保持 `None`，不会伪造 100%。价格由应用通过 `pricing` 配置，未配置价格时
+成本为 `None`。
+
+`InMemoryUsageLedger` 可用于进程内累计统计，也可以实现 `UsageLedger` 接入 SQLite、Redis 或
+数据库。checkpoint metadata 只保存计数、rate、fingerprint 和诊断等非敏感投影，不保存完整
+prompt 或 tool result。相同投影还会通过 runtime 的 `cache_telemetry` custom channel 发出。
+
+## History hygiene 与 compaction
+
+发送给模型前，cache-first 会复制并修复历史投影：删除孤儿 tool result、重复 result、缺失
+result 的完整 multi-tool block 和跨 turn 配对，并按原 tool-call 顺序排列结果。ANSI、base64/data
+URL、重复噪声、超长 JSON、tool args 和累计 tool-result token 会按照 `CacheFirstConfig` 的上限
+压缩。checkpoint 中的原始 `messages` 不会被修改。
+
+当输入 token 加 `max_output_tokens` 超过 context 或 hard cap 时，只压缩动态历史，保留 immutable
+prefix、最新目标、关键结论、错误/TODO 和最近完整 tool block。默认使用确定性的本地摘要；可传
+`summarizer` callback，失败时回退本地摘要，且摘要请求不会混入主请求 prefix。
+
+## Skills 与 MCP progressive discovery
+
+启用 Agent Skills 时，固定的 `read_skill` / `read_skill_resource` schema 不会随 Skill 正文
+膨胀。当 Skills 数量超过 `progressive_tool_limit`，catalog prompt 只携带有限 metadata，正文
+仍按需读取。
+
+大型 MCP catalog 可以使用固定的渐进发现工具：
+
+```python
+from lingxigraph.protocols import MCPToolset
+
+mcp_tools = MCPToolset("https://mcp.example.test/rpc").progressive_tools()
+# 固定 schema：mcp_search、mcp_describe、mcp_call、mcp_refresh_catalog
+agent = create_agent(model, mcp_tools)
+```
+
+远程 schema 和搜索结果作为动态 tool result，不需要在每轮携带完整 catalog。使用
+`MCPToolset.catalog_fingerprint` 观察 catalog 更新，并在 cache-sensitive thread 中保持 tool
+catalog 稳定。
+
+## DeepSeek benchmark
+
+需要安装 `lingxigraph[openai]` 并设置 `DEEPSEEK_API_KEY`：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "..."
+python scripts/benchmark_deepseek_cache.py `
+  --pricing-file examples/deepseek_pricing.example.json `
+  --output artifacts/deepseek-cache.json
+```
+
+benchmark 固定 endpoint、model、temperature 和 output budget，对比不稳定 baseline、cold turn、
+warm-up turn 与 steady-state turns，保存命中/未命中 token、成本、TTFT、完整延迟、fingerprint
+和 provider diagnostics。DeepSeek context cache 是 best-effort；TTL、路由、模型版本和 provider
+side variance 可能造成命中率低于工程目标，报告会明确标记而不会把缺失 usage 当成命中。
+
+## 包装自定义 ChatModel
+
+自定义 provider-neutral `ChatModel` 无需修改协议，只需在边界包一层：
+
+```python
+from lingxigraph import CacheFirstChatModel
+
+model = CacheFirstChatModel(
+    custom_model,
+    prefix=prefix,
+    config=CacheFirstConfig(),
+)
+```
+
+包装器实现既有的 `agenerate` 和可选 `astream`，会返回原始 provider usage 与统一 cache-first
+投影。

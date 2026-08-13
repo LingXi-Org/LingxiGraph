@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.2.0
+
+### Cache-first prompt optimization
+
+- 新增 provider-neutral 的 `ImmutablePrefix`、`CacheFirstConfig` 与 `CacheFirstChatModel`，将稳定
+  system prompt、固定约束、few-shot 和 canonical tool catalog 与动态请求后缀分离。
+- `create_agent()` 和 `OpenAICompatChatModel` 保持向后兼容；支持显式 prefix、prefix drift 诊断、
+  `cache_first=False` 关闭路径，以及自定义 `ChatModel` 包装。
+- 新增 history hygiene、bounded context compaction、确定性摘要回退、Skills/MCP progressive
+  discovery 和 `cache_telemetry` custom channel。
+- 统一 DeepSeek、OpenAI-compatible 和兼容 Anthropic usage 字段，提供 cache hit/miss、命中率、
+  token savings、成本估算与可重启的 `UsageLedger` 累计统计；不把完整 prompt 或 tool result 写入
+  telemetry/checkpoint metadata。
+- 新增中英文 cache-first 指南、2.2.0 迁移说明、DeepSeek benchmark 脚本与示例。
+
 ## 2.1.0
 
 ### Agent Skills Runtime
