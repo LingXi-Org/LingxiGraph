@@ -1,0 +1,47 @@
+{
+  "name": "lingxigraph-docs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LingxiGraph bilingual documentation site powered by Fumadocs",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "check:content": "node scripts/check-docs.mjs",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check": "npm run check:content && npm run typecheck && npm run build",
+    "preview": "npm run build && wrangler pages dev",
+    "cf:deploy": "wrangler pages deploy out --project-name=lingxigraph-docs",
+    "postinstall": "fumadocs-mdx"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@types/mdx": "2.0.13",
+    "fumadocs-core": "16.14.4",
+    "fumadocs-mdx": "15.2.3",
+    "fumadocs-ui": "16.14.4",
+    "lucide-react": "1.31.0",
+    "mermaid": "^11.12.2",
+    "next": "16.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/estree-jsx": "1.0.5",
+    "@types/hast": "3.0.5",
+    "@types/mdast": "4.0.4",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "postcss": "8.5.26",
+    "rolldown": "1.2.4",
+    "satteri": "0.9.5",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "wrangler": "4.122.0"
+  }
+}

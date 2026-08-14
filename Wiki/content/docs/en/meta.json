@@ -1,0 +1,11 @@
+{
+  "pages": [
+    "index",
+    "quickstart",
+    "concepts",
+    "guides",
+    "api",
+    "operations",
+    "contributing"
+  ]
+}

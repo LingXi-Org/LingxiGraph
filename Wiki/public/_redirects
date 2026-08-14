@@ -1,0 +1,5 @@
+/ /docs/zh/ 302
+/zh /docs/zh/ 301
+/en /docs/en/ 301
+/zh/* /docs/zh/:splat 301
+/en/* /docs/en/:splat 301

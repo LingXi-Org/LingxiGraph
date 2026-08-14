@@ -1,0 +1,34 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+:root {
+  --fd-layout-width: 1440px;
+  --color-fd-background: #ffffff;
+  color-scheme: light;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: #ffffff;
+}
+
+body {
+  min-width: 320px;
+  background: #ffffff;
+  font-family: 'PingFang SC', 'PingFang TC', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+}
+
+.site-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  line-height: 1;
+}
+
+.site-brand img {
+  display: block;
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}

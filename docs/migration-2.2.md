@@ -45,7 +45,7 @@ not a fabricated hit rate. Prices are application configuration. Use `InMemoryUs
 development and implement `UsageLedger` for durable counters in production.
 
 The request projection may repair history and compact dynamic context, but it never writes the repaired
-projection back to graph state. Review `Wiki/en/guides/cache-first.mdx` for the full configuration,
+projection back to graph state. Review `Wiki/content/docs/en/guides/cache-first.mdx` for the full configuration,
 progressive Skills/MCP discovery, telemetry, and benchmark guidance.
 
 ## 中文
@@ -90,4 +90,4 @@ cache-first 路径。该选项不会改变 `ChatModel` 协议或 checkpoint 格�
 
 请求投影可能修复历史并压缩动态上下文，但不会把修复后的投影写回 graph state。完整配置、Skills/
 MCP progressive discovery、telemetry 与 benchmark 说明见
-[`Wiki/zh/guides/cache-first.mdx`](../Wiki/zh/guides/cache-first.mdx)。
+[`Wiki/content/docs/zh/guides/cache-first.mdx`](../Wiki/content/docs/zh/guides/cache-first.mdx)。

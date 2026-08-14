@@ -1,0 +1,31 @@
+---
+title: "Agent Skills Python API"
+description: "Reference for SkillSource, FilesystemSkillSource, SkillRegistry, and agent tools."
+---
+
+## Data types
+
+- `SkillMetadata(name, description)` is the minimal discovery catalog record.
+- `SkillSpec` contains parsed fields, the Markdown body, and the original complete `SKILL.md`.
+- `SkillResource` contains `skill_name`, relative path, MIME type, bytes, and `size`.
+- `SkillValidationIssue` contains a path, stable code, and diagnostic message.
+
+## Sources and registry
+
+`SkillSource` defines synchronous `discover()`, `load(name)`, and `read_resource(name, path)` methods.
+`FilesystemSkillSource` is the standard local implementation. `SkillRegistry` combines sources and
+rejects duplicate names.
+
+```python
+from lingxigraph import FilesystemSkillSource, SkillRegistry, validate_skill
+
+issues = validate_skill("skills/hello")
+registry = SkillRegistry([FilesystemSkillSource("skills")])
+metadata = registry.discover()
+spec = registry.load("hello")
+resource = registry.read_resource("hello", "references/greetings.md")
+```
+
+Enabling `create_agent(..., skills=registry)` adds two ordinary Tool Calling schemas:
+`read_skill(skill_name)` and `read_skill_resource(skill_name, path)`. UTF-8 resources return text;
+binary resources return JSON containing MIME type, size, and Base64 content.

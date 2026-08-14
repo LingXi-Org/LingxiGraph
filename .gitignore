@@ -13,3 +13,9 @@ dist/
 .env
 *.db
 *.sqlite*
+node_modules/
+*.tsbuildinfo
+Wiki/.next/
+Wiki/.source/
+Wiki/out/
+Wiki/.wrangler/
