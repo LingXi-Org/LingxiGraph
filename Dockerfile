@@ -14,7 +14,10 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/home/lingxigraph/.local/bin:${PATH}"
-RUN groupadd --system --gid 10001 lingxigraph \
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 lingxigraph \
     && useradd --system --uid 10001 --gid lingxigraph --create-home lingxigraph
 WORKDIR /app
 COPY --from=builder /wheels /wheels
