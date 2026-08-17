@@ -43,6 +43,7 @@ from ..runtime import (
 )
 from ..schema import SchemaAdapter
 from ..serialization import JsonSerializer, Serializer
+from ..steering import SteeringChannel, SteeringEvent
 from ..types import (
     Command,
     CommandScope,
@@ -244,7 +245,61 @@ class CompiledStateGraph:
         self._active_runs: dict[str, CancellationToken] = {}
         self._event_sequences: dict[str, int] = {}
         self._run_budgets: dict[str, ExecutionBudget] = {}
+        self._run_steering: dict[str, SteeringChannel] = {}
         self.response_format: Mapping[str, Any] | type | None = None
+
+    def steer(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> SteeringEvent:
+        """Embedded/library-mode steering: durably-in-process, no server.
+
+        This is the degraded (SQLite/in-memory/embedded) implementation of
+        the mid-run steering protocol: it works against an in-process
+        :class:`~lingxigraph.steering.SteeringChannel` keyed by ``run_id``,
+        which is the same primitive the Agent Server worker feeds from
+        PostgreSQL. Safe to call concurrently from another thread/task
+        while the run is executing; the graph observes it at its next
+        safe point via ``runtime.drain_steering()``.
+        """
+
+        channel = self._run_steering.setdefault(run_id, SteeringChannel(run_id))
+        event, _created = channel.submit(
+            kind=kind,
+            payload=payload,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
+        )
+        return event
+
+    def has_pending_steering(self, run_id: str) -> bool:
+        channel = self._run_steering.get(run_id)
+        return channel is not None and channel.has_pending
+
+    def get_steering_channel(self, run_id: str) -> SteeringChannel:
+        """Return (creating if needed) the in-process channel for a run.
+
+        Used by server integrations (see :mod:`lingxigraph.server.worker`)
+        to feed durable PostgreSQL steering rows into the live executor
+        without going through the public ``steer()`` re-sequencing path.
+        """
+
+        return self._run_steering.setdefault(run_id, SteeringChannel(run_id))
+
+    def forget_steering(self, run_id: str) -> None:
+        """Release the in-process channel for a finished run.
+
+        Call once any final flush of consumed events is done (see
+        :class:`lingxigraph.server.worker.Worker`) to avoid an unbounded
+        per-run memory footprint across many completed runs.
+        """
+
+        self._run_steering.pop(run_id, None)
 
     def _child_runtime(
         self,
@@ -793,6 +848,18 @@ class CompiledStateGraph:
             parent_budget = get_runtime().budget
         except RuntimeError:
             parent_budget = None
+        try:
+            parent_steering = get_runtime()._steering
+        except RuntimeError:
+            parent_steering = None
+        # Subgraphs share the parent run's steering channel (same run_id,
+        # nested namespace) so draining is deterministic regardless of which
+        # namespace's node happens to call ``runtime.drain_steering()``.
+        self._run_steering[run_id] = (
+            parent_steering
+            or self._run_steering.get(run_id)
+            or SteeringChannel(run_id)
+        )
         limits = {**dict(config.get("configurable", {})), **config}
         self._run_budgets[run_id] = parent_budget or ExecutionBudget(
             max_tool_calls=(
@@ -1604,6 +1671,12 @@ class CompiledStateGraph:
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
             self._run_budgets.pop(run_id, None)
+            # Deliberately NOT popping `_run_steering[run_id]` here: a server
+            # integration (see Worker._sync_steering_out) needs to flush any
+            # events the graph drained during its very last safe point
+            # *after* this generator has fully finished. Callers that own
+            # the channel's lifecycle should call `forget_steering(run_id)`
+            # once that final flush is done.
 
     def _plan_tasks(
         self,
@@ -2215,6 +2288,7 @@ class CompiledStateGraph:
             stream_subgraphs=stream_subgraphs,
             budget=self._run_budgets.get(run_id),
             _emit=emit,
+            _steering=self._run_steering.get(run_id),
         )
 
     async def _aget_tuple(self, config: Mapping[str, Any]) -> Any:

@@ -45,6 +45,10 @@ class IdempotencyConflictError(LingxiGraphError):
     """Raised when an idempotency key is reused with a different request."""
 
 
+class RunTerminalError(LingxiGraphError):
+    """Raised when an operation targets a Run that has already finished."""
+
+
 class GraphInterrupt(BaseException):
     """Internal control-flow signal used by :func:`interrupt`."""
 
@@ -66,4 +70,5 @@ __all__ = [
     "IdempotencyConflictError",
     "LingxiGraphError",
     "PersistenceError",
+    "RunTerminalError",
 ]

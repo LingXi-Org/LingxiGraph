@@ -20,7 +20,13 @@ from fastapi.staticfiles import StaticFiles
 
 from ..cache import BaseCache
 from ..checkpoint import Checkpointer, InMemorySaver
-from ..errors import ConcurrentRunError, EmptyInputError, IdempotencyConflictError
+from ..errors import (
+    ConcurrentRunError,
+    EmptyInputError,
+    IdempotencyConflictError,
+    RunTerminalError,
+)
+from ..steering import SteeringPayloadTooLarge
 from ..store import BaseStore, InMemoryStore, StoreOperation
 from ..types import RunStatus
 from ..version import __version__
@@ -36,6 +42,8 @@ from .models import (
     Schedule,
     ScheduleCreate,
     SchedulePatch,
+    SteerAccepted,
+    SteerCreate,
     StoreBatchRequest,
     Thread,
     ThreadCreate,
@@ -183,6 +191,14 @@ def create_app(
     @app.exception_handler(IdempotencyConflictError)
     async def idempotency_error(request: Request, exc: IdempotencyConflictError):
         return _problem(request, 409, "idempotency_conflict", str(exc))
+
+    @app.exception_handler(RunTerminalError)
+    async def run_terminal_error(request: Request, exc: RunTerminalError):
+        return _problem(request, 409, "run_terminal", str(exc))
+
+    @app.exception_handler(SteeringPayloadTooLarge)
+    async def steering_payload_error(request: Request, exc: SteeringPayloadTooLarge):
+        return _problem(request, 413, "payload_too_large", str(exc))
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
@@ -536,6 +552,59 @@ def create_app(
         value = await repository.get_run(user.tenant_id, run_id)
         assert value is not None
         return value
+
+    @app.post("/v1/runs/{run_id}/steer", response_model=SteerAccepted, status_code=202)
+    async def steer_run(
+        run_id: str,
+        body: SteerCreate,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        user: Principal = Depends(require("operator")),
+    ):
+        """Durably accept mid-run steering input.
+
+        202 means the event was durably written to the steering inbox --
+        never that the graph has processed it. The graph decides what a
+        new steering event means at its next safe point via
+        ``runtime.drain_steering()``.
+        """
+
+        run = await repository.get_run(user.tenant_id, run_id)
+        if run is None:
+            raise HTTPException(404, "run not found")
+        key = idempotency_key or body.idempotency_key
+        try:
+            event, created = await repository.submit_steering(
+                user.tenant_id,
+                run_id,
+                kind=body.kind,
+                payload=body.payload,
+                metadata=body.metadata,
+                idempotency_key=key,
+                max_payload_bytes=repository.limits.max_event_bytes,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "run not found") from exc
+        if created:
+            await repository.append_event(
+                user.tenant_id,
+                run_id,
+                "run.steer.accepted",
+                {
+                    "steering_event_id": event.id,
+                    "sequence": event.sequence,
+                    "kind": event.kind,
+                },
+            )
+            await event_bus.publish(user.tenant_id, run_id, 0)
+            await audit(user, "runs.steer", "run", run_id)
+        return SteerAccepted(
+            id=event.id,
+            run_id=run_id,
+            sequence=event.sequence,
+            status=event.status,
+            kind=event.kind,
+            created_at=event.created_at,
+        )
 
     @app.post("/v1/runs/{run_id}/resume", response_model=Run, status_code=202)
     async def resume_run(

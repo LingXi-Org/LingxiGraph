@@ -126,6 +126,36 @@ class Run(ApiModel):
     finished_at: datetime | None = None
 
 
+class SteerCreate(ApiModel):
+    kind: str = "user_input"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+
+
+class SteerAccepted(ApiModel):
+    id: str
+    run_id: str
+    sequence: int
+    status: Literal["pending", "delivered", "consumed", "superseded"]
+    kind: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class RunSteeringEvent(ApiModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    tenant_id: str
+    run_id: str
+    sequence: int
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    status: Literal["pending", "delivered", "consumed", "superseded"] = "pending"
+    created_at: datetime = Field(default_factory=utcnow)
+    consumed_at: datetime | None = None
+
+
 class RunEvent(ApiModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     tenant_id: str
@@ -197,6 +227,9 @@ __all__ = [
     "Run",
     "RunCreate",
     "RunEvent",
+    "RunSteeringEvent",
+    "SteerAccepted",
+    "SteerCreate",
     "Schedule",
     "ScheduleCreate",
     "SchedulePatch",

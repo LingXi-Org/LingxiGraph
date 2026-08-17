@@ -10,7 +10,7 @@ OpenAPI 是 Agent Server 的协议真相。默认服务地址为 `http://localho
 | Graph registry | `GET /v1/graphs`、`GET /v1/graphs/{id}` |
 | Assistants | `POST/GET /v1/assistants`、`GET/PATCH/DELETE /v1/assistants/{id}` |
 | Threads | `POST/GET /v1/threads`、`GET/PATCH/DELETE /v1/threads/{id}`、state、history、fork、runs |
-| Runs | threaded/stateless create、get/list、join、resume、cancel、redrive、stream |
+| Runs | threaded/stateless create、get/list、join、resume、cancel、redrive、steer、stream |
 | Store | `POST /v1/store/batch`、`GET /v1/store/search` |
 | Schedules | create/list/update/delete |
 | Interop | `/a2a/{assistant_id}`、`/mcp` |
@@ -53,6 +53,33 @@ curl -X POST http://localhost:8124/v1/runs \
 
 `X-Tenant-ID` 只在 `LINGXIGRAPH_INSECURE_DEV_AUTH=true` 时生效。生产 tenant 必须从已验证
 JWT claim 派生，绝不信任调用方自报 header。
+
+## 运行中输入（Steering）
+
+`POST /v1/runs/{run_id}/steer` 在 Run 执行期间durably地注入新的结构化输入，不等待完成、
+不强制取消、也不需要先暂停。请求体：
+
+```json
+{"kind": "user_input", "payload": {"message": "..."}, "metadata": {}, "idempotency_key": "..."}
+```
+
+语义：
+
+- 202 只代表已durably写入 PostgreSQL 的 steering inbox，不代表图已经处理；Redis 只用于
+  可选的低延迟 `run.steer.available` 通知，从不作为唯一来源。
+- `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受，但仅在 `resume` 时才会被
+  图实际消费（steer 不替代 resume 的 `{resume, update, goto}` 协议）。
+- 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）返回 HTTP 409
+  `run_terminal`，不会静默生成一条永远不会被消费的事件。
+- `Idempotency-Key` header 或 body 的 `idempotency_key` 二选一；同一 `(tenant, run, key)`
+  只会创建一条事件。
+- cancel 优先于 steer：先 steer 后 cancel，cancel 依然立即生效，steer 从不撤销/延迟取消。
+- payload+metadata 序列化后大小受限（默认约 32KB / 服务端事件字节上限，先到者生效）。
+
+图内部通过 `runtime.has_steering`、`runtime.peek_steering()`、`runtime.drain_steering()`
+在安全点（节点开始前、节点完成后、下一 superstep 前、重试前、resume 之后）读取；
+LingxiGraph 只保证durable delivery、顺序、去重与安全消费，"新消息是否意味着重新规划"完全
+由业务图决定。嵌入式/无 Server 场景下同一套 API 生效：`compiled_graph.steer(run_id, ...)`。
 
 ## SSE 续传
 

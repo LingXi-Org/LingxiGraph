@@ -140,6 +140,34 @@ class _AsyncRuns(_AsyncResource):
     async def cancel(self, run_id: str) -> dict[str, Any]:
         return await self._client.request("POST", f"/v1/runs/{run_id}/cancel")
 
+    async def steer(
+        self,
+        run_id: str,
+        *,
+        kind: str = "user_input",
+        payload: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably inject mid-run steering input; drained by the graph itself.
+
+        Success only means the event was durably accepted -- it does not
+        mean the graph has processed it yet.
+        """
+
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return await self._client.request(
+            "POST",
+            f"/v1/runs/{run_id}/steer",
+            json={
+                "kind": kind,
+                "payload": dict(payload or {}),
+                "metadata": dict(metadata or {}),
+                "idempotency_key": idempotency_key,
+            },
+            headers=headers,
+        )
+
     async def resume(self, run_id: str, resume: Any, **values: Any) -> dict[str, Any]:
         return await self._client.request(
             "POST", f"/v1/runs/{run_id}/resume", json={"resume": resume, **values}
@@ -374,6 +402,34 @@ class _SyncRuns(_SyncResource):
 
     def cancel(self, run_id: str) -> dict[str, Any]:
         return self._client.request("POST", f"/v1/runs/{run_id}/cancel")
+
+    def steer(
+        self,
+        run_id: str,
+        *,
+        kind: str = "user_input",
+        payload: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably inject mid-run steering input; drained by the graph itself.
+
+        Success only means the event was durably accepted -- it does not
+        mean the graph has processed it yet.
+        """
+
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self._client.request(
+            "POST",
+            f"/v1/runs/{run_id}/steer",
+            json={
+                "kind": kind,
+                "payload": dict(payload or {}),
+                "metadata": dict(metadata or {}),
+                "idempotency_key": idempotency_key,
+            },
+            headers=headers,
+        )
 
     def resume(self, run_id: str, resume: Any, **values: Any) -> dict[str, Any]:
         return self._client.request(

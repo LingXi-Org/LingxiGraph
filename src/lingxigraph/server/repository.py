@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from ..errors import ConcurrentRunError, IdempotencyConflictError
+from ..errors import ConcurrentRunError, IdempotencyConflictError, RunTerminalError
+from ..steering import MAX_STEERING_PAYLOAD_BYTES, validate_steering_payload
 from ..types import MultitaskStrategy, RunStatus
 from .models import (
     Assistant,
@@ -18,6 +20,7 @@ from .models import (
     Run,
     RunCreate,
     RunEvent,
+    RunSteeringEvent,
     Schedule,
     ScheduleCreate,
     SchedulePatch,
@@ -60,6 +63,8 @@ class InMemoryRepository:
         self._events: dict[tuple[str, str], list[RunEvent]] = {}
         self._schedules: dict[tuple[str, str], Schedule] = {}
         self._audits: list[AuditRecord] = []
+        self._steering: dict[tuple[str, str], list[RunSteeringEvent]] = {}
+        self._steering_keys: dict[tuple[str, str, str], str] = {}
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition()
 
@@ -441,6 +446,97 @@ class InMemoryRepository:
                 if event.sequence > after
             ]
 
+    async def submit_steering(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        max_payload_bytes: int = MAX_STEERING_PAYLOAD_BYTES,
+    ) -> tuple[RunSteeringEvent, bool]:
+        """Durably accept a steering event. Returns ``(event, created)``.
+
+        Terminal runs raise :class:`RunTerminalError`. Running, queued,
+        cancelling, and paused runs each accept durably -- the *consuming*
+        safe point differs (see module docstring / issue #16 design doc),
+        but acceptance semantics are uniform: it means "written to the
+        durable inbox", never "the graph has processed it".
+        """
+
+        validate_steering_payload(payload, metadata, max_bytes=max_payload_bytes)
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if run is None:
+                raise KeyError(f"run {run_id!r} not found")
+            if enum_value(run.status) in TERMINAL:
+                raise RunTerminalError(
+                    f"run {run_id!r} is in terminal state "
+                    f"{enum_value(run.status)!r} and cannot accept new steering input"
+                )
+            if idempotency_key is not None:
+                existing_id = self._steering_keys.get((tenant_id, run_id, idempotency_key))
+                if existing_id is not None:
+                    existing = next(
+                        event
+                        for event in self._steering[(tenant_id, run_id)]
+                        if event.id == existing_id
+                    )
+                    return existing.model_copy(deep=True), False
+            events = self._steering.setdefault((tenant_id, run_id), [])
+            event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=len(events) + 1,
+                kind=kind,
+                payload=dict(payload),
+                metadata=dict(metadata or {}),
+                idempotency_key=idempotency_key,
+                status="pending",
+            )
+            events.append(event)
+            if idempotency_key is not None:
+                self._steering_keys[(tenant_id, run_id, idempotency_key)] = event.id
+        await self._notify()
+        return event.model_copy(deep=True), True
+
+    async def list_pending_steering(
+        self, tenant_id: str, run_id: str
+    ) -> list[RunSteeringEvent]:
+        """Read-only view of never-consumed steering events, in order."""
+
+        async with self._lock:
+            return [
+                event.model_copy(deep=True)
+                for event in self._steering.get((tenant_id, run_id), ())
+                if event.status in ("pending", "delivered")
+            ]
+
+    async def mark_steering_consumed(
+        self, tenant_id: str, run_id: str, event_ids: Sequence[str]
+    ) -> None:
+        """Mark events consumed once the graph has actually drained them."""
+
+        if not event_ids:
+            return
+        ids = set(event_ids)
+        async with self._lock:
+            events = self._steering.get((tenant_id, run_id), [])
+            for index, event in enumerate(events):
+                if event.id in ids and event.status != "consumed":
+                    events[index] = event.model_copy(
+                        update={"status": "consumed", "consumed_at": utcnow()}
+                    )
+
+    async def list_steering(self, tenant_id: str, run_id: str) -> list[RunSteeringEvent]:
+        async with self._lock:
+            return [
+                event.model_copy(deep=True)
+                for event in self._steering.get((tenant_id, run_id), ())
+            ]
+
     async def create_schedule(
         self, tenant_id: str, request: ScheduleCreate
     ) -> Schedule:
@@ -565,14 +661,20 @@ class PostgresRepository(InMemoryRepository):
     def _setup_sync(self) -> None:
         from importlib.resources import files
 
-        migration = (
-            files("lingxigraph.server")
-            .joinpath("migrations/0001_v1.sql")
-            .read_text(encoding="utf-8")
-            .replace("{{schema}}", self._schema)
+        migrations_dir = files("lingxigraph.server").joinpath("migrations")
+        names = sorted(
+            entry.name
+            for entry in migrations_dir.iterdir()
+            if entry.name.endswith(".sql")
         )
         with self._connect() as conn, conn.cursor() as cursor:
-            cursor.execute(migration)
+            for name in names:
+                migration = (
+                    migrations_dir.joinpath(name)
+                    .read_text(encoding="utf-8")
+                    .replace("{{schema}}", self._schema)
+                )
+                cursor.execute(migration)
 
     @staticmethod
     def _tenant(cursor, tenant_id: str) -> None:
@@ -1012,6 +1114,132 @@ class PostgresRepository(InMemoryRepository):
         )
         return [RunEvent.model_validate(row) for row in rows]
 
+    async def submit_steering(
+        self,
+        tenant_id,
+        run_id,
+        *,
+        kind,
+        payload,
+        metadata=None,
+        idempotency_key=None,
+        max_payload_bytes: int = MAX_STEERING_PAYLOAD_BYTES,
+    ):
+        validate_steering_payload(payload, metadata, max_bytes=max_payload_bytes)
+        return await asyncio.to_thread(
+            self._submit_steering_sync,
+            tenant_id,
+            run_id,
+            kind,
+            payload,
+            metadata or {},
+            idempotency_key,
+        )
+
+    def _submit_steering_sync(
+        self, tenant_id, run_id, kind, payload, metadata, idempotency_key
+    ):
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"SELECT status FROM {self._schema}.runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
+                (tenant_id, run_id),
+            )
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise KeyError(f"run {run_id!r} not found")
+            if run_row["status"] in TERMINAL:
+                raise RunTerminalError(
+                    f"run {run_id!r} is in terminal state {run_row['status']!r} "
+                    "and cannot accept new steering input"
+                )
+            if idempotency_key is not None:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{tenant_id}:{run_id}:{idempotency_key}",),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.run_steering_events
+                    WHERE tenant_id=%s AND run_id=%s AND idempotency_key=%s""",
+                    (tenant_id, run_id, idempotency_key),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    return RunSteeringEvent.model_validate(existing), False
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+                FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, run_id),
+            )
+            sequence = int(cursor.fetchone()["next"])
+            event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=sequence,
+                kind=kind,
+                payload=dict(payload),
+                metadata=dict(metadata or {}),
+                idempotency_key=idempotency_key,
+                status="pending",
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_steering_events
+                (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
+                 status,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    event.id,
+                    tenant_id,
+                    run_id,
+                    event.sequence,
+                    kind,
+                    self._jsonb(event.payload),
+                    self._jsonb(event.metadata),
+                    idempotency_key,
+                    event.status,
+                    event.created_at,
+                ),
+            )
+            return event, True
+
+    async def list_pending_steering(self, tenant_id, run_id):
+        rows = await asyncio.to_thread(
+            self._fetch_all,
+            tenant_id,
+            f"""SELECT * FROM {self._schema}.run_steering_events
+            WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+            ORDER BY sequence""",
+            (tenant_id, run_id),
+        )
+        return [RunSteeringEvent.model_validate(row) for row in rows]
+
+    async def list_steering(self, tenant_id, run_id):
+        rows = await asyncio.to_thread(
+            self._fetch_all,
+            tenant_id,
+            f"""SELECT * FROM {self._schema}.run_steering_events
+            WHERE tenant_id=%s AND run_id=%s ORDER BY sequence""",
+            (tenant_id, run_id),
+        )
+        return [RunSteeringEvent.model_validate(row) for row in rows]
+
+    async def mark_steering_consumed(self, tenant_id, run_id, event_ids):
+        if not event_ids:
+            return
+        await asyncio.to_thread(
+            self._mark_steering_consumed_sync, tenant_id, run_id, list(event_ids)
+        )
+
+    def _mark_steering_consumed_sync(self, tenant_id, run_id, event_ids):
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='consumed', consumed_at=NOW()
+                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'""",
+                (tenant_id, run_id, event_ids),
+            )
+
     async def create_schedule(self, tenant_id, request):
         value = Schedule(tenant_id=tenant_id, **request.model_dump())
         await asyncio.to_thread(self._insert_schedule, value)
@@ -1212,6 +1440,7 @@ class PostgresRepository(InMemoryRepository):
 
 
 __all__ = [
+    "ACTIVE",
     "InMemoryRepository",
     "PostgresRepository",
     "RepositoryLimits",

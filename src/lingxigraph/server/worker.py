@@ -24,6 +24,7 @@ from ..errors import (
 from ..events import Event, EventKind
 from ..runtime import CancellationToken
 from ..serialization import JsonSerializer
+from ..steering import SteeringEvent
 from ..store import BaseStore, InMemoryStore
 from ..types import Command, RunStatus
 from .eventbus import EventBus, InMemoryEventBus
@@ -130,14 +131,24 @@ class Worker:
 
     async def _execute(self, run: Run) -> None:
         token = CancellationToken()
-        heartbeat = asyncio.create_task(self._heartbeat(run, token))
+        # ``with_runtime`` returns a distinct bound graph instance -- build
+        # it first so the heartbeat loop shares the exact same steering
+        # channel the executor actually reads from, not a different
+        # instance's.
+        graph = self.registry.get(run.graph_id, run.graph_version).with_runtime(
+            checkpointer=self.checkpointer,
+            store=self.store_factory(run.tenant_id),
+            cache=self.cache,
+        )
+        # Recover any steering events that were durably accepted while this
+        # run was queued (or before a prior worker crashed) -- the channel
+        # is the same live object the executor reads from at every safe
+        # point, so this is the "recover after restart" and "queued run"
+        # cases from issue #16 in one code path.
+        await self._sync_steering_in(run, graph)
+        heartbeat = asyncio.create_task(self._heartbeat(run, token, graph))
         output: dict[str, Any] | None = None
         try:
-            graph = self.registry.get(run.graph_id, run.graph_version).with_runtime(
-                checkpointer=self.checkpointer,
-                store=self.store_factory(run.tenant_id),
-                cache=self.cache,
-            )
             config = {
                 **run.config,
                 "configurable": {
@@ -253,12 +264,25 @@ class Worker:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+            # Final flush: anything drained between the last heartbeat tick
+            # and run completion must still be recorded as consumed.
+            await self._sync_steering_out(run, graph)
+            graph.forget_steering(run.id)
 
-    async def _heartbeat(self, run: Run, token: CancellationToken) -> None:
+    async def _heartbeat(self, run: Run, token: CancellationToken, graph: Any) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_seconds)
             if await self.repository.is_cancel_requested(run.tenant_id, run.id):
+                # Cancellation always takes priority; steering must never
+                # undo or delay it. We still sync steering below so an
+                # already-accepted event is not lost, but we do not let a
+                # steer block or reorder the cancel signal.
                 token.cancel()
+            # PostgreSQL is the source of truth for steering; this poll
+            # keeps working even if a Redis ``run.steer.available`` notify
+            # was dropped or Redis is unavailable entirely.
+            await self._sync_steering_in(run, graph)
+            await self._sync_steering_out(run, graph)
             alive = await self.repository.heartbeat(
                 run.tenant_id,
                 run.id,
@@ -268,6 +292,49 @@ class Worker:
             if not alive:
                 token.cancel()
                 return
+
+    async def _sync_steering_in(self, run: Run, graph: Any) -> None:
+        """Pull durably-accepted-but-not-yet-delivered events into the graph."""
+
+        pending = await self.repository.list_pending_steering(run.tenant_id, run.id)
+        if not pending:
+            return
+        channel = graph.get_steering_channel(run.id)
+        for row in pending:
+            channel.ingest(
+                SteeringEvent(
+                    id=row.id,
+                    run_id=run.id,
+                    sequence=row.sequence,
+                    kind=row.kind,
+                    payload=row.payload,
+                    metadata=row.metadata,
+                    created_at=row.created_at,
+                )
+            )
+
+    async def _sync_steering_out(self, run: Run, graph: Any) -> None:
+        """Flush events the graph has drained back to PostgreSQL + SSE."""
+
+        channel = graph.get_steering_channel(run.id)
+        consumed = channel.pop_consumed()
+        if not consumed:
+            return
+        await self.repository.mark_steering_consumed(
+            run.tenant_id, run.id, [event.id for event in consumed]
+        )
+        for event in consumed:
+            stored = await self.repository.append_event(
+                run.tenant_id,
+                run.id,
+                "run.steer.consumed",
+                {
+                    "steering_event_id": event.id,
+                    "sequence": event.sequence,
+                    "kind": event.kind,
+                },
+            )
+            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
 
     async def _append_event(self, run: Run, event: Event) -> None:
         encoded = self._serializer.dumps(dataclasses.asdict(event))
