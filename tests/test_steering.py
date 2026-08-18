@@ -3198,6 +3198,111 @@ def make_registry_flaky_before_drain() -> tuple[GraphRegistry, list[int], list[l
     return GraphRegistry({"flaky_before_drain": builder.compile()}), attempts, drained_log
 
 
+class InMemoryRepositoryRound9BranchCoverageTests(unittest.TestCase):
+    """Direct unit coverage of the InMemory-reachable branches added/kept
+    across issue #16 PR #17 review round 9: the restored unfenced
+    ``retry_run()``, ``close_steering()``'s already-closed no-op, the
+    standalone ``supersede_pending_steering_if_owned()`` (both its
+    nothing-to-supersede and something-to-supersede paths), and
+    ``finalize_run_with_steering_disposition_if_owned(supersede_pending=False)``."""
+
+    def test_retry_run_unfenced_admin_path(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.claim_run("worker-a", lease_seconds=30)
+            updated = await repo.retry_run("acme", run.id, error={"code": "x"})
+            self.assertEqual(updated.status, "pending")
+            self.assertIsNone(updated.lease_owner)
+
+        asyncio.run(scenario())
+
+    def test_close_steering_is_a_no_op_when_already_closed(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            first = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(first)
+            second = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(second)
+
+        asyncio.run(scenario())
+
+    def test_supersede_pending_steering_if_owned_standalone_no_pending(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            result = await repo.supersede_pending_steering_if_owned(
+                "acme", run.id, "worker-a", claimed.attempt
+            )
+            self.assertEqual(result, [])
+
+        asyncio.run(scenario())
+
+    def test_supersede_pending_steering_if_owned_standalone_supersedes(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            await repo.submit_steering("acme", run.id, kind="user_input", payload={"m": "x"})
+            result = await repo.supersede_pending_steering_if_owned(
+                "acme", run.id, "worker-a", claimed.attempt
+            )
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].kind, "run.steer.superseded")
+            steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(steering[0].status, "superseded")
+
+        asyncio.run(scenario())
+
+    def test_finalize_run_with_steering_disposition_can_skip_supersede(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            await repo.submit_steering("acme", run.id, kind="user_input", payload={"m": "x"})
+            result = await repo.finalize_run_with_steering_disposition_if_owned(
+                "acme",
+                run.id,
+                "worker-a",
+                claimed.attempt,
+                RunStatus.PAUSED,
+                output=None,
+                error=None,
+                supersede_pending=False,
+                supersede_reason="n/a",
+            )
+            self.assertIsNotNone(result)
+            updated, superseded_events = result
+            self.assertEqual(updated.status, "paused")
+            self.assertEqual(superseded_events, [])
+            steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(steering[0].status, "pending")
+
+        asyncio.run(scenario())
+
+
 def _assistant_create_named(graph_id: str):
     from lingxigraph.server.models import AssistantCreate
 
