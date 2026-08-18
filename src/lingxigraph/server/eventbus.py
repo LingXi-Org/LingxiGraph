@@ -140,19 +140,41 @@ class RedisEventBus:
         pubsub = self._redis.pubsub()
         try:
             await pubsub.subscribe(self._channel(tenant_id, run_id))
-            # ``get_message``'s own ``timeout`` defaults to 0.0 -- "return
-            # immediately, blocking for nothing" -- not "block until a
-            # message arrives". Without passing it explicitly here this
-            # call resolved near-instantly on every tick regardless of
-            # whether a message was published, so ``wait()`` was never
-            # actually blocking in production at all. Pass the real
-            # timeout through so redis-py performs the blocking read;
-            # ``_wait_cancellation_safe``'s own timer is then a secondary,
-            # cancellation-safe upper bound around it.
-            await _wait_cancellation_safe(
-                pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout),
-                timeout,
-            )
+            # Two things had to be fixed here, not just one:
+            #
+            # 1. ``get_message``'s own ``timeout`` defaults to 0.0 --
+            #    "return immediately, blocking for nothing" -- not "block
+            #    until a message arrives". Passing it explicitly makes
+            #    redis-py perform an actual blocking read instead of a
+            #    poll.
+            # 2. Even with that fixed, the *first* ``get_message()`` call
+            #    right after ``subscribe()`` reliably returns near-
+            #    instantly with ``None`` regardless of the timeout given --
+            #    it is consuming the buffered SUBSCRIBE acknowledgement
+            #    frame that ``ignore_subscribe_messages=True`` then
+            #    filters out, not genuinely waiting for a publish.
+            #    (Confirmed empirically against a real Redis server: a
+            #    second call on the same subscription does block for the
+            #    full requested timeout.) A single non-looping call here
+            #    would therefore make ``wait()`` resolve immediately on
+            #    every tick, in production, independent of whether
+            #    anything was ever published -- exactly the bug the round-
+            #    6 cancellation regression test caught, for a reason
+            #    unrelated to cancellation. Loop against a shared
+            #    deadline, re-issuing ``get_message()`` for whatever time
+            #    remains, until either a real message arrives (a non-
+            #    ``None`` result) or the deadline is reached.
+            deadline = asyncio.get_event_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    return
+                message = await _wait_cancellation_safe(
+                    pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining),
+                    remaining,
+                )
+                if message is not None:
+                    return
         except asyncio.CancelledError:
             # A bare ``except Exception`` below would not normally catch
             # this (CancelledError is a BaseException on 3.8+), but some
