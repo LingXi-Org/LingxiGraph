@@ -6,10 +6,18 @@ on:
       - main
     paths:
       - 'Wiki/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'README.en.md'
+      - 'CHANGELOG.md'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'Wiki/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'README.en.md'
+      - 'CHANGELOG.md'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
