@@ -552,6 +552,20 @@ class RegistryServerAndWorkerTests(unittest.TestCase):
                 content=b"x" * 513,
             )
             self.assertEqual(understated.status_code, 413)
+            invalid_length = client.post(
+                "/v1/runs",
+                headers={**headers, "content-length": "not-a-number"},
+                content=b"{}",
+            )
+            self.assertEqual(invalid_length.status_code, 400)
+            self.assertEqual(invalid_length.json()["code"], "invalid_request")
+            negative_length = client.post(
+                "/v1/runs",
+                headers={**headers, "content-length": "-1"},
+                content=b"{}",
+            )
+            self.assertEqual(negative_length.status_code, 400)
+            self.assertEqual(negative_length.json()["code"], "invalid_request")
 
         class UnhealthyRepository(InMemoryRepository):
             async def healthcheck(self) -> bool:
