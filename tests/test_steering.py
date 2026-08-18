@@ -1582,6 +1582,110 @@ class SteeringClosedGateTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class CancellingLeaseExpiryRecoveryTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 11 (BLOCKER).
+
+    Both repositories only reclaimed an expired lease when the run was
+    exactly ``running``. A run that was moved to ``cancelling`` (via
+    ``request_cancel``) keeps its lease -- if the owning worker then
+    crashes before it can finalize the run to a terminal status, the
+    expired lease was never reclaimed because ``cancelling`` didn't match
+    either the expired-``running`` recovery query or the ordinary
+    ``pending`` claim selector. The run was stuck in ``cancelling``
+    forever, wedging its thread and leaving ``steering_closed`` (if it had
+    been set) permanently closed with no terminal status ever reached.
+
+    ``claim_run`` must now resolve an expired ``cancelling`` lease
+    straight to the terminal ``cancelled`` status (never back to
+    ``pending``, which would silently erase the cancellation signal and
+    could let business execution resume after the caller explicitly asked
+    to stop).
+    """
+
+    def test_claim_run_resolves_expired_cancelling_lease_to_cancelled(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+
+            claimed = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed is not None
+            self.assertEqual(claimed.status, "running")
+
+            # Reproduce the exact finalization-window scenario: cancel is
+            # requested while the worker still holds the lease, and the
+            # worker gets as far as closing steering admission before it
+            # crashes -- never reaching the fenced terminal commit.
+            cancelled_requested = await repo.request_cancel("acme", run.id)
+            self.assertTrue(cancelled_requested)
+            mid_flight = await repo.get_run("acme", run.id)
+            self.assertEqual(mid_flight.status, "cancelling")
+
+            # There is durable steering history pending when the crash
+            # happens.
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "hi"}
+            )
+            self.assertTrue(created)
+            self.assertEqual(accepted.status, "pending")
+
+            closed = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(closed)
+
+            # Worker A never comes back; let the lease expire, then
+            # simulate worker B's next claim attempt.
+            await asyncio.sleep(1.2)
+            reclaimed = await repo.claim_run("worker-b", lease_seconds=30)
+
+            # The stranded run must never be handed out as claimable work
+            # -- claim_run must return None (no other pending run exists).
+            self.assertIsNone(reclaimed)
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "cancelled")
+            self.assertIsNone(final.lease_owner)
+            self.assertIsNone(final.lease_expires_at)
+            self.assertIsNotNone(final.finished_at)
+            assert final.error is not None
+            self.assertEqual(final.error["code"], "run_cancelled")
+
+            # A subsequent claim attempt must also never return this run.
+            self.assertIsNone(await repo.claim_run("worker-c", lease_seconds=30))
+
+            # Ordinary cancel already leaves pending steering as durable
+            # history (it is never implicitly consumed/replayed) -- the
+            # lease-recovery path must not behave differently.
+            pending_steering = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(len(pending_steering), 1)
+            self.assertEqual(pending_steering[0].id, accepted.id)
+
+        asyncio.run(scenario())
+
+    def test_expired_running_lease_still_recovers_to_pending(self) -> None:
+        """Confirm the pre-existing expired-``running`` recovery path is
+        unchanged by the new ``cancelling`` branch."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed is not None
+
+            await asyncio.sleep(1.2)
+            reclaimed = await repo.claim_run("worker-b", lease_seconds=30)
+            assert reclaimed is not None
+            self.assertEqual(reclaimed.id, run.id)
+            self.assertEqual(reclaimed.status, "running")
+            self.assertEqual(reclaimed.lease_owner, "worker-b")
+
+        asyncio.run(scenario())
+
+
 class RetryCommitCancelWinsEventTests(unittest.TestCase):
     """Issue #16 PR #17 review round 8, point 2 (BLOCKER).
 

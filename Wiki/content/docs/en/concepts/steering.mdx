@@ -157,9 +157,9 @@ disposition and the run's terminal status commit together or not at all (see
 `finalize_run_with_steering_disposition_if_owned`; a crash or lease loss between two separately
 committed writes used to be able to leave steering permanently `superseded` while the run
 itself never actually finished). The run then finalizes normally with its already-computed
-outcome (`succeeded`, `failed`, `dead_letter`, etc. — any terminal outcome other than `paused`,
-see below) — it is **not** forced through a retry loop just because a steering event happened to
-exist.
+outcome (`succeeded`, `failed`, `dead_letter`, etc. — any terminal outcome; `paused` is excluded
+from this finalization path since it was never terminal to begin with, see below) — it is **not**
+forced through a retry loop just because a steering event happened to exist.
 
 The `unconsumed_at_final_boundary` reason is deliberately generic and does **not** claim a
 race occurred. It covers two different situations the Runtime cannot currently tell apart from

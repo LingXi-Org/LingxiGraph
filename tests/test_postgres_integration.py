@@ -684,6 +684,89 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_claim_run_recovers_expired_cancelling_lease_to_cancelled_and_thread_unwedges(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 11 (BLOCKER), PostgreSQL path:
+        a run stuck in ``cancelling`` whose owning worker crashed before
+        finalizing (lease expired) must never be permanently stranded --
+        ``claim_run`` must resolve it to terminal ``cancelled`` on the
+        very next claim pass, clear its lease, and -- crucially -- stop
+        wedging its thread so a separate queued run on the SAME thread
+        can subsequently be claimed."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            # A second run queued on the same thread -- it must remain
+            # blocked while ``run`` is active, and become claimable once
+            # the stranded ``cancelling`` run is recovered.
+            queued = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+            self.assertTrue(created)
+
+            claimed = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed is not None
+            self.assertEqual(claimed.id, run.id)
+
+            cancel_requested = await repo.request_cancel("acme", run.id)
+            self.assertTrue(cancel_requested)
+            mid_flight = await repo.get_run("acme", run.id)
+            self.assertEqual(mid_flight.status, "cancelling")
+
+            closed = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(closed)
+
+            # Worker A crashes here, never reaching the fenced terminal
+            # commit. Let the lease expire, then simulate worker B's next
+            # claim attempt.
+            await asyncio.sleep(1.2)
+
+            reclaimed = await repo.claim_run("worker-b", lease_seconds=30)
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "cancelled")
+            self.assertIsNone(final.lease_owner)
+            self.assertIsNone(final.lease_expires_at)
+            self.assertIsNotNone(final.finished_at)
+            assert final.error is not None
+            self.assertEqual(final.error["code"], "run_cancelled")
+
+            # The queued run on the same thread is no longer wedged --
+            # either this very claim call already picked it up, or the
+            # next one does.
+            if reclaimed is not None and reclaimed.id == queued.id:
+                thread_unwedged_run = reclaimed
+            else:
+                self.assertIsNone(reclaimed)
+                thread_unwedged_run = await repo.claim_run("worker-c", lease_seconds=30)
+            assert thread_unwedged_run is not None
+            self.assertEqual(thread_unwedged_run.id, queued.id)
+            self.assertEqual(thread_unwedged_run.status, "running")
+
+            # Ordinary cancel already leaves pending steering as durable
+            # history (never implicitly consumed/replayed) -- the
+            # lease-recovery path must behave the same way here.
+            pending_steering = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual([row.id for row in pending_steering], [accepted.id])
+
+        asyncio.run(scenario())
+
     def test_idempotency_key_replay_safe_across_finalizing_and_terminal_gates(self) -> None:
         """Issue #16 PR #17 review round 7, point 3, PostgreSQL path: a
         same-Idempotency-Key replay must return the existing event, never

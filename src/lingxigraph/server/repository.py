@@ -297,11 +297,23 @@ class InMemoryRepository:
         now = utcnow()
         async with self._lock:
             for key, run in list(self._runs.items()):
-                if (
-                    enum_value(run.status) == RunStatus.RUNNING.value
-                    and run.lease_expires_at is not None
-                    and run.lease_expires_at <= now
-                ):
+                if run.lease_expires_at is None or run.lease_expires_at > now:
+                    continue
+                # Lease-expiry recovery rule (issue #16 PR #17 review round
+                # 11, BLOCKER): an expired ``running`` lease is requeued to
+                # ``pending`` so a new worker can pick the run back up. An
+                # expired ``cancelling`` lease must NOT be requeued the same
+                # way -- that would silently erase the fact that the
+                # caller already asked to stop and could let business
+                # execution resume after cancellation was requested. It
+                # instead resolves straight to the terminal ``cancelled``
+                # state, mirroring the same ``run_cancelled`` disposition
+                # ``finish_run_if_owned``/``retry_run_if_owned`` already use
+                # when cancellation wins during in-process finalization.
+                # This guarantees the run can never be stuck in
+                # ``cancelling`` forever and keeps its thread from being
+                # wedged for other queued runs.
+                if enum_value(run.status) == RunStatus.RUNNING.value:
                     self._runs[key] = run.model_copy(
                         update={
                             "status": RunStatus.PENDING.value,
@@ -312,6 +324,22 @@ class InMemoryRepository:
                             # only means anything for the attempt that set
                             # it (issue #16 PR #17 review round 6).
                             "steering_closed": False,
+                        }
+                    )
+                elif enum_value(run.status) == RunStatus.CANCELLING.value:
+                    self._runs[key] = run.model_copy(
+                        update={
+                            "status": RunStatus.CANCELLED.value,
+                            "lease_owner": None,
+                            "lease_expires_at": None,
+                            "finished_at": now,
+                            "error": {
+                                "code": "run_cancelled",
+                                "message": (
+                                    "run was cancelled but its worker's lease"
+                                    " expired before finalization completed"
+                                ),
+                            },
                         }
                     )
             pending = sorted(
@@ -3305,6 +3333,36 @@ class PostgresRepository(InMemoryRepository):
                 f"""UPDATE {self._schema}.runs SET status='pending',
                     lease_owner=NULL, lease_expires_at=NULL, steering_closed=FALSE
                     WHERE status='running' AND lease_expires_at < NOW()"""
+            )
+            # Lease-expiry recovery rule (issue #16 PR #17 review round 11,
+            # BLOCKER): an expired ``cancelling`` lease must NOT be
+            # requeued to ``pending`` like an expired ``running`` lease
+            # above -- that would silently erase the fact that the caller
+            # already asked to stop and could let business execution
+            # resume after cancellation was requested. It instead resolves
+            # straight to the terminal ``cancelled`` state, mirroring the
+            # same ``run_cancelled`` disposition
+            # ``_finish_run_if_owned_sync``/``_retry_run_if_owned_sync``
+            # already use when cancellation wins during in-process
+            # finalization. This guarantees the run can never be stuck in
+            # ``cancelling`` forever and keeps its thread from being
+            # wedged for other queued runs on the same thread.
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status='cancelled',
+                    lease_owner=NULL, lease_expires_at=NULL, finished_at=NOW(),
+                    error=%s
+                    WHERE status='cancelling' AND lease_expires_at < NOW()""",
+                (
+                    self._jsonb(
+                        {
+                            "code": "run_cancelled",
+                            "message": (
+                                "run was cancelled but its worker's lease "
+                                "expired before finalization completed"
+                            ),
+                        }
+                    ),
+                ),
             )
             cursor.execute(
                 f"""

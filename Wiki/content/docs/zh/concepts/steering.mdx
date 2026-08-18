@@ -137,9 +137,9 @@ run 行锁**之前**先抢到锁并完成 durable 提交——即便此时图早
 `unconsumed_at_final_boundary`），并伴随一条 `run.steer.superseded` 生命周期事件，二者与该
 run 的终结状态写入在**同一个** lease/attempt-fenced 事务中一起提交——不再是两次分别提交、
 可能在崩溃或 lease 丢失之间彼此脱节的写入（见 `finalize_run_with_steering_disposition_if_owned`）。
-随后该 run 会以之前已经算出的结果（`succeeded`、`failed`、`dead_letter` 等——除 `paused`
-以外的任何终态，见下文）正常终结——**不会**仅仅因为存在一条 steering 事件就被强制进入重试
-循环。
+随后该 run 会以之前已经算出的结果（`succeeded`、`failed`、`dead_letter` 等——任何终态；
+`paused` 不属于此终结路径，因为它本来就从来不是一种终态，见下文）正常终结——**不会**仅仅
+因为存在一条 steering 事件就被强制进入重试循环。
 
 `unconsumed_at_final_boundary` 是一个刻意保持笼统的原因标签，**并不**声称发生了竞争。它
 涵盖两种 Runtime 目前无法从现有数据中区分的情况：上面描述的锁竞争，以及更常见的情况——
