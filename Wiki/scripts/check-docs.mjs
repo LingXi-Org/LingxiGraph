@@ -4,7 +4,7 @@ import process from 'node:process';
 
 const root = path.resolve(process.cwd(), 'content/docs');
 const locales = ['zh', 'en'];
-const expectedPageCount = 24;
+const expectedPageCount = 26;
 
 async function walk(directory) {
   const entries = await readdir(directory, { withFileTypes: true });

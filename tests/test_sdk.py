@@ -72,6 +72,7 @@ class SyncSDKTests(unittest.TestCase):
             client.runs.get("run")
             client.runs.list("thread")
             client.runs.cancel("run")
+            client.runs.steer("run", payload={"message": "hi"}, idempotency_key="msg-1")
             client.runs.resume("run", True, goto="next")
             self.assertEqual(client.runs.join("run", poll_interval=0)["status"], "succeeded")
             self.assertEqual(list(client.runs.stream("run", after=2))[0]["sequence"], 3)
@@ -129,6 +130,7 @@ class AsyncSDKTests(unittest.TestCase):
                 await client.runs.get("run")
                 await client.runs.list("thread")
                 await client.runs.cancel("run")
+                await client.runs.steer("run", payload={"message": "hi"}, idempotency_key="msg-1")
                 await client.runs.resume("run", True)
                 self.assertEqual((await client.runs.join("run", poll_interval=0))["status"], "succeeded")
                 events = [event async for event in client.runs.stream("run")]

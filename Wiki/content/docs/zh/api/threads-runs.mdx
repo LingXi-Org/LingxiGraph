@@ -79,9 +79,131 @@ POST /v1/runs/{run_id}/redrive
 ```
 
 - cancel 是协作式请求，通常先返回 `cancelling`；节点和 provider 应响应 cancellation token；
+- 取消一个 `pending`（尚未被 worker claim）或 `paused`（停在 `interrupt`、没有 worker 持有它）的 run 会立即变为 `cancelled` 并写入 `finished_at`：这两种状态都没有正在进行的投递可以协作式地观察 cancel token，因此无需等待；
+- 若一个 `paused` run 之后已被 resume，再对它调用 cancel 会返回 `409 run_superseded`——与 `/steer` 对陈旧 `run_id` 给出的信号一致（见下文）。resume 之后旧 run 的 `status` 依设计仍保持 `paused`（只有类型化的 `superseded_by_run_id` 列会标记它已过期——绝不是可被用户写入、因而可能伪造该信号的 `metadata`），因此 cancel 在决定状态迁移之前，会原子地检查同一个字段；它绝不会在历史 run 上悄然"成功"，而真正被 resume 出来的新 run 却仍在继续执行。请改为取消新的 `run_id`；
 - 只有 `paused` run 可 resume；响应是新 run，`metadata.resumed_from_run_id` 指向原 run；
+- 并发对同一个已 `paused` 的 run 调用 resume 时只有一个会成功：它创建上述新 run，其余并发调用都会收到 `409 run_resume_conflict`，而不是各自创建重复的新 run；
 - 只有 `failed` 或 `dead_letter` 可 redrive；保留原 input/config/version 并重新入队。
 
 <Callout type="warn">
 Redrive 不是“修改输入后重试”。业务输入或 graph version 改变时应创建新 run，并使用新的幂等键。
 </Callout>
+
+## 运行中输入（Steering）
+
+`POST /v1/runs/{run_id}/steer` 在 Run 执行期间 durably 地注入新的结构化输入——不等待完成、
+不强制取消、也不需要先暂停 Run。这与 `cancel`（终止执行）和 `interrupt`（图代码主动让出、
+等待 `resume`）是三件不同的事：steering 只是把一条新消息安全地送进正在跑（或即将跑、或
+刚被 pause）的 Run，是否处理、何时处理、处理后是否改变计划完全由图代码决定。
+
+```bash
+curl -X POST https://agents.example.com/v1/runs/$RUN_ID/steer \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: msg-123" \
+  -H "Content-Type: application/json" \
+  -d '{"kind":"user_input","payload":{"message":"改成用中文回复"},"metadata":{}}'
+```
+
+202 响应：
+
+```json
+{
+  "id": "steer_01H...",
+  "run_id": "run_01H...",
+  "sequence": 3,
+  "kind": "user_input",
+  "status": "pending",
+  "created_at": "2026-08-18T09:00:00Z"
+}
+```
+
+请求体字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `kind` | 是 | 业务自定义的事件种类字符串，例如 `user_input`、`priority_change` |
+| `payload` | 是 | 任意 JSON，图代码通过 `drain_steering()` 读到的就是这个对象 |
+| `metadata` | 否 | 附加元数据，不参与去重 |
+| `idempotency_key` | 否 | 见下 |
+
+**`Idempotency-Key` header 与 body 字段的优先级：** 两者语义相同（同一个逻辑 key），
+可以二选一传递；同时传递时以 `Idempotency-Key` header 为准。同一 `(tenant_id, run_id,
+idempotency_key)` 三元组只会创建一条 steering 事件——重复调用返回**同一条**事件
+（`id`、`sequence` 不变，不会新建行，也不会递增 `sequence`），而不是 409。但响应体
+**不保证**与首次调用逐字节一致：它反映的是该事件**当前持久化的状态**，两次调用之间
+状态可能已经变化（例如首次调用时是 `pending`，而图已经在这之后消费了它，重放时读到
+的就是 `consumed`）。这与 `POST /runs` 创建接口的 `Idempotency-Key` 语义一致，都是
+"同 key 同请求安全重放"而不是"报错"——但重放返回的始终是同一个底层资源的最新状态，
+而不是首次响应的静态快照。关键的一点是：这次重放查找发生在下面所有"按 run 状态"的
+准入检查**之前**，而不是之后——同一个 key 的重试永远返回已存在的事件，即使该 run
+此后已经进入 `run_finalizing`、走到终止态、或已被 superseded。只有一个真正全新的 key
+才会受这些检查约束。
+
+### 各 Run 状态下的行为
+
+| Run 状态 | `/steer` 行为 |
+| --- | --- |
+| `pending`（已入队，worker 未 claim） | 202，durably 写入，worker claim 后立即可见 |
+| `running` | 202，durably 写入，下一个安全点可读到 |
+| `cancelling` | 202，仍然接受（cancel 优先级见下，但接受写入本身不受影响） |
+| `running`/`cancelling`，但正在 finalizing（`runs.steering_closed`） | 对一个真正全新的事件返回 `409 run_finalizing`；同一 key 的重放仍然返回已存在的事件，而不是 409——此时该 run 的图已经执行完毕、这次投递尝试里已经没有更多安全点了，但 run 行还没翻转为终止态/暂停态 |
+| `paused`（等待 `interrupt`/`resume`） | 202，durably 写入；见下方"paused steering 迁移" |
+| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter`（终止态） | 对一个新 key 返回 `409 run_terminal`，不产生任何事件 |
+| 已被 `resume` 取代的旧 `run_id` | `409 run_superseded`，见下 |
+
+### cancel 优先于 steer
+
+无论 steer 请求先到还是后到，cancel 请求都会立即生效：一个 Run 上先 `/steer` 再
+`/cancel`，该 Run 依然会进入 `cancelling`（若该 Run 是 `paused`，则直接进入
+`cancelled`，见上文）并停止执行；已经 durably 写入的 steering
+事件不会被回滚，只是不会再被任何存活的执行消费。steer 从不能撤销或延迟一次已经发出
+的 cancel。
+
+### paused steering 在 atomic resume transaction 中迁移到新 Run
+
+`POST /v1/runs/{run_id}/resume` 会创建一条**新** Run（新的 `run_id`，通过
+`metadata.resumed_from_run_id` 关联旧 Run）。因为 worker 只会为它正在执行的
+`run_id` 拉取 pending steering，所以 resume 端点在**同一个原子事务**里做两件事：
+创建新 Run，并把旧 Run 上所有仍处于 `pending`/`delivered` 的 steering 事件**迁移**到
+新 Run（保序、保留 `kind`/`payload`/`metadata`/`idempotency_key`，旧事件被标记为
+`superseded`）。这里的"原子"很关键：新 Run 在被任何 worker `claim` 之前，其迁移过的
+steering 必须已经全部就位——不存在"新 Run 已可被执行，但尚未迁移完成"的中间态窗口。
+之后由新 Run 的 worker 按正常路径投递、消费：paused 时提交的 steering 会在 resume
+之后被新 Run 实际消费，而不是永远停留在 `pending`。
+
+旧 Run 同时被标记为"已被 resume 取代"。resume 之后再对旧 `run_id` 调 `/steer`
+会返回 HTTP 409 `run_superseded`（而不是再次静默积压出一条永远没人消费的事件），
+提示调用方改为对新 Run 调用 `/steer`。
+
+### `source_event_id`：跨多次 resume 的稳定关联
+
+迁移到新 Run 的 steering 事件会获得一个全新的 `id`（它是新 Run 下的一条独立 durable
+行），但其 `source_event_id` 字段回指客户端**最初** `/steer` 调用收到的那个 `id`。
+即便一个 Run 被反复 pause/resume 多次（A → B → C → ……），每一跳迁移都保留**最初**
+的根 id，不会被中间某一跳的 id 覆盖。`created_at` 同样保留最初 durably accepted 的
+时间，因此最终 `run.steer.consumed` 的 `queue_latency_seconds` 包含了全部 pause
+等待时间。客户端只需记住最初 `/steer` 返回的 `id`，即可在任意后续 Run 的
+`run.steer.accepted`/`run.steer.consumed` 事件的 `source_event_id` 字段里找到它，
+无需跟踪中间产生的每一个 `run_id`。
+
+### payload 大小限制
+
+`payload` + `metadata` 序列化后大小受限（默认约 32KB，或服务端事件字节上限，两者先
+到者生效）；超限返回 `413`/`422`，错误码 `payload_too_large`，不会产生任何 durable
+写入。JSON 值必须是可安全序列化的普通类型（字符串、数字、布尔、null、数组、对象）；
+不支持二进制、循环引用或不可 JSON 化的自定义类型。
+
+### accepted ≠ consumed
+
+`/steer` 的 202 响应只代表事件已 durably 写入 PostgreSQL 的 steering inbox
+（`run.steer.accepted`，状态 `pending`）——**不代表图已经处理这条输入**。当配置了
+`EventBus`（进程内，或通过 `RedisEventBus` 使用 Redis）时，`/steer` 会发布一个可选的
+唤醒通知，正在运行的 worker 心跳循环会等待它，从而缩短发现延迟；它从不是唯一数据源，
+也不是事件流里的一个具名生命周期事件（事件流中并不存在 `run.steer.available` 这个
+事件），只是一个低延迟提示。即使这个通知丢失，worker 仍会通过 PostgreSQL 自身的周期性
+安全点检查最终发现并消费该事件。只有当某个安全点的图代码真正调用
+`runtime.drain_steering()` 读取到该事件，并且这次消费被 `commit_steering_consumptions_if_owned()`
+durably 提交后，才会出现 `run.steer.consumed`。调用方不能仅凭 202 就假设图已经
+"看到"这条输入——目前没有可以直接轮询某个 steering 事件状态的接口；请观察该 run 的
+事件流（`GET /v1/runs/{run_id}/stream`）或事件列表中的 `run.steer.consumed` 来确认
+真正被消费。

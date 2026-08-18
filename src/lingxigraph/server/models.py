@@ -121,9 +121,66 @@ class Run(ApiModel):
     attempt: int = 0
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    #: Set atomically by the owning worker once graph execution has ended
+    #: and before it starts the final steering flush + finalization commit
+    #: (issue #16 PR #17 review round 6, point 3). Once set, ``/steer``
+    #: must refuse new admission -- there is no safe point left for the
+    #: graph to ever consume a newly-accepted event.
+    steering_closed: bool = False
+    #: Set atomically by the resume transaction that creates a descendant
+    #: run from this (paused) run (issue #16 PR #17 review round 14,
+    #: BLOCKER). This is authoritative control-plane lineage state -- it
+    #: MUST NOT live in user-writable ``metadata``, since a caller could
+    #: otherwise forge it at run-creation time to falsely trigger
+    #: ``409 run_superseded`` / ``409 run_resume_conflict`` on a run that
+    #: was never actually resumed. ``/steer``, ``/cancel``, and the
+    #: concurrent-resume conflict gate all read this field, never
+    #: ``metadata.get("superseded_by_run_id")``.
+    superseded_by_run_id: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class SteerCreate(ApiModel):
+    kind: str = "user_input"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+
+
+class SteerAccepted(ApiModel):
+    id: str
+    run_id: str
+    sequence: int
+    status: Literal["pending", "delivered", "consumed", "superseded"]
+    kind: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class RunSteeringEvent(ApiModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    tenant_id: str
+    run_id: str
+    sequence: int
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    status: Literal["pending", "delivered", "consumed", "superseded"] = "pending"
+    created_at: datetime = Field(default_factory=utcnow)
+    consumed_at: datetime | None = None
+    #: Stable logical identity across a paused-run -> resumed-run transfer
+    #: (see ``Repository.resume_run_with_pending_steering`` / issue #16 PR
+    #: #17 review point 3). ``None`` for an event that was never
+    #: transferred. When set, this is the ``id`` of the original
+    #: ``superseded`` row the client's ``/steer`` call actually received --
+    #: external callers correlate "the id I got back" to "the id that was
+    #: eventually consumed" via this field rather than the (new,
+    #: post-transfer) ``id``. ``created_at`` on the transferred row is also
+    #: preserved from the original so ``queue_latency_seconds`` includes
+    #: the time an event spent waiting while the run was paused.
+    source_event_id: str | None = None
 
 
 class RunEvent(ApiModel):
@@ -197,6 +254,9 @@ __all__ = [
     "Run",
     "RunCreate",
     "RunEvent",
+    "RunSteeringEvent",
+    "SteerAccepted",
+    "SteerCreate",
     "Schedule",
     "ScheduleCreate",
     "SchedulePatch",

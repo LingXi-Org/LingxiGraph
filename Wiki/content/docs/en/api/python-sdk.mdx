@@ -36,6 +36,16 @@ with LingxiGraphClient(
 
     completed = client.runs.join(run["id"], timeout=120)
     print(completed["output"])
+
+    # Durably inject mid-run input; success only means it was durably
+    # written -- not that the graph has processed it yet.
+    accepted = client.runs.steer(
+        run["id"],
+        kind="user_input",
+        payload={"message": "switch to Spanish"},
+        idempotency_key="msg-123",
+    )
+    print(accepted["id"], accepted["status"])  # "pending"
 ```
 
 Available resource methods:
@@ -45,11 +55,34 @@ Available resource methods:
 | `graphs` | `list()`, `get(graph_id)` |
 | `assistants` | `create(**values)`, `list()`, `get()`, `update()`, `delete()` |
 | `threads` | `create()`, `list()`, `get()`, `update()`, `state()`, `history()`, `fork()`, `delete()` |
-| `runs` | `create()`, `get()`, `list(thread_id)`, `join()`, `stream()`, `cancel()`, `resume()` |
+| `runs` | `create()`, `get()`, `list(thread_id)`, `join()`, `stream()`, `cancel()`, `steer()`, `resume()` |
 | `store` | `batch(operations)`, `search(namespace, ...)` |
 | `schedules` | `create()`, `list()`, `update()`, `delete()` |
 
 Use `client.request(method, path, **kwargs)` for redrive or an endpoint not yet wrapped by a resource.
+
+### `runs.steer()`
+
+```python
+client.runs.steer(
+    run_id,
+    kind="user_input",
+    payload={"message": "..."},
+    metadata=None,
+    idempotency_key="msg-123",
+)
+```
+
+- `kind` defaults to `"user_input"` but may be any application-defined string;
+- `payload` is the raw JSON the graph reads back via `runtime.drain_steering()`;
+- `idempotency_key`, when set, is also sent as the `Idempotency-Key` header; a repeat call
+  with the same key returns the original event instead of enqueueing a second one;
+- the return value is the 202 response body (`id`, `sequence`, `status`) — it does **not**
+  mean the graph has processed the input; only a subsequent `run.steer.consumed` event
+  means it was actually consumed;
+- calling it against a terminal run raises `LingxiGraphAPIError` with
+  `code == "run_terminal"`; calling it against an old `run_id` already superseded by a
+  `resume` raises `code == "run_superseded"`.
 
 ## Asynchronous client
 
@@ -65,6 +98,14 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
     )
     async for event in client.runs.stream(run["id"]):
         print(event)
+
+    accepted = await client.runs.steer(
+        run["id"],
+        kind="user_input",
+        payload={"message": "switch to Spanish"},
+        idempotency_key="msg-123",
+    )
+    print(accepted["id"], accepted["status"])
 ```
 
 Async resources mirror sync resources. Do not use the synchronous client inside an async event loop.

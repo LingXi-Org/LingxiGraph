@@ -12,6 +12,7 @@ from threading import Event as ThreadEvent
 from threading import Lock
 from typing import Any, Generic, TypeVar
 
+from .steering import SteeringChannel, SteeringEvent
 from .types import StreamWriter
 
 ContextT = TypeVar("ContextT")
@@ -228,6 +229,63 @@ class Runtime(Generic[ContextT]):
     stream_subgraphs: bool = False
     budget: ExecutionBudget | None = None
     _emit: StreamEmitter | None = None
+    _steering: SteeringChannel | None = None
+
+    @property
+    def has_steering(self) -> bool:
+        """Whether one or more steering events are waiting to be drained.
+
+        This is a stable, generic read -- it never interprets the payload.
+        Safe to call from sync or async nodes, and from any subgraph
+        namespace (steering is scoped per top-level run, not per namespace).
+        """
+
+        return self._steering is not None and self._steering.has_pending
+
+    #: Alias suggested by the design doc for "should I consider replanning".
+    steering_pending = has_steering
+
+    def peek_steering(self) -> tuple[SteeringEvent, ...]:
+        """Read pending steering events without consuming them."""
+
+        if self._steering is None:
+            return ()
+        return self._steering.peek()
+
+    def drain_steering(self) -> tuple[SteeringEvent, ...]:
+        """Atomically consume and return pending steering events in order.
+
+        Once drained, the same events are not re-exposed by this channel.
+        The graph decides what to do with them (update state, replan, goto
+        another node, ignore, ask the user) -- LingxiGraph only guarantees
+        durable delivery, ordering, dedup and safe consumption.
+
+        Documented design choice -- "safe point" is application-chosen, not
+        executor-enforced: LingxiGraph guarantees *when* a fresh, correctly
+        ordered, deduplicated view of the channel is available to a node
+        (at every node invocation, via this ``Runtime``), but it does not
+        restrict *where inside the node's own code* that node is allowed to
+        call ``drain_steering()``. A node may call it at the very top before
+        doing any work, in the middle between two tool calls, or not at
+        all -- the executor has no notion of an in-node checkpoint to pin
+        the call to, and enforcing one would mean pausing arbitrary user
+        code mid-function, which LingxiGraph does not attempt. What *is*
+        guaranteed and executor-enforced is the channel's consistency
+        properties (atomic drain-once, dedup, ordering) and that consumption
+        is recorded (node/namespace/task_id/queue latency -- see
+        :class:`~lingxigraph.steering.SteeringConsumption`) against whichever
+        node actually called this method. See ``docs/api.md`` (steering
+        section) for the full statement of this contract.
+        """
+
+        if self._steering is None:
+            return ()
+        # ``task_id`` is either the plain node name or ``"{node}#{index}"``
+        # for a ``Send``-fanout task (see ``CompiledStateGraph._plan_tasks``)
+        # -- split off the fan-out suffix so the observability record names
+        # the node itself, not a synthetic per-task id.
+        node = self.task_id.split("#", 1)[0] if self.task_id else None
+        return self._steering.drain(node=node, namespace=self.namespace, task_id=self.task_id)
 
     @property
     def cancelled(self) -> bool:
@@ -358,6 +416,8 @@ __all__ = [
     "CancellationToken",
     "ExecutionBudget",
     "Runtime",
+    "SteeringChannel",
+    "SteeringEvent",
     "StreamWriter",
     "get_config",
     "get_runtime",

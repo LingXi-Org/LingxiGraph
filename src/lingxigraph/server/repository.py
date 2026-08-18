@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from ..errors import ConcurrentRunError, IdempotencyConflictError
+from ..errors import (
+    ConcurrentRunError,
+    IdempotencyConflictError,
+    RunFinalizingError,
+    RunResumeConflictError,
+    RunSupersededError,
+    RunTerminalError,
+)
+from ..steering import (
+    MAX_STEERING_PAYLOAD_BYTES,
+    SteeringConsumption,
+    validate_steering_payload,
+)
 from ..types import MultitaskStrategy, RunStatus
 from .models import (
     Assistant,
@@ -18,6 +31,7 @@ from .models import (
     Run,
     RunCreate,
     RunEvent,
+    RunSteeringEvent,
     Schedule,
     ScheduleCreate,
     SchedulePatch,
@@ -60,6 +74,8 @@ class InMemoryRepository:
         self._events: dict[tuple[str, str], list[RunEvent]] = {}
         self._schedules: dict[tuple[str, str], Schedule] = {}
         self._audits: list[AuditRecord] = []
+        self._steering: dict[tuple[str, str], list[RunSteeringEvent]] = {}
+        self._steering_keys: dict[tuple[str, str, str], str] = {}
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition()
 
@@ -168,83 +184,106 @@ class InMemoryRepository:
         request_digest: str | None = None,
     ) -> Run:
         async with self._lock:
-            if idempotency_key is not None:
-                existing = next(
-                    (
-                        run
-                        for run in self._runs.values()
-                        if run.tenant_id == tenant_id
-                        and run.idempotency_key == idempotency_key
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    if existing.request_digest != request_digest:
-                        raise IdempotencyConflictError(
-                            "idempotency key was already used for a different run request"
-                        )
-                    return existing.model_copy(deep=True)
-            tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
-            active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
-            queued = [
-                run
-                for run in tenant_runs
-                if enum_value(run.status) == RunStatus.PENDING.value
-            ]
-            if len(active) >= self.limits.max_active_runs:
-                raise ConcurrentRunError("tenant active-run quota exceeded")
-            if len(queued) >= self.limits.max_queued_runs:
-                raise ConcurrentRunError("tenant queued-run quota exceeded")
-            same_thread = [
-                run
-                for run in active
-                if thread_id is not None and run.thread_id == thread_id
-            ]
-            strategy = MultitaskStrategy(request.multitask_strategy)
-            if same_thread and strategy is MultitaskStrategy.REJECT:
-                raise ConcurrentRunError("thread already has an active run")
-            if same_thread and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
-                for run in same_thread:
-                    self._runs[(tenant_id, run.id)] = run.model_copy(
-                        update={"status": RunStatus.CANCELLING.value}
-                    )
-            run = Run(
-                tenant_id=tenant_id,
-                thread_id=thread_id,
-                assistant_id=assistant.id,
-                graph_id=assistant.graph_id,
-                graph_version=assistant.graph_version,
+            run = self._create_run_locked(
+                tenant_id,
+                thread_id,
+                assistant,
+                request,
                 idempotency_key=idempotency_key,
                 request_digest=request_digest,
-                input=request.input,
-                context={**assistant.context, **request.context},
-                config={**assistant.config, **request.config},
-                metadata=request.metadata,
-                resume=request.resume,
-                update=request.update,
-                goto=request.goto,
-                durability=request.durability,
             )
-            if request.run_timeout is not None:
-                run.config["run_timeout"] = request.run_timeout
-            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
-            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
-                budget_value = getattr(request, budget_name)
-                if budget_value is not None:
-                    run.config[budget_name] = budget_value
-            self._runs[(tenant_id, run.id)] = run
-            self._events[(tenant_id, run.id)] = []
         await self._notify()
         return run.model_copy(deep=True)
+
+    def _create_run_locked(
+        self,
+        tenant_id: str,
+        thread_id: str | None,
+        assistant: Assistant,
+        request: RunCreate,
+        *,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
+    ) -> Run:
+        """The body of :meth:`create_run` -- assumes ``self._lock`` is held.
+
+        Factored out so :meth:`resume_run_with_pending_steering` can create
+        the resumed Run and migrate its paused-run steering under a single
+        lock acquisition (see issue #16 PR #17 review point 1): otherwise a
+        worker's own lock acquisition (``claim_run``) could interleave
+        between "new Run committed" and "steering migrated", claiming (and
+        even finishing) the new Run before the migration ever happens.
+        """
+
+        if idempotency_key is not None:
+            existing = next(
+                (
+                    run
+                    for run in self._runs.values()
+                    if run.tenant_id == tenant_id and run.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.request_digest != request_digest:
+                    raise IdempotencyConflictError(
+                        "idempotency key was already used for a different run request"
+                    )
+                return existing
+        tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
+        active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
+        queued = [
+            run for run in tenant_runs if enum_value(run.status) == RunStatus.PENDING.value
+        ]
+        if len(active) >= self.limits.max_active_runs:
+            raise ConcurrentRunError("tenant active-run quota exceeded")
+        if len(queued) >= self.limits.max_queued_runs:
+            raise ConcurrentRunError("tenant queued-run quota exceeded")
+        same_thread = [
+            run for run in active if thread_id is not None and run.thread_id == thread_id
+        ]
+        strategy = MultitaskStrategy(request.multitask_strategy)
+        if same_thread and strategy is MultitaskStrategy.REJECT:
+            raise ConcurrentRunError("thread already has an active run")
+        if same_thread and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
+            for run in same_thread:
+                self._runs[(tenant_id, run.id)] = run.model_copy(
+                    update={"status": RunStatus.CANCELLING.value}
+                )
+        run = Run(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            assistant_id=assistant.id,
+            graph_id=assistant.graph_id,
+            graph_version=assistant.graph_version,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            input=request.input,
+            context={**assistant.context, **request.context},
+            config={**assistant.config, **request.config},
+            metadata=request.metadata,
+            resume=request.resume,
+            update=request.update,
+            goto=request.goto,
+            durability=request.durability,
+        )
+        if request.run_timeout is not None:
+            run.config["run_timeout"] = request.run_timeout
+        run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+        for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+            budget_value = getattr(request, budget_name)
+            if budget_value is not None:
+                run.config[budget_name] = budget_value
+        self._runs[(tenant_id, run.id)] = run
+        self._events[(tenant_id, run.id)] = []
+        return run
 
     async def get_run(self, tenant_id: str, run_id: str) -> Run | None:
         async with self._lock:
             value = self._runs.get((tenant_id, run_id))
             return value.model_copy(deep=True) if value else None
 
-    async def list_runs(
-        self, tenant_id: str, *, thread_id: str | None = None
-    ) -> list[Run]:
+    async def list_runs(self, tenant_id: str, *, thread_id: str | None = None) -> list[Run]:
         async with self._lock:
             values = [
                 run.model_copy(deep=True)
@@ -254,22 +293,53 @@ class InMemoryRepository:
             ]
         return sorted(values, key=lambda run: run.created_at, reverse=True)
 
-    async def claim_run(
-        self, worker_id: str, *, lease_seconds: int = 30
-    ) -> Run | None:
+    async def claim_run(self, worker_id: str, *, lease_seconds: int = 30) -> Run | None:
         now = utcnow()
         async with self._lock:
             for key, run in list(self._runs.items()):
-                if (
-                    enum_value(run.status) == RunStatus.RUNNING.value
-                    and run.lease_expires_at is not None
-                    and run.lease_expires_at <= now
-                ):
+                if run.lease_expires_at is None or run.lease_expires_at > now:
+                    continue
+                # Lease-expiry recovery rule (issue #16 PR #17 review round
+                # 11, BLOCKER): an expired ``running`` lease is requeued to
+                # ``pending`` so a new worker can pick the run back up. An
+                # expired ``cancelling`` lease must NOT be requeued the same
+                # way -- that would silently erase the fact that the
+                # caller already asked to stop and could let business
+                # execution resume after cancellation was requested. It
+                # instead resolves straight to the terminal ``cancelled``
+                # state, mirroring the same ``run_cancelled`` disposition
+                # ``finish_run_if_owned``/``retry_run_if_owned`` already use
+                # when cancellation wins during in-process finalization.
+                # This guarantees the run can never be stuck in
+                # ``cancelling`` forever and keeps its thread from being
+                # wedged for other queued runs.
+                if enum_value(run.status) == RunStatus.RUNNING.value:
                     self._runs[key] = run.model_copy(
                         update={
                             "status": RunStatus.PENDING.value,
                             "lease_owner": None,
                             "lease_expires_at": None,
+                            # A fresh delivery attempt must start with
+                            # steering admission open -- ``steering_closed``
+                            # only means anything for the attempt that set
+                            # it (issue #16 PR #17 review round 6).
+                            "steering_closed": False,
+                        }
+                    )
+                elif enum_value(run.status) == RunStatus.CANCELLING.value:
+                    self._runs[key] = run.model_copy(
+                        update={
+                            "status": RunStatus.CANCELLED.value,
+                            "lease_owner": None,
+                            "lease_expires_at": None,
+                            "finished_at": now,
+                            "error": {
+                                "code": "run_cancelled",
+                                "message": (
+                                    "run was cancelled but its worker's lease"
+                                    " expired before finalization completed"
+                                ),
+                            },
                         }
                     )
             pending = sorted(
@@ -346,9 +416,292 @@ class InMemoryRepository:
         await self._notify()
         return updated.model_copy(deep=True)
 
+    async def finish_run_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        status: RunStatus | str,
+        *,
+        output: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> Run | None:
+        """Fenced/CAS'd terminal-status write for a specific lease + attempt.
+
+        Issue #16 PR #17 review round 6, point 1 (BLOCKER): a stale
+        worker whose lease has already expired (and been claimed by a new
+        owner) must never be able to overwrite that new owner's status.
+        This only writes when ``(lease_owner, attempt)`` still match the
+        caller's *and* the run is still in an active status -- if either
+        no longer holds, it returns ``None`` and touches nothing, and the
+        caller must abandon the attempt without any further status
+        mutation.
+
+        Review round 6, point 2 (BLOCKER): re-checking the current
+        control state (``cancelling`` vs ``running``) happens inside this
+        *same* locked decision, atomically with the fence check -- if the
+        run is already ``cancelling``, cancellation wins and the actual
+        write is coerced to ``cancelled`` regardless of the caller's
+        requested ``status``, so a stale in-flight ``succeeded`` intent
+        can never overwrite a cancel that arrived during finalization.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            final_status = RunStatus(status).value
+            final_output = output
+            final_error = error
+            if (
+                enum_value(run.status) == RunStatus.CANCELLING.value
+                and final_status != RunStatus.CANCELLED.value
+            ):
+                final_status = RunStatus.CANCELLED.value
+                final_output = None
+                final_error = {
+                    "code": "run_cancelled",
+                    "message": "run was cancelled during finalization",
+                }
+            updated = run.model_copy(
+                update={
+                    "status": final_status,
+                    "output": final_output,
+                    "error": final_error,
+                    "finished_at": utcnow(),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+            )
+            self._runs[key] = updated
+        await self._notify()
+        return updated.model_copy(deep=True)
+
+    async def retry_run_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        error: dict[str, Any] | None = None,
+    ) -> Run | None:
+        """Fenced/CAS'd retry-to-pending write; see ``finish_run_if_owned``.
+
+        A ``cancelling`` run must never be sent back to ``pending`` by a
+        stale worker's retry decision -- cancellation still wins here too,
+        resolving directly to ``cancelled`` instead.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            if enum_value(run.status) == RunStatus.CANCELLING.value:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.CANCELLED.value,
+                        "error": {
+                            "code": "run_cancelled",
+                            "message": "run was cancelled during finalization",
+                        },
+                        "finished_at": utcnow(),
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }
+                )
+            else:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.PENDING.value,
+                        "error": error,
+                        "finished_at": None,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                        "steering_closed": False,
+                    }
+                )
+            self._runs[key] = updated
+        await self._notify()
+        return updated.model_copy(deep=True)
+
+    async def retry_run_with_event_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        error: dict[str, Any] | None = None,
+        max_attempts: int | None = None,
+    ) -> tuple[Run, RunEvent | None] | None:
+        """Merge the retry-to-pending transition and its ``worker_retrying``
+        lifecycle event into one atomic operation.
+
+        Issue #16 PR #17 review round 10, point 1 (BLOCKER):
+        ``retry_run_if_owned()`` (the status write) and the caller's
+        subsequent ``append_event("worker_retrying")`` used to be two
+        separate durable decisions/transactions. That reopened a TOCTOU
+        window: (race A) a concurrent cancel landing in the gap between the
+        status write committing and the event append could see this worker
+        append a now-stale ``worker_retrying`` event for a run that had
+        already, durably, moved on to ``cancelled``; (race B) a *new*
+        worker could claim the run (``pending -> running``, attempt N+1)
+        in that same gap and log its own attempt-N+1 events *before* the
+        stale attempt-N ``worker_retrying`` event finally landed, inverting
+        the durable event stream's causal order. Folding both writes into
+        one lock critical section (no ``await`` between the status
+        transition and the event append) makes both races impossible: the
+        instant ``pending``/``cancelled`` becomes visible, the matching
+        event (or lack of one, for ``cancelled``) is already durable too.
+
+        Returns ``(updated_run, event)`` where ``event`` is the appended
+        ``worker_retrying`` :class:`RunEvent` when the run actually
+        transitioned to ``pending``, or ``(cancelled_run, None)`` when
+        cancellation won the race instead (mirroring
+        ``retry_run_if_owned``'s existing cancel-wins coercion -- no
+        ``worker_retrying`` event is ever appended for a run that is really
+        ``cancelled``). Returns ``None`` if the lease was no longer owned,
+        identically to ``retry_run_if_owned``.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            if enum_value(run.status) == RunStatus.CANCELLING.value:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.CANCELLED.value,
+                        "error": {
+                            "code": "run_cancelled",
+                            "message": "run was cancelled during finalization",
+                        },
+                        "finished_at": utcnow(),
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }
+                )
+                self._runs[key] = updated
+                event = None
+            else:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.PENDING.value,
+                        "error": error,
+                        "finished_at": None,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                        "steering_closed": False,
+                    }
+                )
+                self._runs[key] = updated
+                run_events = self._events.setdefault(key, [])
+                event = RunEvent(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    sequence=len(run_events) + 1,
+                    kind="worker_retrying",
+                    data={
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": error,
+                    },
+                )
+                run_events.append(event)
+        await self._notify()
+        return updated.model_copy(deep=True), (event.model_copy(deep=True) if event else None)
+
+    async def close_steering(
+        self, tenant_id: str, run_id: str, worker_id: str, attempt: int
+    ) -> bool:
+        """Atomically close new steering admission for this lease + attempt.
+
+        Issue #16 PR #17 review round 6, point 3 (BLOCKER): once graph
+        execution has ended there is no safe point left for a newly
+        accepted steering event to ever be consumed, even though the Run
+        row may still read ``running``/``cancelling`` while the final
+        flush is in flight. The owning worker calls this the instant
+        execution ends (before the final flush starts) so a concurrent
+        ``/steer`` either lands before this gate closes (and gets synced
+        in as usual, or -- round 7, point 1 -- durably lands but is
+        detected as still-pending by the caller's post-flush disposition
+        call, see below) or after it closes (and is rejected with a
+        stable error) -- never durably accepted into a channel nobody
+        will ever drain again. Fenced the same way as
+        ``finish_run_if_owned``: a stale worker that has already lost its
+        lease cannot close the gate on the new owner's behalf.
+
+        Issue #16 PR #17 review round 7, point 1 (BLOCKER), updated per
+        round 9, point 2: this alone is *not* sufficient to prevent a
+        permanently-pending steering row -- see
+        ``finalize_run_with_steering_disposition_if_owned()``, which the
+        Worker's post-flush finalization calls -- it is what actually
+        catches a row that was durably accepted a moment before this call
+        locked the run (and therefore was never, and can never be,
+        ingested by this attempt's channel), transitioning it to
+        ``superseded`` in the same transaction as the terminal status
+        write. (Round 7 originally described this check as a separate
+        ``Worker._execute`` post-flush ``list_pending_steering`` call;
+        round 9 merged that disposition into
+        ``finalize_run_with_steering_disposition_if_owned()`` itself.)
+        Deliberately *not* checked here: at the instant this call runs,
+        the graph may have already drained events into the channel's local
+        consumption log without those rows having been committed
+        (``status='consumed'``) yet -- that only happens moments later, in
+        the final flush this call precedes. Checking "any pending row
+        exists" here would misidentify perfectly ordinary, about-to-be-
+        flushed consumptions as a permanent race every single time.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return False
+            if not run.steering_closed:
+                self._runs[key] = run.model_copy(update={"steering_closed": True})
+        return True
+
     async def retry_run(
         self, tenant_id: str, run_id: str, *, error: dict[str, Any] | None = None
     ) -> Run:
+        """Unfenced admin/back-compat retry-to-pending write.
+
+        Restored per issue #16 PR #17 review round 9, point 5 (compatibility):
+        this is exported public API on both repository classes (see
+        ``lingxigraph.server.__init__``) and existed on ``main`` before this
+        PR -- it must not be deleted to satisfy a coverage gate. The
+        Worker's production finalization path uses only the fenced
+        ``retry_run_if_owned`` (see ``_commit_intent``/``_retry_or_dead_letter``);
+        this method remains available for callers outside that fenced
+        lease/attempt protocol.
+        """
+
         async with self._lock:
             key = (tenant_id, run_id)
             run = self._runs[key]
@@ -359,6 +712,7 @@ class InMemoryRepository:
                     "finished_at": None,
                     "lease_owner": None,
                     "lease_expires_at": None,
+                    "steering_closed": False,
                 }
             )
             self._runs[key] = updated
@@ -382,6 +736,7 @@ class InMemoryRepository:
                     "finished_at": None,
                     "lease_owner": None,
                     "lease_expires_at": None,
+                    "steering_closed": False,
                 }
             )
             self._runs[key] = updated
@@ -394,9 +749,27 @@ class InMemoryRepository:
             run = self._runs.get(key)
             if run is None or enum_value(run.status) in TERMINAL:
                 return False
+            # Round 13 review (BLOCKER): a paused run that has since been
+            # resumed is only marked stale via the typed
+            # ``Run.superseded_by_run_id`` field -- its ``status``
+            # deliberately stays ``paused`` so /steer's existing superseded
+            # gate keeps working. Cancel must honor that same signal
+            # *inside this lock*, or a cancel racing behind a resume would
+            # silently "succeed" against the old run while the real
+            # (resumed) descendant keeps executing untouched.
+            # Round 14 review (BLOCKER): this MUST be the typed field, not
+            # user-writable ``metadata`` -- a caller could otherwise forge
+            # ``metadata.superseded_by_run_id`` at run-creation time to
+            # falsely trigger this gate on a run that was never resumed.
+            superseded_by = run.superseded_by_run_id
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"cancel the new run instead"
+                )
             status = (
                 RunStatus.CANCELLED.value
-                if enum_value(run.status) == RunStatus.PENDING.value
+                if enum_value(run.status) in {RunStatus.PENDING.value, RunStatus.PAUSED.value}
                 else RunStatus.CANCELLING.value
             )
             self._runs[key] = run.model_copy(
@@ -441,9 +814,658 @@ class InMemoryRepository:
                 if event.sequence > after
             ]
 
-    async def create_schedule(
-        self, tenant_id: str, request: ScheduleCreate
-    ) -> Schedule:
+    async def submit_steering(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        max_payload_bytes: int = MAX_STEERING_PAYLOAD_BYTES,
+    ) -> tuple[RunSteeringEvent, bool]:
+        """Durably accept a steering event. Returns ``(event, created)``.
+
+        Terminal runs raise :class:`RunTerminalError`. Running, queued,
+        cancelling, and paused runs each accept durably -- the *consuming*
+        safe point differs (see module docstring / issue #16 design doc),
+        but acceptance semantics are uniform: it means "written to the
+        durable inbox", never "the graph has processed it".
+        """
+
+        validate_steering_payload(payload, metadata, max_bytes=max_payload_bytes)
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if run is None:
+                raise KeyError(f"run {run_id!r} not found")
+            # Issue #16 PR #17 review round 7, point 3 (BLOCKER): the
+            # idempotency-key replay check must run *before* the terminal/
+            # finalizing/superseded admission gates, not after. A client
+            # that durably submitted this exact event, then lost the 202
+            # response and retried with the same Idempotency-Key after the
+            # run raced ahead to finalizing/terminal/superseded, must still
+            # get back the same event -- that is the entire point of an
+            # idempotency key. Gating replay on "the run is still active"
+            # turns every uncertain-outcome retry into a spurious 409.
+            if idempotency_key is not None:
+                existing_id = self._steering_keys.get((tenant_id, run_id, idempotency_key))
+                if existing_id is not None:
+                    existing = next(
+                        event
+                        for event in self._steering[(tenant_id, run_id)]
+                        if event.id == existing_id
+                    )
+                    # A prior attempt with this idempotency key may have
+                    # committed the steering row but then failed before its
+                    # ``run.steer.accepted`` event was recorded (review
+                    # round 4, point 2) -- repair that gap on the retry
+                    # instead of permanently skipping it.
+                    self._ensure_steer_accepted_event_locked(tenant_id, run_id, existing)
+                    return existing.model_copy(deep=True), False
+            # Only a genuinely new admission decision (no existing row for
+            # this idempotency key -- or none was given) is subject to the
+            # terminal/finalizing/superseded gates.
+            if enum_value(run.status) in TERMINAL:
+                raise RunTerminalError(
+                    f"run {run_id!r} is in terminal state "
+                    f"{enum_value(run.status)!r} and cannot accept new steering input"
+                )
+            if run.steering_closed:
+                raise RunFinalizingError(
+                    f"run {run_id!r} has finished executing and is finalizing; "
+                    "no further steering input can be safely consumed"
+                )
+            # Round 14 review (BLOCKER): read the typed field, not
+            # user-writable ``metadata`` -- see ``request_cancel`` above.
+            superseded_by = run.superseded_by_run_id
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"steer the new run instead"
+                )
+            events = self._steering.setdefault((tenant_id, run_id), [])
+            event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=len(events) + 1,
+                kind=kind,
+                payload=dict(payload),
+                metadata=dict(metadata or {}),
+                idempotency_key=idempotency_key,
+                status="pending",
+            )
+            events.append(event)
+            if idempotency_key is not None:
+                self._steering_keys[(tenant_id, run_id, idempotency_key)] = event.id
+            self._ensure_steer_accepted_event_locked(tenant_id, run_id, event)
+        await self._notify()
+        return event.model_copy(deep=True), True
+
+    def _ensure_steer_accepted_event_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        transferred_from_run_id: str | None = None,
+    ) -> RunEvent:
+        """Idempotently ensure ``run.steer.accepted`` exists for one event.
+
+        Issue #16 PR #17 review round 4, point 2: appending the
+        ``run.steer.accepted`` lifecycle event used to be a second,
+        separately-committed step after ``submit_steering`` (or the
+        paused-resume steering migration) -- a transient failure on that
+        second step, followed by an idempotent-key retry that finds the
+        steering row already created, permanently skipped the event
+        forever. Doing both under the caller's already-held ``self._lock``
+        and keying this on the steering event's id (never appending twice
+        for the same id) makes "accept the steering row" and "record the
+        accepted lifecycle event" a single atomic, idempotent unit -- a
+        retry (of the request, or of this call) always converges on
+        exactly one ``run.steer.accepted`` event per steering event id.
+        Assumes ``self._lock`` is already held.
+        """
+
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        for existing in run_events:
+            if (
+                existing.kind == "run.steer.accepted"
+                and existing.data.get("steering_event_id") == steering_event.id
+            ):
+                return existing
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+        }
+        if transferred_from_run_id is not None:
+            data["transferred_from_run_id"] = transferred_from_run_id
+            data["source_event_id"] = steering_event.source_event_id
+        event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=len(run_events) + 1,
+            kind="run.steer.accepted",
+            data=data,
+        )
+        run_events.append(event)
+        return event
+
+    async def list_pending_steering(
+        self, tenant_id: str, run_id: str
+    ) -> list[RunSteeringEvent]:
+        """Read-only view of never-consumed steering events, in order."""
+
+        async with self._lock:
+            return [
+                event.model_copy(deep=True)
+                for event in self._steering.get((tenant_id, run_id), ())
+                if event.status in ("pending", "delivered")
+            ]
+
+    def _ensure_steer_superseded_event_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        reason: str,
+        superseded_by_run_id: str | None = None,
+        replacement_steering_event_id: str | None = None,
+    ) -> RunEvent:
+        """Idempotently ensure ``run.steer.superseded`` exists for one event.
+
+        Issue #16 PR #17 review round 8, point 3 (BLOCKER): issue #16's
+        observability section requires a durable ``run.steer.superseded``
+        lifecycle event for every steering row that transitions to the
+        ``superseded`` disposition -- both the paused-run resume-transfer
+        case and the late-boundary-race disposition (round 8, point 1).
+        Keyed on the steering event's id, never appending twice for the
+        same id, so a retried transaction (e.g. a resume attempt retried
+        after a transient failure, or a repeated late-race supersede call)
+        converges on exactly one event per steering event id -- the same
+        idempotency discipline as
+        :meth:`_ensure_steer_accepted_event_locked`. Assumes ``self._lock``
+        is already held.
+        """
+
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        for existing in run_events:
+            if (
+                existing.kind == "run.steer.superseded"
+                and existing.data.get("steering_event_id") == steering_event.id
+            ):
+                return existing
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "source_event_id": steering_event.source_event_id or steering_event.id,
+            # Issue #16 PR #17 review round 9, point 4 (REQUIRED): every
+            # other steering lifecycle event (``run.steer.accepted``,
+            # ``run.steer.consumed``) already carries the steering event's
+            # own ``sequence``/``kind`` -- ``run.steer.superseded`` was
+            # missing both, which issue #16's observability section
+            # requires at minimum for every steering lifecycle event.
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+            "reason": reason,
+            "superseded_by_run_id": superseded_by_run_id,
+            "replacement_steering_event_id": replacement_steering_event_id,
+        }
+        event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=len(run_events) + 1,
+            kind="run.steer.superseded",
+            data=data,
+        )
+        run_events.append(event)
+        return event
+
+    async def finalize_run_with_steering_disposition_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        status: RunStatus | str,
+        *,
+        output: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+        supersede_pending: bool = True,
+        supersede_reason: str = "unconsumed_at_final_boundary",
+    ) -> tuple[Run, list[RunEvent]] | None:
+        """Supersede leftover steering AND commit the Run's terminal status
+        as one durable unit.
+
+        Issue #16 PR #17 review round 9, point 2 (BLOCKER): round 8's
+        terminal path called ``supersede_pending_steering_if_owned()`` (one
+        fenced write, committing the ``superseded`` dispositions and their
+        ``run.steer.superseded`` events) and then, moments later and
+        separately, ``finish_run_if_owned()`` (a second fenced write for the
+        Run's terminal status). Each write was individually fenced and
+        correct in isolation, but they were not the same durable boundary:
+        a crash, a failed DB call, or a reclaimed lease between the two
+        left steering permanently ``superseded`` while the Run itself never
+        actually reached a terminal status -- the next owner would see the
+        Run back in an active state with admission reopened, but the
+        "leftover" steering the previous attempt already disposed of could
+        never be recovered, even though that disposition's premise (the Run
+        is finishing right now) turned out to be false.
+
+        This method makes only two outcomes possible: either everything
+        below rolls back together (a subsequent owner still sees the
+        steering rows as ``pending``/``delivered``, fully recoverable), or
+        the steering disposition and the terminal Run status commit
+        together, in the exact same critical section -- for
+        ``InMemoryRepository`` that is one lock acquisition with no
+        intervening ``await``; :class:`PostgresRepository` overrides this
+        with one real SQL transaction. Fenced identically to
+        ``finish_run_if_owned``/``supersede_pending_steering_if_owned``: a
+        ``None`` result means the caller's lease was already reclaimed by a
+        new owner, and nothing here was written. The cancel-wins re-check
+        from ``finish_run_if_owned`` still applies atomically inside this
+        same critical section.
+
+        Returns ``(updated_run, superseded_events)`` on success, or
+        ``None`` if the lease was no longer owned.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            superseded_events: list[RunEvent] = []
+            if supersede_pending:
+                events = self._steering.get((tenant_id, run_id), [])
+                for index, event in enumerate(events):
+                    if event.status in ("pending", "delivered"):
+                        events[index] = event.model_copy(update={"status": "superseded"})
+                        superseded_events.append(
+                            self._ensure_steer_superseded_event_locked(
+                                tenant_id,
+                                run_id,
+                                event,
+                                reason=supersede_reason,
+                            )
+                        )
+            final_status = RunStatus(status).value
+            final_output = output
+            final_error = error
+            if (
+                enum_value(run.status) == RunStatus.CANCELLING.value
+                and final_status != RunStatus.CANCELLED.value
+            ):
+                final_status = RunStatus.CANCELLED.value
+                final_output = None
+                final_error = {
+                    "code": "run_cancelled",
+                    "message": "run was cancelled during finalization",
+                }
+            updated = run.model_copy(
+                update={
+                    "status": final_status,
+                    "output": final_output,
+                    "error": final_error,
+                    "finished_at": utcnow(),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+            )
+            self._runs[key] = updated
+        await self._notify()
+        return updated.model_copy(deep=True), superseded_events
+
+    async def supersede_pending_steering_if_owned(
+        self, tenant_id: str, run_id: str, worker_id: str, attempt: int
+    ) -> list[RunEvent] | None:
+        """Durably supersede any steering row still pending/delivered.
+
+        Issue #16 PR #17 review round 8, point 1 (BLOCKER) -- CHOSEN FIX:
+        "seal admission at the safe boundary + supersede late events".
+        ``close_steering()`` already seals *new* admission the instant
+        graph execution ends; this closes the remaining gap round 7's fix
+        mishandled -- a steering event that durably lands *after* the
+        graph's last safe point but *before* (or racing) the seal itself.
+        Rather than forcing the run through an indefinite retry/dead-letter
+        loop (round 7's approach, which hardcoded an application decision
+        -- "does undrained steering mean rerun?" -- into the Runtime, in
+        violation of issue #16's Runtime/application boundary), any row
+        still ``pending``/``delivered`` once the final flush has completed
+        is durably transitioned to ``superseded`` here, in the same
+        lease/attempt-fenced call as everything else this finalization
+        window does. The run is then free to finalize with its originally
+        computed intent -- a graph that legitimately never calls
+        ``drain_steering()`` is not penalized just because a steering
+        event happened to exist.
+
+        Fenced exactly like ``commit_steering_consumptions_if_owned``: a
+        ``None`` result means this worker's lease was already reclaimed by
+        a new owner between the final flush and this call, and the caller
+        must not treat any of this run's finalization as decided by this
+        attempt.
+        """
+
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            events = self._steering.get((tenant_id, run_id), [])
+            stale = [event for event in events if event.status in ("pending", "delivered")]
+            if not stale:
+                return []
+            stored: list[RunEvent] = []
+            for index, event in enumerate(events):
+                if event.status in ("pending", "delivered"):
+                    events[index] = event.model_copy(update={"status": "superseded"})
+                    stored.append(
+                        self._ensure_steer_superseded_event_locked(
+                            tenant_id,
+                            run_id,
+                            event,
+                            reason="unconsumed_at_final_boundary",
+                        )
+                    )
+        await self._notify()
+        return stored
+
+    async def mark_steering_consumed(
+        self, tenant_id: str, run_id: str, event_ids: Sequence[str]
+    ) -> None:
+        """Mark events consumed once the graph has actually drained them."""
+
+        if not event_ids:
+            return
+        ids = set(event_ids)
+        async with self._lock:
+            events = self._steering.get((tenant_id, run_id), [])
+            for index, event in enumerate(events):
+                if event.id in ids and event.status != "consumed":
+                    events[index] = event.model_copy(
+                        update={"status": "consumed", "consumed_at": utcnow()}
+                    )
+
+    async def commit_steering_consumptions(
+        self,
+        tenant_id: str,
+        run_id: str,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent]:
+        """Durably record consumption (status + lifecycle event), atomically.
+
+        Issue #16 PR #17 review point 2: ``mark_steering_consumed`` plus a
+        separate ``append_event("run.steer.consumed")`` call left a window
+        where a caller that destructively popped its local consumption log
+        *before* calling either could lose the record forever on a
+        transient failure -- the DB row could end up stuck ``pending``
+        forever (no ``on_drain``/dedup path re-surfaces it once
+        ``SteeringChannel._seen_ids`` has recorded the id), or the status
+        could flip to ``consumed`` while the ``run.steer.consumed``
+        observability event silently never appears. This method updates
+        both under one lock acquisition so a caller (see
+        ``Worker._sync_steering_out``) can safely defer clearing its own
+        local bookkeeping until *after* this succeeds, and retry on the
+        next safe point if it raises.
+        """
+
+        if not consumptions:
+            return []
+        async with self._lock:
+            stored = self._commit_steering_consumptions_locked(tenant_id, run_id, consumptions)
+        await self._notify()
+        return stored
+
+    async def commit_steering_consumptions_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent] | None:
+        """Fenced counterpart of :meth:`commit_steering_consumptions`.
+
+        Issue #16 PR #17 review round 7, point 2 (BLOCKER): the unfenced
+        version only keys on ``(tenant_id, run_id, steering_ids)`` -- it
+        never checks ``lease_owner``/``attempt``. A worker whose lease has
+        already been reclaimed by a new owner (attempt N+1) can still
+        durably commit a stale consumption from attempt N *after* the new
+        owner has already re-ingested the same still-pending row into its
+        own channel and started processing it, corrupting the steering
+        inbox/lifecycle even though the stale worker's later
+        ``finish_run_if_owned``/``retry_run_if_owned`` call is correctly
+        rejected.
+
+        This checks ``lease_owner == worker_id``, ``attempt == attempt``,
+        and the run is still active, inside the *same* lock acquisition as
+        the actual status/event writes -- on any mismatch it returns
+        ``None`` and touches nothing, so the caller must not locally ack
+        either.
+        """
+
+        if not consumptions:
+            return []
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            stored = self._commit_steering_consumptions_locked(tenant_id, run_id, consumptions)
+        await self._notify()
+        return stored
+
+    def _commit_steering_consumptions_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent]:
+        """Body of the consumption commit; assumes ``self._lock`` is held."""
+
+        ids = {consumption.event.id for consumption in consumptions}
+        events = self._steering.get((tenant_id, run_id), [])
+        transitioned: set[str] = set()
+        for index, event in enumerate(events):
+            if event.id in ids and event.status != "consumed":
+                events[index] = event.model_copy(
+                    update={"status": "consumed", "consumed_at": utcnow()}
+                )
+                transitioned.add(event.id)
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        stored: list[RunEvent] = []
+        for consumption in consumptions:
+            steering_event = consumption.event
+            if steering_event.id not in transitioned:
+                # Already consumed by a previous call (idempotent
+                # retry, e.g. a worker that re-sends the same batch
+                # after an ack it never observed) -- do not emit a
+                # second, semantically duplicate ``run.steer.consumed``
+                # lifecycle event for it (issue #16 PR #17 review
+                # point 3).
+                continue
+            data: dict[str, Any] = {
+                "steering_event_id": steering_event.id,
+                "sequence": steering_event.sequence,
+                "kind": steering_event.kind,
+                "queue_latency_seconds": consumption.queue_latency_seconds,
+                "node": consumption.node,
+                "namespace": list(consumption.namespace),
+                "task_id": consumption.task_id,
+            }
+            if steering_event.source_event_id is not None:
+                data["source_event_id"] = steering_event.source_event_id
+            stored_event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=len(run_events) + 1,
+                kind="run.steer.consumed",
+                data=data,
+            )
+            run_events.append(stored_event)
+            stored.append(stored_event.model_copy(deep=True))
+        return stored
+
+    async def list_steering(self, tenant_id: str, run_id: str) -> list[RunSteeringEvent]:
+        async with self._lock:
+            return [
+                event.model_copy(deep=True)
+                for event in self._steering.get((tenant_id, run_id), ())
+            ]
+
+    def _transfer_pending_steering_locked(
+        self, tenant_id: str, old_run_id: str, new_run_id: str
+    ) -> list[RunSteeringEvent]:
+        """The body of the old-run -> new-run steering migration.
+
+        Assumes ``self._lock`` is already held -- only called from
+        :meth:`resume_run_with_pending_steering`, which creates the new Run
+        and performs this migration under one lock acquisition (see issue
+        #16 PR #17 review point 1's "not atomic" finding: this must never
+        run as a second, separately-lockable step after the new Run is
+        already visible to :meth:`claim_run`).
+
+        Every event still ``pending``/``delivered`` under ``old_run_id`` is
+        marked ``superseded`` in place (its terminal state -- it was never
+        drained by the paused run) and re-inserted as a fresh ``pending``
+        event under ``new_run_id``, preserving order, ``kind``, ``payload``,
+        ``metadata`` and ``idempotency_key``. The new row's ``created_at``
+        and ``source_event_id`` preserve the original event's identity
+        (review point 3): external callers correlate the id a paused-run
+        ``/steer`` call returned to the eventual ``consumed`` event via
+        ``source_event_id``, and ``queue_latency_seconds`` computed from the
+        preserved ``created_at`` includes the time spent waiting while
+        paused, not just time since the transfer.
+        """
+
+        old_run = self._runs.get((tenant_id, old_run_id))
+        if old_run is not None:
+            # Round 14 review (BLOCKER): write the typed field, not
+            # user-writable ``metadata`` -- see ``request_cancel`` above.
+            self._runs[(tenant_id, old_run_id)] = old_run.model_copy(
+                update={"superseded_by_run_id": new_run_id}
+            )
+        old_events = self._steering.get((tenant_id, old_run_id), [])
+        pending = sorted(
+            (event for event in old_events if event.status in ("pending", "delivered")),
+            key=lambda event: event.sequence,
+        )
+        if not pending:
+            return []
+        for index, event in enumerate(old_events):
+            if event.status in ("pending", "delivered"):
+                old_events[index] = event.model_copy(update={"status": "superseded"})
+        new_events = self._steering.setdefault((tenant_id, new_run_id), [])
+        transferred: list[RunSteeringEvent] = []
+        for event in pending:
+            new_event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=new_run_id,
+                sequence=len(new_events) + 1,
+                kind=event.kind,
+                payload=dict(event.payload),
+                metadata=dict(event.metadata),
+                idempotency_key=event.idempotency_key,
+                status="pending",
+                source_event_id=event.source_event_id or event.id,
+                created_at=event.created_at,
+            )
+            new_events.append(new_event)
+            if event.idempotency_key is not None:
+                self._steering_keys[(tenant_id, new_run_id, event.idempotency_key)] = (
+                    new_event.id
+                )
+            # Record the transferred event's ``run.steer.accepted`` inside
+            # this same locked migration (review round 4, point 2) instead
+            # of leaving it to a second, separately-committed
+            # ``append_event`` call after the endpoint returns from this
+            # method -- otherwise a transient failure of that later call
+            # permanently loses the accepted record for the transferred run.
+            self._ensure_steer_accepted_event_locked(
+                tenant_id, new_run_id, new_event, transferred_from_run_id=old_run_id
+            )
+            # Issue #16 PR #17 review round 8, point 3 (BLOCKER): the old
+            # row's transition to ``superseded`` above must be paired with
+            # a durable ``run.steer.superseded`` lifecycle event, recorded
+            # in this same locked migration -- otherwise an SSE/RunEvent-
+            # only client has no way to learn the old row stopped being
+            # pending or which new run/event now owns it.
+            self._ensure_steer_superseded_event_locked(
+                tenant_id,
+                old_run_id,
+                event,
+                reason="resume_transfer",
+                superseded_by_run_id=new_run_id,
+                replacement_steering_event_id=new_event.id,
+            )
+            transferred.append(new_event.model_copy(deep=True))
+        return transferred
+
+    async def resume_run_with_pending_steering(
+        self,
+        tenant_id: str,
+        thread_id: str | None,
+        assistant: Assistant,
+        request: RunCreate,
+        old_run_id: str,
+    ) -> tuple[Run, list[RunSteeringEvent]]:
+        """Atomically create the resumed Run and migrate paused steering.
+
+        Issue #16 PR #17 review point 1: creating the resumed Run and
+        transferring its predecessor's still-pending steering used to be
+        two separately-locked operations (``create_run`` then
+        ``transfer_pending_steering``); a worker could claim -- and even
+        finish -- the brand-new ``pending`` Run in the window between them,
+        so the migrated steering could land after nobody was left to
+        consume it. Doing both under one ``self._lock`` acquisition (no
+        ``await`` in between) means no other coroutine, including
+        ``claim_run``, can observe the new Run row before its steering
+        migration has also completed.
+
+        Issue #16 PR #17 review round 4, point 1: the endpoint's own
+        ``GET old run -> status == paused`` pre-check happens *before*
+        this call and is therefore not atomic with it -- two concurrent
+        resume requests can both pass it. Re-validate, inside this same
+        lock acquisition, that the old Run is still ``paused`` and has no
+        ``superseded_by_run_id`` set yet; the loser of the race gets
+        :class:`RunResumeConflictError` instead of silently creating a
+        second descendant Run and overwriting the winner's
+        ``superseded_by_run_id``.
+        """
+
+        async with self._lock:
+            old_run = self._runs.get((tenant_id, old_run_id))
+            if (
+                old_run is None
+                or enum_value(old_run.status) != RunStatus.PAUSED.value
+                # Round 14 review (BLOCKER): typed field, not user-writable
+                # ``metadata`` -- see ``request_cancel`` above.
+                or old_run.superseded_by_run_id is not None
+            ):
+                raise RunResumeConflictError(
+                    f"run {old_run_id!r} is no longer resumable "
+                    "(it is not paused, or has already been resumed by a concurrent request)"
+                )
+            run = self._create_run_locked(tenant_id, thread_id, assistant, request)
+            transferred = self._transfer_pending_steering_locked(tenant_id, old_run_id, run.id)
+        await self._notify()
+        return run.model_copy(deep=True), transferred
+
+    async def create_schedule(self, tenant_id: str, request: ScheduleCreate) -> Schedule:
         schedule = Schedule(tenant_id=tenant_id, **request.model_dump())
         async with self._lock:
             self._schedules[(tenant_id, schedule.id)] = schedule
@@ -493,12 +1515,8 @@ class InMemoryRepository:
                     if tenant == tenant_id
                 ),
                 "threads": sum(tenant == tenant_id for tenant, _ in self._threads),
-                "assistants": sum(
-                    tenant == tenant_id for tenant, _ in self._assistants
-                ),
-                "schedules": sum(
-                    tenant == tenant_id for tenant, _ in self._schedules
-                ),
+                "assistants": sum(tenant == tenant_id for tenant, _ in self._assistants),
+                "schedules": sum(tenant == tenant_id for tenant, _ in self._schedules),
             }
 
     async def wait_for_change(self, timeout: float = 1.0) -> None:
@@ -538,7 +1556,9 @@ class PostgresRepository(InMemoryRepository):
             from psycopg.rows import dict_row
             from psycopg.types.json import Jsonb
         except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("install lingxigraph[postgres] to use PostgresRepository") from exc
+            raise RuntimeError(
+                "install lingxigraph[postgres] to use PostgresRepository"
+            ) from exc
         self._psycopg = psycopg
         self._dict_row = dict_row
         self._jsonb = Jsonb
@@ -565,14 +1585,18 @@ class PostgresRepository(InMemoryRepository):
     def _setup_sync(self) -> None:
         from importlib.resources import files
 
-        migration = (
-            files("lingxigraph.server")
-            .joinpath("migrations/0001_v1.sql")
-            .read_text(encoding="utf-8")
-            .replace("{{schema}}", self._schema)
+        migrations_dir = files("lingxigraph.server").joinpath("migrations")
+        names = sorted(
+            entry.name for entry in migrations_dir.iterdir() if entry.name.endswith(".sql")
         )
         with self._connect() as conn, conn.cursor() as cursor:
-            cursor.execute(migration)
+            for name in names:
+                migration = (
+                    migrations_dir.joinpath(name)
+                    .read_text(encoding="utf-8")
+                    .replace("{{schema}}", self._schema)
+                )
+                cursor.execute(migration)
 
     @staticmethod
     def _tenant(cursor, tenant_id: str) -> None:
@@ -898,9 +1922,7 @@ class PostgresRepository(InMemoryRepository):
             return cursor.rowcount > 0
 
     async def finish_run(self, tenant_id, run_id, status, *, output=None, error=None):
-        await asyncio.to_thread(
-            self._finish_run_sync, tenant_id, run_id, status, output, error
-        )
+        await asyncio.to_thread(self._finish_run_sync, tenant_id, run_id, status, output, error)
         value = await self.get_run(tenant_id, run_id)
         assert value is not None
         return value
@@ -915,6 +1937,282 @@ class PostgresRepository(InMemoryRepository):
         changed = await asyncio.to_thread(self._retry_run_sync, tenant_id, run_id, None, True)
         return await self.get_run(tenant_id, run_id) if changed else None
 
+    async def finish_run_if_owned(
+        self, tenant_id, run_id, worker_id, attempt, status, *, output=None, error=None
+    ) -> Run | None:
+        row = await asyncio.to_thread(
+            self._finish_run_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            status,
+            output,
+            error,
+        )
+        if row is None:
+            return None
+        return self._run_from_row(row)
+
+    def _finish_run_if_owned_sync(
+        self, tenant_id, run_id, worker_id, attempt, status, output, error
+    ):  # pragma: no cover -- exercised only against a live Postgres in the `postgres` CI job, not `quality`'s coverage gate
+        # Fenced/CAS'd terminal-status write (issue #16 PR #17 review round
+        # 6, point 1, BLOCKER). Selecting the row ``FOR UPDATE`` first --
+        # filtered on lease_owner/attempt/status, mirroring the pattern
+        # ``_submit_steering_sync``/``_append_event_sync`` already use --
+        # then issuing a plain follow-up ``UPDATE`` inside the same
+        # transaction is deliberately simpler (and easier to verify by
+        # inspection without a live Postgres) than trying to express the
+        # fencing *and* the cancellation-wins re-check as one combined
+        # CASE-heavy UPDATE statement.
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            final_status = RunStatus(status).value
+            final_output = output
+            final_error = error
+            # Review round 6, point 2 (BLOCKER): re-check the current
+            # control state inside this same locked transaction --
+            # cancellation always wins over a stale non-cancel intent.
+            if row["status"] == "cancelling" and final_status != RunStatus.CANCELLED.value:
+                final_status = RunStatus.CANCELLED.value
+                final_output = None
+                final_error = {
+                    "code": "run_cancelled",
+                    "message": "run was cancelled during finalization",
+                }
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): use
+            # ``RETURNING *`` so the row this async wrapper hands back to
+            # the caller is the *same transaction's own* resulting
+            # snapshot, not a separate, later ``get_run()`` read that a
+            # concurrent write (e.g. a racing ``/redrive`` or unfenced
+            # ``retry_run()``) could observe a different value through.
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status=%s, output=%s, error=%s,
+                finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
+                (
+                    final_status,
+                    self._jsonb(final_output) if final_output is not None else None,
+                    self._jsonb(final_error) if final_error is not None else None,
+                    tenant_id,
+                    run_id,
+                ),
+            )
+            return cursor.fetchone()
+
+    async def retry_run_if_owned(
+        self, tenant_id, run_id, worker_id, attempt, *, error=None
+    ) -> Run | None:
+        row = await asyncio.to_thread(
+            self._retry_run_if_owned_sync, tenant_id, run_id, worker_id, attempt, error
+        )
+        if row is None:
+            return None
+        return self._run_from_row(row)
+
+    def _retry_run_if_owned_sync(
+        self, tenant_id, run_id, worker_id, attempt, error
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): return
+            # the transaction's own ``RETURNING *`` snapshot, not a
+            # separate later ``get_run()`` read (see the matching comment
+            # on ``_finish_run_if_owned_sync``).
+            if row["status"] == "cancelling":
+                # Cancellation wins: never send a cancelling run back to
+                # pending because of a stale worker's retry decision.
+                cursor.execute(
+                    f"""UPDATE {self._schema}.runs SET status='cancelled', error=%s,
+                    finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
+                    (
+                        self._jsonb(
+                            {
+                                "code": "run_cancelled",
+                                "message": "run was cancelled during finalization",
+                            }
+                        ),
+                        tenant_id,
+                        run_id,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    f"""UPDATE {self._schema}.runs SET status='pending',
+                    error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                    steering_closed=FALSE
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
+                    (self._jsonb(error) if error is not None else None, tenant_id, run_id),
+                )
+            return cursor.fetchone()
+
+    async def retry_run_with_event_if_owned(
+        self,
+        tenant_id,
+        run_id,
+        worker_id,
+        attempt,
+        *,
+        error=None,
+        max_attempts=None,
+    ) -> tuple[Run, RunEvent | None] | None:
+        """SQL counterpart of
+        :meth:`InMemoryRepository.retry_run_with_event_if_owned` (issue
+        #16 PR #17 review round 10, point 1, BLOCKER). One real PostgreSQL
+        transaction covers: locking the run row, re-checking the fence and
+        control state (cancel-wins), writing the retry-to-pending (or
+        cancel-wins) status transition, and -- only when the transition
+        actually lands on ``pending`` -- inserting the matching
+        ``worker_retrying`` :class:`RunEvent` in the *same* transaction, so
+        both the status write and the event become externally visible
+        together or not at all. This closes the race a separate
+        ``retry_run_if_owned()`` + ``append_event()`` pair left open: a
+        concurrent cancel or a new worker's claim landing in the gap
+        between two independently-committed writes could previously
+        observe (or produce) a stale/out-of-order ``worker_retrying``
+        event.
+        """
+
+        result = await asyncio.to_thread(
+            self._retry_run_with_event_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            error,
+            max_attempts,
+        )
+        if result is None:
+            return None
+        row, event = result
+        return self._run_from_row(row), event
+
+    def _retry_run_with_event_if_owned_sync(  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        self, tenant_id, run_id, worker_id, attempt, error, max_attempts
+    ):
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            if row["status"] == "cancelling":
+                # Cancellation wins: never send a cancelling run back to
+                # pending, and never emit a ``worker_retrying`` event for a
+                # run that is really cancelled.
+                cursor.execute(
+                    f"""UPDATE {self._schema}.runs SET status='cancelled', error=%s,
+                    finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
+                    (
+                        self._jsonb(
+                            {
+                                "code": "run_cancelled",
+                                "message": "run was cancelled during finalization",
+                            }
+                        ),
+                        tenant_id,
+                        run_id,
+                    ),
+                )
+                updated_row = cursor.fetchone()
+                return updated_row, None
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status='pending',
+                error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                steering_closed=FALSE
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
+                (self._jsonb(error) if error is not None else None, tenant_id, run_id),
+            )
+            updated_row = cursor.fetchone()
+            # Same transaction, same lock: allocate the next RunEvent
+            # sequence and insert ``worker_retrying`` here, not via a
+            # later, separately-committed ``append_event()`` call.
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+                FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, run_id),
+            )
+            sequence = int(cursor.fetchone()["next"])
+            data: dict[str, Any] = {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "error": error,
+            }
+            event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=sequence,
+                kind="worker_retrying",
+                data=data,
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_events
+                (id,tenant_id,run_id,sequence,kind,data,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    event.id,
+                    tenant_id,
+                    run_id,
+                    sequence,
+                    "worker_retrying",
+                    self._jsonb(data),
+                    event.created_at,
+                ),
+            )
+            return updated_row, event
+
+    async def close_steering(self, tenant_id, run_id, worker_id, attempt) -> bool:
+        return await asyncio.to_thread(
+            self._close_steering_sync, tenant_id, run_id, worker_id, attempt
+        )
+
+    def _close_steering_sync(
+        self, tenant_id, run_id, worker_id, attempt
+    ) -> bool:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository.close_steering` -- see its docstring for
+        why no "undrained" check happens here (issue #16 PR #17 review
+        round 7, point 1, BLOCKER; the real check, as of round 9, point 2,
+        is ``finalize_run_with_steering_disposition_if_owned()``, which the
+        Worker's post-flush finalization calls).
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET steering_closed=TRUE
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling')""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            return cursor.rowcount > 0
+
     def _retry_run_sync(self, tenant_id, run_id, error, reset_attempt):
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
@@ -922,7 +2220,8 @@ class PostgresRepository(InMemoryRepository):
             attempt = "attempt=0," if reset_attempt else ""
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET status='pending', {attempt}
-                error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL
+                error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                steering_closed=FALSE
                 WHERE tenant_id=%s AND id=%s {allowed}""",
                 (self._jsonb(error) if error is not None else None, tenant_id, run_id),
             )
@@ -947,15 +2246,53 @@ class PostgresRepository(InMemoryRepository):
     async def request_cancel(self, tenant_id, run_id):
         return await asyncio.to_thread(self._request_cancel_sync, tenant_id, run_id)
 
-    def _request_cancel_sync(self, tenant_id, run_id):
+    def _request_cancel_sync(
+        self, tenant_id, run_id
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
+            # Round 13 review (BLOCKER): lock the row first and check the
+            # typed ``superseded_by_run_id`` column *inside this same
+            # lock*, before deciding the status transition. A resumed-away
+            # paused run keeps status='paused' (by design, so /steer's
+            # existing superseded gate works) -- cancel must honor that
+            # same signal atomically, or a cancel racing behind a resume
+            # could falsely report success against the stale run while the
+            # real (resumed) descendant keeps running untouched. Doing
+            # this as a pre-read outside the lock would reopen the same
+            # TOCTOU class of bug already fixed for double-resume.
+            # Round 14 review (BLOCKER): this reads the typed
+            # ``superseded_by_run_id`` column, not user-writable
+            # ``metadata`` -- a caller could otherwise forge
+            # ``metadata.superseded_by_run_id`` at run-creation time to
+            # falsely trigger this gate on a run that was never resumed.
+            cursor.execute(
+                f"""SELECT status, superseded_by_run_id FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+                (tenant_id, run_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            if row["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "timed_out",
+                "dead_letter",
+            }:
+                return False
+            superseded_by = row["superseded_by_run_id"]
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"cancel the new run instead"
+                )
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET
-                status=CASE WHEN status='pending' THEN 'cancelled' ELSE 'cancelling' END,
-                finished_at=CASE WHEN status='pending' THEN NOW() ELSE finished_at END
-                WHERE tenant_id=%s AND id=%s
-                  AND status NOT IN ('succeeded','failed','cancelled','timed_out','dead_letter')""",
+                status=CASE WHEN status IN ('pending','paused') THEN 'cancelled' ELSE 'cancelling' END,
+                finished_at=CASE WHEN status IN ('pending','paused') THEN NOW() ELSE finished_at END
+                WHERE tenant_id=%s AND id=%s""",
                 (tenant_id, run_id),
             )
             return cursor.rowcount > 0
@@ -968,9 +2305,7 @@ class PostgresRepository(InMemoryRepository):
         }
 
     async def append_event(self, tenant_id, run_id, kind, data):
-        return await asyncio.to_thread(
-            self._append_event_sync, tenant_id, run_id, kind, data
-        )
+        return await asyncio.to_thread(self._append_event_sync, tenant_id, run_id, kind, data)
 
     def _append_event_sync(self, tenant_id, run_id, kind, data):
         event = RunEvent(tenant_id=tenant_id, run_id=run_id, sequence=0, kind=kind, data=data)
@@ -1011,6 +2346,903 @@ class PostgresRepository(InMemoryRepository):
             (tenant_id, run_id, after),
         )
         return [RunEvent.model_validate(row) for row in rows]
+
+    async def submit_steering(
+        self,
+        tenant_id,
+        run_id,
+        *,
+        kind,
+        payload,
+        metadata=None,
+        idempotency_key=None,
+        max_payload_bytes: int = MAX_STEERING_PAYLOAD_BYTES,
+    ):
+        validate_steering_payload(payload, metadata, max_bytes=max_payload_bytes)
+        return await asyncio.to_thread(
+            self._submit_steering_sync,
+            tenant_id,
+            run_id,
+            kind,
+            payload,
+            metadata or {},
+            idempotency_key,
+        )
+
+    def _submit_steering_sync(
+        self, tenant_id, run_id, kind, payload, metadata, idempotency_key
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status, steering_closed, superseded_by_run_id
+                FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+                (tenant_id, run_id),
+            )
+            run_row = cursor.fetchone()
+            if run_row is None:
+                raise KeyError(f"run {run_id!r} not found")
+            # Issue #16 PR #17 review round 7, point 3 (BLOCKER): check the
+            # idempotency key for an existing row *before* the terminal/
+            # finalizing/superseded admission gates below -- see the
+            # matching comment in ``InMemoryRepository.submit_steering``.
+            if idempotency_key is not None:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{tenant_id}:{run_id}:{idempotency_key}",),
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.run_steering_events
+                    WHERE tenant_id=%s AND run_id=%s AND idempotency_key=%s""",
+                    (tenant_id, run_id, idempotency_key),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    existing_event = RunSteeringEvent.model_validate(existing)
+                    # A prior attempt with this idempotency key may have
+                    # committed the steering row but then failed before its
+                    # ``run.steer.accepted`` event was recorded (issue #16
+                    # PR #17 review round 4, point 2) -- repair that gap on
+                    # the retry instead of permanently skipping it.
+                    self._ensure_steer_accepted_event_sync(
+                        cursor, tenant_id, run_id, existing_event
+                    )
+                    return existing_event, False
+            # Only a genuinely new admission decision (no existing row for
+            # this idempotency key -- or none was given) is subject to the
+            # terminal/finalizing/superseded gates.
+            if run_row["status"] in TERMINAL:
+                raise RunTerminalError(
+                    f"run {run_id!r} is in terminal state {run_row['status']!r} "
+                    "and cannot accept new steering input"
+                )
+            if run_row.get("steering_closed"):
+                raise RunFinalizingError(
+                    f"run {run_id!r} has finished executing and is finalizing; "
+                    "no further steering input can be safely consumed"
+                )
+            # Round 14 review (BLOCKER): typed column, not user-writable
+            # ``metadata`` -- see ``_request_cancel_sync`` above.
+            superseded_by = run_row.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"steer the new run instead"
+                )
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+                FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, run_id),
+            )
+            sequence = int(cursor.fetchone()["next"])
+            event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=sequence,
+                kind=kind,
+                payload=dict(payload),
+                metadata=dict(metadata or {}),
+                idempotency_key=idempotency_key,
+                status="pending",
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_steering_events
+                (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
+                 status,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    event.id,
+                    tenant_id,
+                    run_id,
+                    event.sequence,
+                    kind,
+                    self._jsonb(event.payload),
+                    self._jsonb(event.metadata),
+                    idempotency_key,
+                    event.status,
+                    event.created_at,
+                ),
+            )
+            # Accept the steering row and record its ``run.steer.accepted``
+            # lifecycle event in the same transaction (issue #16 PR #17
+            # review round 4, point 2) -- both commit together, or neither
+            # does, so a retry can never observe the row without its
+            # accepted event.
+            self._ensure_steer_accepted_event_sync(cursor, tenant_id, run_id, event)
+            return event, True
+
+    def _ensure_steer_accepted_event_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        transferred_from_run_id: str | None = None,
+    ) -> None:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """Idempotently ensure ``run.steer.accepted`` exists for one event.
+
+        Must be called with the target run's row already locked (``FOR
+        UPDATE`` / an implicit lock from an ``INSERT`` earlier in this same
+        transaction) so concurrent sequence-number assignment for
+        ``run_events`` serializes -- same discipline as
+        ``_append_event_sync`` / ``_commit_steering_consumptions_sync``.
+        """
+
+        cursor.execute(
+            f"""SELECT 1 FROM {self._schema}.run_events
+            WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.accepted'
+              AND data->>'steering_event_id'=%s""",
+            (tenant_id, run_id, steering_event.id),
+        )
+        if cursor.fetchone() is not None:
+            return
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        sequence = int(cursor.fetchone()["next"])
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+        }
+        if transferred_from_run_id is not None:
+            data["transferred_from_run_id"] = transferred_from_run_id
+            data["source_event_id"] = steering_event.source_event_id
+        run_event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=sequence,
+            kind="run.steer.accepted",
+            data=data,
+        )
+        cursor.execute(
+            f"""INSERT INTO {self._schema}.run_events
+            (id,tenant_id,run_id,sequence,kind,data,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                run_event.id,
+                tenant_id,
+                run_id,
+                sequence,
+                "run.steer.accepted",
+                self._jsonb(data),
+                run_event.created_at,
+            ),
+        )
+
+    def _ensure_steer_superseded_event_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        reason: str,
+        superseded_by_run_id: str | None = None,
+        replacement_steering_event_id: str | None = None,
+    ) -> None:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository._ensure_steer_superseded_event_locked`
+        (issue #16 PR #17 review round 8, point 3, BLOCKER). Must be
+        called with the target run's row already locked (``FOR UPDATE`` /
+        an implicit lock from an earlier ``INSERT``/``UPDATE`` in this
+        same transaction), same discipline as
+        ``_ensure_steer_accepted_event_sync``.
+        """
+
+        cursor.execute(
+            f"""SELECT 1 FROM {self._schema}.run_events
+            WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.superseded'
+              AND data->>'steering_event_id'=%s""",
+            (tenant_id, run_id, steering_event.id),
+        )
+        if cursor.fetchone() is not None:
+            return
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        sequence = int(cursor.fetchone()["next"])
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "source_event_id": steering_event.source_event_id or steering_event.id,
+            # Issue #16 PR #17 review round 9, point 4 (REQUIRED): see the
+            # matching comment in
+            # ``InMemoryRepository._ensure_steer_superseded_event_locked``.
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+            "reason": reason,
+            "superseded_by_run_id": superseded_by_run_id,
+            "replacement_steering_event_id": replacement_steering_event_id,
+        }
+        run_event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=sequence,
+            kind="run.steer.superseded",
+            data=data,
+        )
+        cursor.execute(
+            f"""INSERT INTO {self._schema}.run_events
+            (id,tenant_id,run_id,sequence,kind,data,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                run_event.id,
+                tenant_id,
+                run_id,
+                sequence,
+                "run.steer.superseded",
+                self._jsonb(data),
+                run_event.created_at,
+            ),
+        )
+
+    async def finalize_run_with_steering_disposition_if_owned(
+        self,
+        tenant_id,
+        run_id,
+        worker_id,
+        attempt,
+        status,
+        *,
+        output=None,
+        error=None,
+        supersede_pending: bool = True,
+        supersede_reason: str = "unconsumed_at_final_boundary",
+    ) -> tuple[Run, list[RunEvent]] | None:
+        result = await asyncio.to_thread(
+            self._finalize_run_with_steering_disposition_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            status,
+            output,
+            error,
+            supersede_pending,
+            supersede_reason,
+        )
+        if result is None:
+            return None
+        row, stored_events = result
+        return self._run_from_row(row), stored_events
+
+    def _finalize_run_with_steering_disposition_if_owned_sync(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        status,
+        output,
+        error,
+        supersede_pending: bool,
+        supersede_reason: str,
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository.finalize_run_with_steering_disposition_if_owned`
+        (issue #16 PR #17 review round 9, point 2, BLOCKER). One real
+        PostgreSQL transaction covers: locking the run row, re-checking the
+        fence and control state (cancel-wins), locking and superseding any
+        still-``pending``/``delivered`` steering rows plus their
+        ``run.steer.superseded`` events, and writing the run's terminal
+        status -- all committed together by the surrounding ``with
+        self._connect()`` block, or all rolled back together if anything
+        raises before it exits normally.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            stored: list[RunEvent] = []
+            if supersede_pending:
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.run_steering_events
+                    WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+                    ORDER BY sequence FOR UPDATE""",
+                    (tenant_id, run_id),
+                )
+                stale_rows = cursor.fetchall()
+                if stale_rows:
+                    stale_ids = [stale_row["id"] for stale_row in stale_rows]
+                    cursor.execute(
+                        f"""UPDATE {self._schema}.run_steering_events
+                        SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                        (tenant_id, stale_ids),
+                    )
+                    for stale_row in stale_rows:
+                        steering_event = RunSteeringEvent.model_validate(stale_row)
+                        self._ensure_steer_superseded_event_sync(
+                            cursor,
+                            tenant_id,
+                            run_id,
+                            steering_event,
+                            reason=supersede_reason,
+                        )
+                        cursor.execute(
+                            f"""SELECT * FROM {self._schema}.run_events
+                            WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.superseded'
+                              AND data->>'steering_event_id'=%s""",
+                            (tenant_id, run_id, steering_event.id),
+                        )
+                        stored_row = cursor.fetchone()
+                        if stored_row is not None:
+                            stored.append(RunEvent.model_validate(stored_row))
+
+            final_status = RunStatus(status).value
+            final_output = output
+            final_error = error
+            if row["status"] == "cancelling" and final_status != RunStatus.CANCELLED.value:
+                final_status = RunStatus.CANCELLED.value
+                final_output = None
+                final_error = {
+                    "code": "run_cancelled",
+                    "message": "run was cancelled during finalization",
+                }
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): return
+            # this transaction's own ``RETURNING *`` snapshot alongside the
+            # superseded events, instead of a separate later ``get_run()``
+            # a concurrent write (e.g. ``/redrive`` or the unfenced
+            # ``retry_run()``) could race ahead of.
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status=%s, output=%s, error=%s,
+                finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
+                (
+                    final_status,
+                    self._jsonb(final_output) if final_output is not None else None,
+                    self._jsonb(final_error) if final_error is not None else None,
+                    tenant_id,
+                    run_id,
+                ),
+            )
+            return cursor.fetchone(), stored
+
+    async def supersede_pending_steering_if_owned(
+        self, tenant_id, run_id, worker_id, attempt
+    ) -> list[RunEvent] | None:
+        return await asyncio.to_thread(
+            self._supersede_pending_steering_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+        )
+
+    def _supersede_pending_steering_if_owned_sync(
+        self, tenant_id: str, run_id: str, worker_id: str, attempt: int
+    ) -> (
+        list[RunEvent] | None
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository.supersede_pending_steering_if_owned` --
+        see its docstring (issue #16 PR #17 review round 8, point 1,
+        BLOCKER) for the "seal + supersede" design this implements.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            if cursor.fetchone() is None:
+                return None
+            cursor.execute(
+                f"""SELECT * FROM {self._schema}.run_steering_events
+                WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+                ORDER BY sequence FOR UPDATE""",
+                (tenant_id, run_id),
+            )
+            stale_rows = cursor.fetchall()
+            if not stale_rows:
+                return []
+            stale_ids = [row["id"] for row in stale_rows]
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                (tenant_id, stale_ids),
+            )
+            stored: list[RunEvent] = []
+            for row in stale_rows:
+                steering_event = RunSteeringEvent.model_validate(row)
+                self._ensure_steer_superseded_event_sync(
+                    cursor,
+                    tenant_id,
+                    run_id,
+                    steering_event,
+                    reason="unconsumed_at_final_boundary",
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.run_events
+                    WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.superseded'
+                      AND data->>'steering_event_id'=%s""",
+                    (tenant_id, run_id, steering_event.id),
+                )
+                stored_row = cursor.fetchone()
+                if stored_row is not None:
+                    stored.append(RunEvent.model_validate(stored_row))
+            return stored
+
+    async def list_pending_steering(self, tenant_id, run_id):
+        rows = await asyncio.to_thread(
+            self._fetch_all,
+            tenant_id,
+            f"""SELECT * FROM {self._schema}.run_steering_events
+            WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+            ORDER BY sequence""",
+            (tenant_id, run_id),
+        )
+        return [RunSteeringEvent.model_validate(row) for row in rows]
+
+    async def list_steering(self, tenant_id, run_id):
+        rows = await asyncio.to_thread(
+            self._fetch_all,
+            tenant_id,
+            f"""SELECT * FROM {self._schema}.run_steering_events
+            WHERE tenant_id=%s AND run_id=%s ORDER BY sequence""",
+            (tenant_id, run_id),
+        )
+        return [RunSteeringEvent.model_validate(row) for row in rows]
+
+    async def mark_steering_consumed(self, tenant_id, run_id, event_ids):
+        if not event_ids:
+            return
+        await asyncio.to_thread(
+            self._mark_steering_consumed_sync, tenant_id, run_id, list(event_ids)
+        )
+
+    def _mark_steering_consumed_sync(
+        self, tenant_id, run_id, event_ids
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='consumed', consumed_at=NOW()
+                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'""",
+                (tenant_id, run_id, event_ids),
+            )
+
+    async def commit_steering_consumptions(self, tenant_id, run_id, consumptions):
+        if not consumptions:
+            return []
+        return await asyncio.to_thread(
+            self._commit_steering_consumptions_sync, tenant_id, run_id, list(consumptions)
+        )
+
+    def _commit_steering_consumptions_sync(
+        self, tenant_id: str, run_id: str, consumptions: list[SteeringConsumption]
+    ) -> list[RunEvent]:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository.commit_steering_consumptions` -- see its
+        docstring (issue #16 PR #17 review point 2) for why the status
+        update and the ``run.steer.consumed`` event append must commit
+        together, in the same transaction, before the caller acks its
+        local consumption log.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            # Same locking discipline as ``_append_event_sync``: lock the
+            # run row first so concurrent event appenders for this run
+            # serialize their sequence assignment instead of racing.
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
+                (tenant_id, run_id),
+            )
+            return self._commit_steering_consumptions_body_sync(
+                cursor, tenant_id, run_id, consumptions
+            )
+
+    async def commit_steering_consumptions_if_owned(
+        self, tenant_id, run_id, worker_id, attempt, consumptions
+    ) -> list[RunEvent] | None:
+        if not consumptions:
+            return []
+        return await asyncio.to_thread(
+            self._commit_steering_consumptions_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            list(consumptions),
+        )
+
+    def _commit_steering_consumptions_if_owned_sync(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        consumptions: list[SteeringConsumption],
+    ) -> (
+        list[RunEvent] | None
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """Fenced counterpart of ``_commit_steering_consumptions_sync``.
+
+        Issue #16 PR #17 review round 7, point 2 (BLOCKER): see the
+        matching docstring on
+        :meth:`InMemoryRepository.commit_steering_consumptions_if_owned`.
+        The run row is locked ``FOR UPDATE`` first, filtered on
+        ``lease_owner``/``attempt``/active status -- exactly the same
+        pattern as ``_finish_run_if_owned_sync``/``_close_steering_sync`` --
+        *before* any steering row is touched, so a concurrent
+        ``claim_run()`` (which updates ``lease_owner``/``attempt`` under
+        its own ``FOR UPDATE`` on the same row) fully serializes against
+        this fencing check: a worker that has already lost its lease can
+        never observe a stale "still owned" result here.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            if cursor.fetchone() is None:
+                return None
+            return self._commit_steering_consumptions_body_sync(
+                cursor, tenant_id, run_id, consumptions
+            )
+
+    def _commit_steering_consumptions_body_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        consumptions: list[SteeringConsumption],
+    ) -> list[RunEvent]:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """Shared body; assumes the run row is already locked ``FOR UPDATE``
+        on ``cursor``'s transaction (by the caller, with or without lease
+        fencing applied first)."""
+
+        ids = [consumption.event.id for consumption in consumptions]
+        cursor.execute(
+            f"""UPDATE {self._schema}.run_steering_events
+            SET status='consumed', consumed_at=NOW()
+            WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'
+            RETURNING id""",
+            (tenant_id, run_id, ids),
+        )
+        # Only ids that *actually* transitioned pending/delivered ->
+        # consumed in this call. A retried batch (e.g. a worker that
+        # re-sends consumptions after a commit whose ack it never saw)
+        # must not emit a second, semantically duplicate
+        # ``run.steer.consumed`` lifecycle event for a row some
+        # earlier call already consumed (issue #16 PR #17 review
+        # point 3).
+        transitioned = {row["id"] for row in cursor.fetchall()}
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0) AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        next_sequence = int(cursor.fetchone()["next"])
+        stored: list[RunEvent] = []
+        for consumption in consumptions:
+            event = consumption.event
+            if event.id not in transitioned:
+                continue
+            next_sequence += 1
+            data: dict[str, Any] = {
+                "steering_event_id": event.id,
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "queue_latency_seconds": consumption.queue_latency_seconds,
+                "node": consumption.node,
+                "namespace": list(consumption.namespace),
+                "task_id": consumption.task_id,
+            }
+            if event.source_event_id is not None:
+                data["source_event_id"] = event.source_event_id
+            run_event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=next_sequence,
+                kind="run.steer.consumed",
+                data=data,
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_events
+                (id,tenant_id,run_id,sequence,kind,data,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    run_event.id,
+                    tenant_id,
+                    run_id,
+                    run_event.sequence,
+                    run_event.kind,
+                    self._jsonb(run_event.data),
+                    run_event.created_at,
+                ),
+            )
+            stored.append(run_event)
+        return stored
+
+    async def resume_run_with_pending_steering(
+        self, tenant_id, thread_id, assistant, request, old_run_id
+    ):
+        return await asyncio.to_thread(
+            self._resume_run_with_pending_steering_sync,
+            tenant_id,
+            thread_id,
+            assistant,
+            request,
+            old_run_id,
+        )
+
+    def _resume_run_with_pending_steering_sync(
+        self, tenant_id, thread_id, assistant, request, old_run_id
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        """SQL counterpart of
+        :meth:`InMemoryRepository.resume_run_with_pending_steering`.
+
+        Issue #16 PR #17 review point 1: the resumed Run's INSERT and the
+        old Run's steering migration must commit as one all-or-nothing unit
+        so no other transaction can ever see the new Run row without its
+        migrated steering already alongside it. Using a single connection
+        for both means they share one PostgreSQL transaction (autocommit is
+        off; the ``with self._connect()`` block only commits when it exits
+        normally) -- ``claim_run`` runs its own ``UPDATE ... FOR UPDATE
+        SKIP LOCKED`` against ``runs`` in a *different* connection/
+        transaction, so it cannot observe the freshly INSERTed new-Run row
+        at all until this transaction commits, by which point the
+        migration below has already happened.
+
+        This also closes the second race the review flagged: an ordinary
+        concurrent ``/steer`` against the new run (``_submit_steering_sync``)
+        takes ``SELECT ... FOR UPDATE`` on the **runs** row for
+        ``new_run.id`` before computing ``MAX(sequence)+1`` over
+        ``run_steering_events``. Because the new run's row was INSERTed --
+        and is therefore implicitly locked -- inside *this* transaction,
+        that concurrent ``FOR UPDATE`` blocks until this transaction
+        commits, so the two ``MAX(sequence)+1`` computations for the same
+        ``new_run_id`` can never race.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            # Lock the paused run first so two concurrent resume attempts
+            # against the same paused run_id serialize instead of both
+            # migrating (and superseding) the same steering rows.
+            cursor.execute(
+                f"""SELECT status, superseded_by_run_id FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+                (tenant_id, old_run_id),
+            )
+            old_run_row = cursor.fetchone()
+            # Issue #16 PR #17 review round 4, point 1: the endpoint's own
+            # pre-check (``GET old run -> status == paused``) races with
+            # concurrent resumes and is not itself atomic with this call.
+            # Re-validate under the lock just acquired above -- still
+            # ``paused``, and not already superseded by a resume that won
+            # the race -- before creating a second descendant Run.
+            # Round 14 review (BLOCKER): typed column, not user-writable
+            # ``metadata`` -- see ``_request_cancel_sync`` above.
+            if old_run_row is None:
+                raise RunResumeConflictError(f"run {old_run_id!r} no longer exists")
+            if (
+                old_run_row.get("status") != "paused"
+                or old_run_row.get("superseded_by_run_id") is not None
+            ):
+                raise RunResumeConflictError(
+                    f"run {old_run_id!r} is no longer resumable "
+                    "(it is not paused, or has already been resumed by a concurrent request)"
+                )
+
+            cursor.execute(
+                f"""SELECT
+                  COUNT(*) FILTER (WHERE status IN ('running','cancelling')) AS active,
+                  COUNT(*) FILTER (WHERE status='pending') AS queued
+                FROM {self._schema}.runs WHERE tenant_id=%s""",
+                (tenant_id,),
+            )
+            counts = cursor.fetchone()
+            if counts["active"] >= self.limits.max_active_runs:
+                raise ConcurrentRunError("tenant active-run quota exceeded")
+            if counts["queued"] >= self.limits.max_queued_runs:
+                raise ConcurrentRunError("tenant queued-run quota exceeded")
+            if thread_id is not None:
+                cursor.execute(
+                    f"""SELECT id FROM {self._schema}.runs WHERE tenant_id=%s
+                    AND thread_id=%s AND status IN ('running','cancelling') FOR UPDATE""",
+                    (tenant_id, thread_id),
+                )
+                active = cursor.fetchall()
+                strategy = MultitaskStrategy(request.multitask_strategy)
+                if active and strategy is MultitaskStrategy.REJECT:
+                    raise ConcurrentRunError("thread already has an active run")
+                if active and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
+                    cursor.execute(
+                        f"""UPDATE {self._schema}.runs SET status='cancelling'
+                        WHERE tenant_id=%s AND thread_id=%s AND status='running'""",
+                        (tenant_id, thread_id),
+                    )
+
+            run = Run(
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                assistant_id=assistant.id,
+                graph_id=assistant.graph_id,
+                graph_version=assistant.graph_version,
+                input=request.input,
+                context={**assistant.context, **request.context},
+                config={**assistant.config, **request.config},
+                metadata=request.metadata,
+                resume=request.resume,
+                update=request.update,
+                goto=request.goto,
+                durability=request.durability,
+            )
+            if request.run_timeout is not None:
+                run.config["run_timeout"] = request.run_timeout
+            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+                budget_value = getattr(request, budget_name)
+                if budget_value is not None:
+                    run.config[budget_name] = budget_value
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.runs
+                (id,tenant_id,thread_id,assistant_id,graph_id,graph_version,status,
+                 idempotency_key,request_digest,input,context,config,metadata,resume,update,goto_node,durability,
+                 attempt,created_at)
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    run.id,
+                    tenant_id,
+                    thread_id,
+                    run.assistant_id,
+                    run.graph_id,
+                    run.graph_version,
+                    enum_value(run.status),
+                    run.idempotency_key,
+                    run.request_digest,
+                    self._jsonb(run.input) if run.input is not None else None,
+                    self._jsonb(run.context),
+                    self._jsonb(run.config),
+                    self._jsonb(run.metadata),
+                    self._jsonb(run.resume) if run.resume is not None else None,
+                    self._jsonb(run.update) if run.update is not None else None,
+                    run.goto,
+                    enum_value(run.durability),
+                    run.attempt,
+                    run.created_at,
+                ),
+            )
+
+            # Round 14 review (BLOCKER): write the typed column
+            # atomically as part of this same resume transaction, not
+            # user-writable ``metadata``.
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET superseded_by_run_id=%s
+                WHERE tenant_id=%s AND id=%s""",
+                (run.id, tenant_id, old_run_id),
+            )
+
+            cursor.execute(
+                f"""SELECT * FROM {self._schema}.run_steering_events
+                WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+                ORDER BY sequence FOR UPDATE""",
+                (tenant_id, old_run_id),
+            )
+            pending_rows = cursor.fetchall()
+            transferred: list[RunSteeringEvent] = []
+            if pending_rows:
+                pending_ids = [row["id"] for row in pending_rows]
+                cursor.execute(
+                    f"""UPDATE {self._schema}.run_steering_events
+                    SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                    (tenant_id, pending_ids),
+                )
+                # Safe against a concurrent ordinary /steer on the new run:
+                # both this and ``_submit_steering_sync`` first take
+                # ``FOR UPDATE`` on the *new run's* ``runs`` row -- which
+                # this transaction already holds implicitly from the
+                # INSERT above -- before computing MAX(sequence)+1 here.
+                cursor.execute(
+                    f"""SELECT COALESCE(MAX(sequence),0) AS next
+                    FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
+                    (tenant_id, run.id),
+                )
+                next_sequence = int(cursor.fetchone()["next"])
+                for row in pending_rows:
+                    next_sequence += 1
+                    event = RunSteeringEvent(
+                        tenant_id=tenant_id,
+                        run_id=run.id,
+                        sequence=next_sequence,
+                        kind=row["kind"],
+                        payload=dict(row["payload"] or {}),
+                        metadata=dict(row["metadata"] or {}),
+                        idempotency_key=row["idempotency_key"],
+                        status="pending",
+                        source_event_id=row["source_event_id"] or row["id"],
+                        created_at=row["created_at"],
+                    )
+                    cursor.execute(
+                        f"""INSERT INTO {self._schema}.run_steering_events
+                        (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
+                         status,created_at,source_event_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (
+                            event.id,
+                            tenant_id,
+                            run.id,
+                            event.sequence,
+                            event.kind,
+                            self._jsonb(event.payload),
+                            self._jsonb(event.metadata),
+                            event.idempotency_key,
+                            event.status,
+                            event.created_at,
+                            event.source_event_id,
+                        ),
+                    )
+                    # Record the transferred event's ``run.steer.accepted``
+                    # inside this same migration transaction (review round
+                    # 4, point 2) instead of a separate ``append_event``
+                    # call after this method returns.
+                    self._ensure_steer_accepted_event_sync(
+                        cursor,
+                        tenant_id,
+                        run.id,
+                        event,
+                        transferred_from_run_id=old_run_id,
+                    )
+                    # Issue #16 PR #17 review round 8, point 3 (BLOCKER):
+                    # the old row's transition to ``superseded`` above must
+                    # be paired with a durable ``run.steer.superseded``
+                    # lifecycle event in this same migration transaction.
+                    self._ensure_steer_superseded_event_sync(
+                        cursor,
+                        tenant_id,
+                        old_run_id,
+                        RunSteeringEvent.model_validate(row),
+                        reason="resume_transfer",
+                        superseded_by_run_id=run.id,
+                        replacement_steering_event_id=event.id,
+                    )
+                    transferred.append(event)
+            return run, transferred
 
     async def create_schedule(self, tenant_id, request):
         value = Schedule(tenant_id=tenant_id, **request.model_dump())
@@ -1152,8 +3384,7 @@ class PostgresRepository(InMemoryRepository):
             counts: dict[str, int] = {}
             for name in ("run_events", "threads", "assistants", "schedules"):
                 cursor.execute(
-                    f"SELECT COUNT(*) AS count FROM {self._schema}.{name} "
-                    "WHERE tenant_id=%s",
+                    f"SELECT COUNT(*) AS count FROM {self._schema}.{name} WHERE tenant_id=%s",
                     (tenant_id,),
                 )
                 counts[name] = int(cursor.fetchone()["count"])
@@ -1172,8 +3403,38 @@ class PostgresRepository(InMemoryRepository):
         with self._connect() as conn, conn.cursor() as cursor:
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET status='pending',
-                    lease_owner=NULL, lease_expires_at=NULL
+                    lease_owner=NULL, lease_expires_at=NULL, steering_closed=FALSE
                     WHERE status='running' AND lease_expires_at < NOW()"""
+            )
+            # Lease-expiry recovery rule (issue #16 PR #17 review round 11,
+            # BLOCKER): an expired ``cancelling`` lease must NOT be
+            # requeued to ``pending`` like an expired ``running`` lease
+            # above -- that would silently erase the fact that the caller
+            # already asked to stop and could let business execution
+            # resume after cancellation was requested. It instead resolves
+            # straight to the terminal ``cancelled`` state, mirroring the
+            # same ``run_cancelled`` disposition
+            # ``_finish_run_if_owned_sync``/``_retry_run_if_owned_sync``
+            # already use when cancellation wins during in-process
+            # finalization. This guarantees the run can never be stuck in
+            # ``cancelling`` forever and keeps its thread from being
+            # wedged for other queued runs on the same thread.
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status='cancelled',
+                    lease_owner=NULL, lease_expires_at=NULL, finished_at=NOW(),
+                    error=%s
+                    WHERE status='cancelling' AND lease_expires_at < NOW()""",
+                (
+                    self._jsonb(
+                        {
+                            "code": "run_cancelled",
+                            "message": (
+                                "run was cancelled but its worker's lease "
+                                "expired before finalization completed"
+                            ),
+                        }
+                    ),
+                ),
             )
             cursor.execute(
                 f"""
@@ -1207,11 +3468,14 @@ class PostgresRepository(InMemoryRepository):
         value = dict(row)
         value["goto"] = value.pop("goto_node", None)
         for name in ("input", "context", "config", "metadata", "error", "output"):
-            value[name] = value.get(name) or ({} if name in {"context", "config", "metadata"} else None)
+            value[name] = value.get(name) or (
+                {} if name in {"context", "config", "metadata"} else None
+            )
         return Run.model_validate(value)
 
 
 __all__ = [
+    "ACTIVE",
     "InMemoryRepository",
     "PostgresRepository",
     "RepositoryLimits",

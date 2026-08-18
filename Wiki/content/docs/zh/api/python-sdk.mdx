@@ -36,6 +36,15 @@ with LingxiGraphClient(
 
     completed = client.runs.join(run["id"], timeout=120)
     print(completed["output"])
+
+    # Durably 注入一条运行中输入；成功只代表已 durably 写入，不代表已被图消费。
+    accepted = client.runs.steer(
+        run["id"],
+        kind="user_input",
+        payload={"message": "改成用中文回复"},
+        idempotency_key="msg-123",
+    )
+    print(accepted["id"], accepted["status"])  # "pending"
 ```
 
 可用资源方法：
@@ -45,11 +54,32 @@ with LingxiGraphClient(
 | `graphs` | `list()`、`get(graph_id)` |
 | `assistants` | `create(**values)`、`list()`、`get()`、`update()`、`delete()` |
 | `threads` | `create()`、`list()`、`get()`、`update()`、`state()`、`history()`、`fork()`、`delete()` |
-| `runs` | `create()`、`get()`、`list(thread_id)`、`join()`、`stream()`、`cancel()`、`resume()` |
+| `runs` | `create()`、`get()`、`list(thread_id)`、`join()`、`stream()`、`cancel()`、`steer()`、`resume()` |
 | `store` | `batch(operations)`、`search(namespace, ...)` |
 | `schedules` | `create()`、`list()`、`update()`、`delete()` |
 
 Redrive 或尚未封装的端点可使用 `client.request(method, path, **kwargs)`。
+
+### `runs.steer()`
+
+```python
+client.runs.steer(
+    run_id,
+    kind="user_input",
+    payload={"message": "..."},
+    metadata=None,
+    idempotency_key="msg-123",
+)
+```
+
+- `kind` 默认 `"user_input"`，可自定义为任意业务字符串；
+- `payload` 是图代码通过 `runtime.drain_steering()` 读回的原始 JSON；
+- `idempotency_key` 传入时会同时作为 `Idempotency-Key` header 发送；同一 key 重复调用
+  返回原事件，不会重复入队；
+- 返回值是 202 响应体（含 `id`、`sequence`、`status`），**不代表**图已经处理这条输入——
+  只有服务端后续出现的 `run.steer.consumed` 事件才代表真正被消费；
+- 对处于终止态的 run 调用会抛出 `LingxiGraphAPIError`，`code == "run_terminal"`；
+  对已被 `resume` 取代的旧 `run_id` 调用会抛出 `code == "run_superseded"`。
 
 ## 异步客户端
 
@@ -65,6 +95,14 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
     )
     async for event in client.runs.stream(run["id"]):
         print(event)
+
+    accepted = await client.runs.steer(
+        run["id"],
+        kind="user_input",
+        payload={"message": "switch to Spanish"},
+        idempotency_key="msg-123",
+    )
+    print(accepted["id"], accepted["status"])
 ```
 
 异步资源与同步资源一一对应。不要在 async 事件循环中使用同步客户端。

@@ -223,6 +223,53 @@ class SecurityEventBusTests(unittest.TestCase):
             asyncio.run(bus.close())
         redis.publish.assert_awaited_once()
 
+    def test_redis_wait_does_not_busy_loop_when_get_message_raises(self) -> None:
+        """Issue #16 PR #17 review round 7, point 4: if Redis disconnects
+        right after ``subscribe()`` succeeds, every subsequent
+        ``get_message()`` call can raise immediately. Before this fix,
+        ``_wait_cancellation_safe`` folded that exception into ``None`` --
+        indistinguishable from "no message yet" -- so ``RedisEventBus.
+        wait()``'s deadline loop just kept calling ``get_message()`` again
+        with no backoff for the rest of the timeout window. The exception
+        must now propagate out to ``wait()``'s own outer ``except
+        Exception: return``, so ``wait()`` returns promptly and
+        ``get_message`` is called only once."""
+
+        call_count = 0
+
+        class FlakyPubSub:
+            async def subscribe(self, _channel):
+                return None
+
+            async def get_message(self, **_kwargs):
+                nonlocal call_count
+                call_count += 1
+                raise ConnectionError("simulated redis disconnect")
+
+            async def aclose(self):
+                return None
+
+        redis = SimpleNamespace(
+            publish=AsyncMock(return_value=1),
+            pubsub=lambda: FlakyPubSub(),
+            aclose=AsyncMock(),
+        )
+        with patch("redis.asyncio.Redis.from_url", return_value=redis):
+            bus = RedisEventBus("redis://test")
+
+            async def scenario():
+                start = asyncio.get_event_loop().time()
+                await bus.wait("tenant", "run", timeout=5.0)
+                elapsed = asyncio.get_event_loop().time() - start
+                return elapsed
+
+            elapsed = asyncio.run(scenario())
+        # A busy-loop would burn through the whole 5s timeout window
+        # calling get_message() thousands of times; the fix returns almost
+        # immediately after the single raising call.
+        self.assertEqual(call_count, 1)
+        self.assertLess(elapsed, 1.0)
+
     def test_redis_cache_roundtrip_clear_and_sync_wrappers(self) -> None:
         serializer = JsonSerializer()
 

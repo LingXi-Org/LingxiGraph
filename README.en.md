@@ -55,6 +55,7 @@ flowchart TB
 LingxiGraph is for product and platform teams that need to deliver Agent experiences reliably to end users. It focuses on the engineering problems that appear after a model call works in a prototype:
 
 - **Continuous user experiences** — threads, checkpoints, history, forks, resumes, and resumable SSE support multi-turn sessions, long-running work, and reconnects.
+- **Durable mid-run steering** — inject new structured input into a running (or paused) run without cancelling it; delivery is durable, ordered, deduplicated, and survives worker crashes and paused-run resumes.
 - **Composable intelligent workflows** — state graphs, subgraphs, and supervisor, handoff, swarm, group chat, plan-and-execute, parallel-review, and map-reduce patterns organize complex requests.
 - **Governed production execution** — pinned graph versions, lease-based queues, idempotency keys, timeouts, budgets, quotas, dead-letter/redrive, and cooperative cancellation make retries and scaling manageable.
 - **Tenant-aware security boundaries** — OIDC/JWT, RBAC, tenant isolation, PostgreSQL RLS, audit records, and safe JSON state serialization provide runtime foundations for data isolation in online products.

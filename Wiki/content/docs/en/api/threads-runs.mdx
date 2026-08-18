@@ -79,9 +79,143 @@ POST /v1/runs/{run_id}/redrive
 ```
 
 - Cancellation is cooperative and usually returns `cancelling` first; nodes and providers should honor the cancellation token.
+- Cancelling a `pending` (not yet claimed) or `paused` (parked on `interrupt`, no live worker holding it) run resolves to `cancelled` immediately, with `finished_at` set — there is no live delivery attempt for either status to cooperatively observe a token, so there is nothing to wait on.
+- Cancelling a `paused` run that has since been `resume`d returns `409 run_superseded` instead — the same signal `/steer` gives for a stale `run_id` (see below). The old run's `status` deliberately stays `paused` after a resume (only the typed `superseded_by_run_id` column marks it stale — never user-writable `metadata`, which cannot forge this signal), so cancel checks that same field, atomically, before deciding the status transition; it never silently succeeds against the historical run while the resumed descendant keeps executing. Cancel the new `run_id` instead.
 - Only a `paused` run can resume. The response is a new run whose `metadata.resumed_from_run_id` points to the original.
+- Concurrent resume calls against the same paused run have exactly one winner: it creates the new run as above, and every other concurrent caller gets `409 run_resume_conflict` instead of a duplicate run.
 - Only `failed` or `dead_letter` runs can redrive. Redrive preserves input/config/version and re-enqueues the run.
 
 <Callout type="warn">
 Redrive does not mean “retry with edited input.” When business input or graph version changes, create a new run with a new idempotency key.
 </Callout>
+
+## Mid-run input (Steering)
+
+`POST /v1/runs/{run_id}/steer` durably injects a new piece of structured input while a run
+executes — without waiting for it to finish, without forcing a cancel, and without needing
+the run to be paused first. This is distinct from both `cancel` (terminate execution) and
+`interrupt` (graph code voluntarily yielding, waiting for `resume`): steering only safely
+delivers a new message into a run that is running (or about to run, or just paused). Whether,
+when, and how it changes the plan is entirely up to the graph code.
+
+```bash
+curl -X POST https://agents.example.com/v1/runs/$RUN_ID/steer \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: msg-123" \
+  -H "Content-Type: application/json" \
+  -d '{"kind":"user_input","payload":{"message":"switch to Spanish"},"metadata":{}}'
+```
+
+202 response:
+
+```json
+{
+  "id": "steer_01H...",
+  "run_id": "run_01H...",
+  "sequence": 3,
+  "kind": "user_input",
+  "status": "pending",
+  "created_at": "2026-08-18T09:00:00Z"
+}
+```
+
+Request body fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `kind` | yes | Application-defined event kind, e.g. `user_input`, `priority_change` |
+| `payload` | yes | Arbitrary JSON; this is exactly what graph code reads back from `drain_steering()` |
+| `metadata` | no | Extra metadata, not part of dedup |
+| `idempotency_key` | no | See below |
+
+**`Idempotency-Key` header vs. body field.** Both express the same logical key and either
+may be used; when both are present the `Idempotency-Key` header wins. The same
+`(tenant_id, run_id, idempotency_key)` triple creates at most one steering event — a repeat
+call returns the **same** event (`id` and `sequence` unchanged, no new row created and no
+`sequence` bump), not a `409`. The response body is *not* guaranteed to be byte-identical to
+the first call's, though: it reflects that event's **current persisted status**, which can
+have moved on between calls (e.g. `pending` on the first call, `consumed` on a later replay
+after the graph has since drained it). This mirrors the `Idempotency-Key` semantics on
+`POST /runs`: same key + same request is a safe replay, not an error — but a replay always
+returns the live state of the one underlying resource, not a frozen snapshot of the first
+response. Crucially, this replay lookup happens **before** any of the run-status admission
+checks below, not after: a same-key retry always returns the existing event, even if the run
+has since moved into `run_finalizing`, gone terminal, or been superseded. Only a genuinely new
+key is subject to those checks.
+
+### Behavior by run status
+
+| Run status | `/steer` behavior |
+| --- | --- |
+| `pending` (queued, not yet claimed) | 202, durably written; visible as soon as a worker claims the run |
+| `running` | 202, durably written; visible at the next safe point |
+| `cancelling` | 202, still accepted (cancel still wins overall — see below — but accepting the write itself is unaffected) |
+| `running`/`cancelling`, but finalizing (`runs.steering_closed`) | `409 run_finalizing` for a genuinely new event; a same-key replay still returns the existing event, not a 409 — the graph has already finished executing and there is no further safe point in this delivery attempt, but the run row has not yet flipped to a terminal/paused status |
+| `paused` (waiting on `interrupt`/`resume`) | 202, durably written; see "paused steering transfer" below |
+| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter` (terminal) | `409 run_terminal`, no event is created for a new key |
+| An old `run_id` already superseded by a `resume` | `409 run_superseded`, see below |
+
+### Cancel always wins over steer
+
+Regardless of arrival order, a cancel request always takes effect: a run that receives a
+`/steer` and is then `/cancel`led still moves to `cancelling` (or, for a `paused` run,
+straight to `cancelled` — see above) and stops executing. The already-durably-written
+steering event is not rolled back — it simply is never consumed by any surviving execution.
+Steer can never undo or delay a cancel that has already been issued.
+
+### Paused steering transfers to the new run inside the atomic resume transaction
+
+`POST /v1/runs/{run_id}/resume` creates a **new** run (a new `run_id`, linked to the old one
+via `metadata.resumed_from_run_id`). Because a worker only pulls pending steering for the
+`run_id` it is actually executing, the resume endpoint does two things in a **single atomic
+transaction**: it creates the new run, and it **migrates** every still-`pending`/`delivered`
+steering event from the old run onto the new one (preserving order, `kind`, `payload`,
+`metadata`, `idempotency_key`; the old events are marked `superseded`). The atomicity matters:
+before the new run can be claimed by any worker, its migrated steering must already be fully
+in place — there is no intermediate window where the new run is claimable but its migration
+has not finished yet. From there the new run's worker delivers and consumes it through the
+normal path: steering submitted while paused ends up actually consumed by the resumed run,
+instead of sitting `pending` forever.
+
+The old run is also marked as superseded by the resume. A subsequent `/steer` call against
+the old `run_id` returns HTTP `409 run_superseded` (instead of silently queuing an event
+nobody will ever consume), telling the caller to steer the new run instead.
+
+### `source_event_id`: stable correlation across repeated resumes
+
+A steering event migrated onto a new run gets a brand-new `id` (it is a fresh durable row
+under the new run), but its `source_event_id` field points back at the `id` the client
+originally received from its `/steer` call. Even if a run is paused and resumed repeatedly
+(A → B → C → …), every hop of the migration preserves the **original** root id — it is never
+overwritten by an intermediate hop's id. `created_at` likewise preserves the original
+durably-accepted time, so the eventual `run.steer.consumed` event's `queue_latency_seconds`
+includes the entire time spent waiting across every pause, not just the time since the last
+resume. A client only needs to remember the `id` its very first `/steer` call returned to
+find it, later, in the `source_event_id` field of `run.steer.accepted`/`run.steer.consumed`
+events on whatever run eventually consumes it — no need to track every intermediate
+`run_id`.
+
+### Payload size limits
+
+Serialized `payload` + `metadata` size is bounded (roughly 32KB by default, or the server's
+event byte cap, whichever is smaller); exceeding it returns `413`/`422` with error code
+`payload_too_large` and creates no durable write. JSON values must be safely serializable
+plain types (string, number, boolean, null, array, object) — no binary data, cyclic
+references, or non-JSON-serializable custom types.
+
+### Accepted ≠ consumed
+
+The 202 response from `/steer` only means the event has been durably written to PostgreSQL's
+steering inbox (`run.steer.accepted`, status `pending`) — **it does not mean the graph has
+processed it**. When an `EventBus` is configured (in-process, or Redis via `RedisEventBus`),
+`/steer` publishes an optional wake notification a running worker's heartbeat loop is waiting
+on, which can shorten the time to discovery; it is never the sole source of truth, and it is
+not itself a named lifecycle event (there is no `run.steer.available` event in the stream) —
+it is purely a low-latency hint. Even if that notification is lost, a worker still eventually
+discovers and consumes the event via PostgreSQL's own periodic safe-point checks. Only once
+graph code at some safe point actually calls `runtime.drain_steering()` and that consumption
+is durably committed by `commit_steering_consumptions_if_owned()` does `run.steer.consumed` appear.
+Callers must not assume the graph has "seen" the input just because they got a 202 — there is
+no endpoint to poll a steering event's status directly; watch the run's event stream
+(`GET /v1/runs/{run_id}/stream`) or event list for `run.steer.consumed` to confirm it was
+actually consumed.

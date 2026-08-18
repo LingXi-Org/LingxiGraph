@@ -20,7 +20,16 @@ from fastapi.staticfiles import StaticFiles
 
 from ..cache import BaseCache
 from ..checkpoint import Checkpointer, InMemorySaver
-from ..errors import ConcurrentRunError, EmptyInputError, IdempotencyConflictError
+from ..errors import (
+    ConcurrentRunError,
+    EmptyInputError,
+    IdempotencyConflictError,
+    RunFinalizingError,
+    RunResumeConflictError,
+    RunSupersededError,
+    RunTerminalError,
+)
+from ..steering import MAX_STEERING_PAYLOAD_BYTES, SteeringPayloadTooLarge
 from ..store import BaseStore, InMemoryStore, StoreOperation
 from ..types import RunStatus
 from ..version import __version__
@@ -36,6 +45,8 @@ from .models import (
     Schedule,
     ScheduleCreate,
     SchedulePatch,
+    SteerAccepted,
+    SteerCreate,
     StoreBatchRequest,
     Thread,
     ThreadCreate,
@@ -183,6 +194,26 @@ def create_app(
     @app.exception_handler(IdempotencyConflictError)
     async def idempotency_error(request: Request, exc: IdempotencyConflictError):
         return _problem(request, 409, "idempotency_conflict", str(exc))
+
+    @app.exception_handler(RunTerminalError)
+    async def run_terminal_error(request: Request, exc: RunTerminalError):
+        return _problem(request, 409, "run_terminal", str(exc))
+
+    @app.exception_handler(RunSupersededError)
+    async def run_superseded_error(request: Request, exc: RunSupersededError):
+        return _problem(request, 409, "run_superseded", str(exc))
+
+    @app.exception_handler(RunResumeConflictError)
+    async def run_resume_conflict_error(request: Request, exc: RunResumeConflictError):
+        return _problem(request, 409, "run_resume_conflict", str(exc))
+
+    @app.exception_handler(RunFinalizingError)
+    async def run_finalizing_error(request: Request, exc: RunFinalizingError):
+        return _problem(request, 409, "run_finalizing", str(exc))
+
+    @app.exception_handler(SteeringPayloadTooLarge)
+    async def steering_payload_error(request: Request, exc: SteeringPayloadTooLarge):
+        return _problem(request, 413, "payload_too_large", str(exc))
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
@@ -537,6 +568,64 @@ def create_app(
         assert value is not None
         return value
 
+    @app.post("/v1/runs/{run_id}/steer", response_model=SteerAccepted, status_code=202)
+    async def steer_run(
+        run_id: str,
+        body: SteerCreate,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        user: Principal = Depends(require("operator")),
+    ):
+        """Durably accept mid-run steering input.
+
+        202 means the event was durably written to the steering inbox --
+        never that the graph has processed it. The graph decides what a
+        new steering event means at its next safe point via
+        ``runtime.drain_steering()``.
+        """
+
+        run = await repository.get_run(user.tenant_id, run_id)
+        if run is None:
+            raise HTTPException(404, "run not found")
+        key = idempotency_key or body.idempotency_key
+        try:
+            event, created = await repository.submit_steering(
+                user.tenant_id,
+                run_id,
+                kind=body.kind,
+                payload=body.payload,
+                metadata=body.metadata,
+                idempotency_key=key,
+                # Issue #16 PR #17 review round 5, point 3: the public docs
+                # and the ``steering`` module both promise a ~32KB payload
+                # cap (``MAX_STEERING_PAYLOAD_BYTES``); using the much
+                # larger generic event cap here let payloads up to 256KB
+                # through, contradicting that documented contract. Enforce
+                # whichever limit is smaller so the HTTP endpoint never
+                # accepts more than the documented steering limit, even if
+                # a deployment raises the generic event size cap.
+                max_payload_bytes=min(
+                    MAX_STEERING_PAYLOAD_BYTES, repository.limits.max_event_bytes
+                ),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "run not found") from exc
+        # ``repository.submit_steering`` durably records the steering row
+        # *and* its ``run.steer.accepted`` lifecycle event atomically (issue
+        # #16 PR #17 review round 4, point 2) -- nothing further to persist
+        # here even on an idempotent retry that repairs a previously-missing
+        # accepted event.
+        if created:
+            await event_bus.publish(user.tenant_id, run_id, 0)
+            await audit(user, "runs.steer", "run", run_id)
+        return SteerAccepted(
+            id=event.id,
+            run_id=run_id,
+            sequence=event.sequence,
+            status=event.status,
+            kind=event.kind,
+            created_at=event.created_at,
+        )
+
     @app.post("/v1/runs/{run_id}/resume", response_model=Run, status_code=202)
     async def resume_run(
         run_id: str,
@@ -567,9 +656,27 @@ def create_app(
             durability=previous.durability,
             metadata={"resumed_from_run_id": previous.id},
         )
-        value = await repository.create_run(
-            user.tenant_id, previous.thread_id, assistant, request
+        # Create the resumed Run and carry over any steering that was
+        # durably accepted while `previous` was paused as a single atomic
+        # repository operation (issue #16 PR #17 review point 1) -- the
+        # worker only pulls pending steering for the run it is actually
+        # executing (the new one), so without atomicity a worker could
+        # claim and even finish the new Run before the migration below
+        # ever ran, leaving the migrated steering permanently unconsumed.
+        # This also marks `previous` so any *later* steer attempt against
+        # the stale run_id is rejected instead of silently pending again
+        # (see RunSupersededError).
+        # ``resume_run_with_pending_steering`` re-validates under its own
+        # lock that ``previous`` is still paused and not already resumed by
+        # a concurrent request (issue #16 PR #17 review round 4, point 1),
+        # and durably records each transferred event's ``run.steer.accepted``
+        # lifecycle event in the same migration transaction (review round 4,
+        # point 2) -- nothing further to persist for that here.
+        value, transferred = await repository.resume_run_with_pending_steering(
+            user.tenant_id, previous.thread_id, assistant, request, previous.id
         )
+        if transferred:
+            await event_bus.publish(user.tenant_id, value.id, 0)
         await audit(user, "runs.resume", "run", value.id)
         return value
 
