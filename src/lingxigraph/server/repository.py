@@ -15,7 +15,11 @@ from ..errors import (
     RunSupersededError,
     RunTerminalError,
 )
-from ..steering import MAX_STEERING_PAYLOAD_BYTES, validate_steering_payload
+from ..steering import (
+    MAX_STEERING_PAYLOAD_BYTES,
+    SteeringConsumption,
+    validate_steering_payload,
+)
 from ..types import MultitaskStrategy, RunStatus
 from .models import (
     Assistant,
@@ -178,74 +182,104 @@ class InMemoryRepository:
         request_digest: str | None = None,
     ) -> Run:
         async with self._lock:
-            if idempotency_key is not None:
-                existing = next(
-                    (
-                        run
-                        for run in self._runs.values()
-                        if run.tenant_id == tenant_id
-                        and run.idempotency_key == idempotency_key
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    if existing.request_digest != request_digest:
-                        raise IdempotencyConflictError(
-                            "idempotency key was already used for a different run request"
-                        )
-                    return existing.model_copy(deep=True)
-            tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
-            active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
-            queued = [
-                run
-                for run in tenant_runs
-                if enum_value(run.status) == RunStatus.PENDING.value
-            ]
-            if len(active) >= self.limits.max_active_runs:
-                raise ConcurrentRunError("tenant active-run quota exceeded")
-            if len(queued) >= self.limits.max_queued_runs:
-                raise ConcurrentRunError("tenant queued-run quota exceeded")
-            same_thread = [
-                run
-                for run in active
-                if thread_id is not None and run.thread_id == thread_id
-            ]
-            strategy = MultitaskStrategy(request.multitask_strategy)
-            if same_thread and strategy is MultitaskStrategy.REJECT:
-                raise ConcurrentRunError("thread already has an active run")
-            if same_thread and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
-                for run in same_thread:
-                    self._runs[(tenant_id, run.id)] = run.model_copy(
-                        update={"status": RunStatus.CANCELLING.value}
-                    )
-            run = Run(
-                tenant_id=tenant_id,
-                thread_id=thread_id,
-                assistant_id=assistant.id,
-                graph_id=assistant.graph_id,
-                graph_version=assistant.graph_version,
+            run = self._create_run_locked(
+                tenant_id,
+                thread_id,
+                assistant,
+                request,
                 idempotency_key=idempotency_key,
                 request_digest=request_digest,
-                input=request.input,
-                context={**assistant.context, **request.context},
-                config={**assistant.config, **request.config},
-                metadata=request.metadata,
-                resume=request.resume,
-                update=request.update,
-                goto=request.goto,
-                durability=request.durability,
             )
-            if request.run_timeout is not None:
-                run.config["run_timeout"] = request.run_timeout
-            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
-            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
-                budget_value = getattr(request, budget_name)
-                if budget_value is not None:
-                    run.config[budget_name] = budget_value
-            self._runs[(tenant_id, run.id)] = run
-            self._events[(tenant_id, run.id)] = []
         await self._notify()
         return run.model_copy(deep=True)
+
+    def _create_run_locked(
+        self,
+        tenant_id: str,
+        thread_id: str | None,
+        assistant: Assistant,
+        request: RunCreate,
+        *,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
+    ) -> Run:
+        """The body of :meth:`create_run` -- assumes ``self._lock`` is held.
+
+        Factored out so :meth:`resume_run_with_pending_steering` can create
+        the resumed Run and migrate its paused-run steering under a single
+        lock acquisition (see issue #16 PR #17 review point 1): otherwise a
+        worker's own lock acquisition (``claim_run``) could interleave
+        between "new Run committed" and "steering migrated", claiming (and
+        even finishing) the new Run before the migration ever happens.
+        """
+
+        if idempotency_key is not None:
+            existing = next(
+                (
+                    run
+                    for run in self._runs.values()
+                    if run.tenant_id == tenant_id
+                    and run.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.request_digest != request_digest:
+                    raise IdempotencyConflictError(
+                        "idempotency key was already used for a different run request"
+                    )
+                return existing
+        tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
+        active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
+        queued = [
+            run
+            for run in tenant_runs
+            if enum_value(run.status) == RunStatus.PENDING.value
+        ]
+        if len(active) >= self.limits.max_active_runs:
+            raise ConcurrentRunError("tenant active-run quota exceeded")
+        if len(queued) >= self.limits.max_queued_runs:
+            raise ConcurrentRunError("tenant queued-run quota exceeded")
+        same_thread = [
+            run
+            for run in active
+            if thread_id is not None and run.thread_id == thread_id
+        ]
+        strategy = MultitaskStrategy(request.multitask_strategy)
+        if same_thread and strategy is MultitaskStrategy.REJECT:
+            raise ConcurrentRunError("thread already has an active run")
+        if same_thread and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
+            for run in same_thread:
+                self._runs[(tenant_id, run.id)] = run.model_copy(
+                    update={"status": RunStatus.CANCELLING.value}
+                )
+        run = Run(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            assistant_id=assistant.id,
+            graph_id=assistant.graph_id,
+            graph_version=assistant.graph_version,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            input=request.input,
+            context={**assistant.context, **request.context},
+            config={**assistant.config, **request.config},
+            metadata=request.metadata,
+            resume=request.resume,
+            update=request.update,
+            goto=request.goto,
+            durability=request.durability,
+        )
+        if request.run_timeout is not None:
+            run.config["run_timeout"] = request.run_timeout
+        run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+        for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+            budget_value = getattr(request, budget_name)
+            if budget_value is not None:
+                run.config[budget_name] = budget_value
+        self._runs[(tenant_id, run.id)] = run
+        self._events[(tenant_id, run.id)] = []
+        return run
 
     async def get_run(self, tenant_id: str, run_id: str) -> Run | None:
         async with self._lock:
@@ -541,6 +575,66 @@ class InMemoryRepository:
                         update={"status": "consumed", "consumed_at": utcnow()}
                     )
 
+    async def commit_steering_consumptions(
+        self,
+        tenant_id: str,
+        run_id: str,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent]:
+        """Durably record consumption (status + lifecycle event), atomically.
+
+        Issue #16 PR #17 review point 2: ``mark_steering_consumed`` plus a
+        separate ``append_event("run.steer.consumed")`` call left a window
+        where a caller that destructively popped its local consumption log
+        *before* calling either could lose the record forever on a
+        transient failure -- the DB row could end up stuck ``pending``
+        forever (no ``on_drain``/dedup path re-surfaces it once
+        ``SteeringChannel._seen_ids`` has recorded the id), or the status
+        could flip to ``consumed`` while the ``run.steer.consumed``
+        observability event silently never appears. This method updates
+        both under one lock acquisition so a caller (see
+        ``Worker._sync_steering_out``) can safely defer clearing its own
+        local bookkeeping until *after* this succeeds, and retry on the
+        next safe point if it raises.
+        """
+
+        if not consumptions:
+            return []
+        async with self._lock:
+            ids = {consumption.event.id for consumption in consumptions}
+            events = self._steering.get((tenant_id, run_id), [])
+            for index, event in enumerate(events):
+                if event.id in ids and event.status != "consumed":
+                    events[index] = event.model_copy(
+                        update={"status": "consumed", "consumed_at": utcnow()}
+                    )
+            run_events = self._events.setdefault((tenant_id, run_id), [])
+            stored: list[RunEvent] = []
+            for consumption in consumptions:
+                steering_event = consumption.event
+                data: dict[str, Any] = {
+                    "steering_event_id": steering_event.id,
+                    "sequence": steering_event.sequence,
+                    "kind": steering_event.kind,
+                    "queue_latency_seconds": consumption.queue_latency_seconds,
+                    "node": consumption.node,
+                    "namespace": list(consumption.namespace),
+                    "task_id": consumption.task_id,
+                }
+                if steering_event.source_event_id is not None:
+                    data["source_event_id"] = steering_event.source_event_id
+                stored_event = RunEvent(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    sequence=len(run_events) + 1,
+                    kind="run.steer.consumed",
+                    data=data,
+                )
+                run_events.append(stored_event)
+                stored.append(stored_event.model_copy(deep=True))
+        await self._notify()
+        return stored
+
     async def list_steering(self, tenant_id: str, run_id: str) -> list[RunSteeringEvent]:
         async with self._lock:
             return [
@@ -548,72 +642,103 @@ class InMemoryRepository:
                 for event in self._steering.get((tenant_id, run_id), ())
             ]
 
-    async def transfer_pending_steering(
+    def _transfer_pending_steering_locked(
         self, tenant_id: str, old_run_id: str, new_run_id: str
     ) -> list[RunSteeringEvent]:
-        """Move never-consumed steering from a paused Run onto its resume.
+        """The body of the old-run -> new-run steering migration.
 
-        Implements the "issue #16 durably-accepted steer must eventually be
-        consumed" contract for the specific gap a resume creates: ``/resume``
-        starts a brand-new Run row (see ``create_run`` /
-        ``metadata.resumed_from_run_id``), and a worker only ever pulls
-        pending steering for the run it is actually executing. Without this,
-        anything durably accepted while the old Run was paused would sit
-        forever under a ``run_id`` no worker will ever claim again.
+        Assumes ``self._lock`` is already held -- only called from
+        :meth:`resume_run_with_pending_steering`, which creates the new Run
+        and performs this migration under one lock acquisition (see issue
+        #16 PR #17 review point 1's "not atomic" finding: this must never
+        run as a second, separately-lockable step after the new Run is
+        already visible to :meth:`claim_run`).
 
         Every event still ``pending``/``delivered`` under ``old_run_id`` is
         marked ``superseded`` in place (its terminal state -- it was never
         drained by the paused run) and re-inserted as a fresh ``pending``
         event under ``new_run_id``, preserving order, ``kind``, ``payload``,
-        ``metadata`` and ``idempotency_key``. The old run is also marked
-        with ``metadata.superseded_by_run_id`` (even when there was nothing
-        to transfer) so any *later* steer attempt against the stale
-        ``old_run_id`` fails with :class:`~lingxigraph.errors.RunSupersededError`
-        instead of silently pending forever a second time.
+        ``metadata`` and ``idempotency_key``. The new row's ``created_at``
+        and ``source_event_id`` preserve the original event's identity
+        (review point 3): external callers correlate the id a paused-run
+        ``/steer`` call returned to the eventual ``consumed`` event via
+        ``source_event_id``, and ``queue_latency_seconds`` computed from the
+        preserved ``created_at`` includes the time spent waiting while
+        paused, not just time since the transfer.
+        """
+
+        old_run = self._runs.get((tenant_id, old_run_id))
+        if old_run is not None:
+            self._runs[(tenant_id, old_run_id)] = old_run.model_copy(
+                update={
+                    "metadata": {
+                        **old_run.metadata,
+                        "superseded_by_run_id": new_run_id,
+                    }
+                }
+            )
+        old_events = self._steering.get((tenant_id, old_run_id), [])
+        pending = sorted(
+            (event for event in old_events if event.status in ("pending", "delivered")),
+            key=lambda event: event.sequence,
+        )
+        if not pending:
+            return []
+        for index, event in enumerate(old_events):
+            if event.status in ("pending", "delivered"):
+                old_events[index] = event.model_copy(update={"status": "superseded"})
+        new_events = self._steering.setdefault((tenant_id, new_run_id), [])
+        transferred: list[RunSteeringEvent] = []
+        for event in pending:
+            new_event = RunSteeringEvent(
+                tenant_id=tenant_id,
+                run_id=new_run_id,
+                sequence=len(new_events) + 1,
+                kind=event.kind,
+                payload=dict(event.payload),
+                metadata=dict(event.metadata),
+                idempotency_key=event.idempotency_key,
+                status="pending",
+                source_event_id=event.id,
+                created_at=event.created_at,
+            )
+            new_events.append(new_event)
+            if event.idempotency_key is not None:
+                self._steering_keys[
+                    (tenant_id, new_run_id, event.idempotency_key)
+                ] = new_event.id
+            transferred.append(new_event.model_copy(deep=True))
+        return transferred
+
+    async def resume_run_with_pending_steering(
+        self,
+        tenant_id: str,
+        thread_id: str | None,
+        assistant: Assistant,
+        request: RunCreate,
+        old_run_id: str,
+    ) -> tuple[Run, list[RunSteeringEvent]]:
+        """Atomically create the resumed Run and migrate paused steering.
+
+        Issue #16 PR #17 review point 1: creating the resumed Run and
+        transferring its predecessor's still-pending steering used to be
+        two separately-locked operations (``create_run`` then
+        ``transfer_pending_steering``); a worker could claim -- and even
+        finish -- the brand-new ``pending`` Run in the window between them,
+        so the migrated steering could land after nobody was left to
+        consume it. Doing both under one ``self._lock`` acquisition (no
+        ``await`` in between) means no other coroutine, including
+        ``claim_run``, can observe the new Run row before its steering
+        migration has also completed.
         """
 
         async with self._lock:
-            old_run = self._runs.get((tenant_id, old_run_id))
-            if old_run is not None:
-                self._runs[(tenant_id, old_run_id)] = old_run.model_copy(
-                    update={
-                        "metadata": {
-                            **old_run.metadata,
-                            "superseded_by_run_id": new_run_id,
-                        }
-                    }
-                )
-            old_events = self._steering.get((tenant_id, old_run_id), [])
-            pending = sorted(
-                (event for event in old_events if event.status in ("pending", "delivered")),
-                key=lambda event: event.sequence,
+            run = self._create_run_locked(tenant_id, thread_id, assistant, request)
+            transferred = self._transfer_pending_steering_locked(
+                tenant_id, old_run_id, run.id
             )
-            if not pending:
-                return []
-            for index, event in enumerate(old_events):
-                if event.status in ("pending", "delivered"):
-                    old_events[index] = event.model_copy(update={"status": "superseded"})
-            new_events = self._steering.setdefault((tenant_id, new_run_id), [])
-            transferred: list[RunSteeringEvent] = []
-            for event in pending:
-                new_event = RunSteeringEvent(
-                    tenant_id=tenant_id,
-                    run_id=new_run_id,
-                    sequence=len(new_events) + 1,
-                    kind=event.kind,
-                    payload=dict(event.payload),
-                    metadata=dict(event.metadata),
-                    idempotency_key=event.idempotency_key,
-                    status="pending",
-                )
-                new_events.append(new_event)
-                if event.idempotency_key is not None:
-                    self._steering_keys[
-                        (tenant_id, new_run_id, event.idempotency_key)
-                    ] = new_event.id
-                transferred.append(new_event.model_copy(deep=True))
         await self._notify()
-        return transferred
+        return run.model_copy(deep=True), transferred
 
     async def create_schedule(
         self, tenant_id: str, request: ScheduleCreate
@@ -1326,30 +1451,227 @@ class PostgresRepository(InMemoryRepository):
                 (tenant_id, run_id, event_ids),
             )
 
-    async def transfer_pending_steering(self, tenant_id, old_run_id, new_run_id):
+    async def commit_steering_consumptions(self, tenant_id, run_id, consumptions):
+        if not consumptions:
+            return []
         return await asyncio.to_thread(
-            self._transfer_pending_steering_sync, tenant_id, old_run_id, new_run_id
+            self._commit_steering_consumptions_sync, tenant_id, run_id, list(consumptions)
         )
 
-    def _transfer_pending_steering_sync(self, tenant_id, old_run_id, new_run_id):
-        """SQL counterpart of :meth:`InMemoryRepository.transfer_pending_steering`."""
+    def _commit_steering_consumptions_sync(
+        self, tenant_id: str, run_id: str, consumptions: list[SteeringConsumption]
+    ) -> list[RunEvent]:
+        """SQL counterpart of
+        :meth:`InMemoryRepository.commit_steering_consumptions` -- see its
+        docstring (issue #16 PR #17 review point 2) for why the status
+        update and the ``run.steer.consumed`` event append must commit
+        together, in the same transaction, before the caller acks its
+        local consumption log.
+        """
+
+        ids = [consumption.event.id for consumption in consumptions]
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='consumed', consumed_at=NOW()
+                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'""",
+                (tenant_id, run_id, ids),
+            )
+            # Same locking discipline as ``_append_event_sync``: lock the
+            # run row first so concurrent event appenders for this run
+            # serialize their sequence assignment instead of racing.
+            cursor.execute(
+                f"SELECT id FROM {self._schema}.runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
+                (tenant_id, run_id),
+            )
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0) AS next
+                FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, run_id),
+            )
+            next_sequence = int(cursor.fetchone()["next"])
+            stored: list[RunEvent] = []
+            for consumption in consumptions:
+                next_sequence += 1
+                event = consumption.event
+                data: dict[str, Any] = {
+                    "steering_event_id": event.id,
+                    "sequence": event.sequence,
+                    "kind": event.kind,
+                    "queue_latency_seconds": consumption.queue_latency_seconds,
+                    "node": consumption.node,
+                    "namespace": list(consumption.namespace),
+                    "task_id": consumption.task_id,
+                }
+                if event.source_event_id is not None:
+                    data["source_event_id"] = event.source_event_id
+                run_event = RunEvent(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    sequence=next_sequence,
+                    kind="run.steer.consumed",
+                    data=data,
+                )
+                cursor.execute(
+                    f"""INSERT INTO {self._schema}.run_events
+                    (id,tenant_id,run_id,sequence,kind,data,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        run_event.id,
+                        tenant_id,
+                        run_id,
+                        run_event.sequence,
+                        run_event.kind,
+                        self._jsonb(run_event.data),
+                        run_event.created_at,
+                    ),
+                )
+                stored.append(run_event)
+            return stored
+
+    async def resume_run_with_pending_steering(
+        self, tenant_id, thread_id, assistant, request, old_run_id
+    ):
+        return await asyncio.to_thread(
+            self._resume_run_with_pending_steering_sync,
+            tenant_id,
+            thread_id,
+            assistant,
+            request,
+            old_run_id,
+        )
+
+    def _resume_run_with_pending_steering_sync(
+        self, tenant_id, thread_id, assistant, request, old_run_id
+    ):
+        """SQL counterpart of
+        :meth:`InMemoryRepository.resume_run_with_pending_steering`.
+
+        Issue #16 PR #17 review point 1: the resumed Run's INSERT and the
+        old Run's steering migration must commit as one all-or-nothing unit
+        so no other transaction can ever see the new Run row without its
+        migrated steering already alongside it. Using a single connection
+        for both means they share one PostgreSQL transaction (autocommit is
+        off; the ``with self._connect()`` block only commits when it exits
+        normally) -- ``claim_run`` runs its own ``UPDATE ... FOR UPDATE
+        SKIP LOCKED`` against ``runs`` in a *different* connection/
+        transaction, so it cannot observe the freshly INSERTed new-Run row
+        at all until this transaction commits, by which point the
+        migration below has already happened.
+
+        This also closes the second race the review flagged: an ordinary
+        concurrent ``/steer`` against the new run (``_submit_steering_sync``)
+        takes ``SELECT ... FOR UPDATE`` on the **runs** row for
+        ``new_run.id`` before computing ``MAX(sequence)+1`` over
+        ``run_steering_events``. Because the new run's row was INSERTed --
+        and is therefore implicitly locked -- inside *this* transaction,
+        that concurrent ``FOR UPDATE`` blocks until this transaction
+        commits, so the two ``MAX(sequence)+1`` computations for the same
+        ``new_run_id`` can never race.
+        """
 
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
+            # Lock the paused run first so two concurrent resume attempts
+            # against the same paused run_id serialize instead of both
+            # migrating (and superseding) the same steering rows.
             cursor.execute(
                 f"""SELECT metadata FROM {self._schema}.runs
                 WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, old_run_id),
             )
             old_run_row = cursor.fetchone()
+
+            cursor.execute(
+                f"""SELECT
+                  COUNT(*) FILTER (WHERE status IN ('running','cancelling')) AS active,
+                  COUNT(*) FILTER (WHERE status='pending') AS queued
+                FROM {self._schema}.runs WHERE tenant_id=%s""",
+                (tenant_id,),
+            )
+            counts = cursor.fetchone()
+            if counts["active"] >= self.limits.max_active_runs:
+                raise ConcurrentRunError("tenant active-run quota exceeded")
+            if counts["queued"] >= self.limits.max_queued_runs:
+                raise ConcurrentRunError("tenant queued-run quota exceeded")
+            if thread_id is not None:
+                cursor.execute(
+                    f"""SELECT id FROM {self._schema}.runs WHERE tenant_id=%s
+                    AND thread_id=%s AND status IN ('running','cancelling') FOR UPDATE""",
+                    (tenant_id, thread_id),
+                )
+                active = cursor.fetchall()
+                strategy = MultitaskStrategy(request.multitask_strategy)
+                if active and strategy is MultitaskStrategy.REJECT:
+                    raise ConcurrentRunError("thread already has an active run")
+                if active and strategy is MultitaskStrategy.CANCEL_PREVIOUS:
+                    cursor.execute(
+                        f"""UPDATE {self._schema}.runs SET status='cancelling'
+                        WHERE tenant_id=%s AND thread_id=%s AND status='running'""",
+                        (tenant_id, thread_id),
+                    )
+
+            run = Run(
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                assistant_id=assistant.id,
+                graph_id=assistant.graph_id,
+                graph_version=assistant.graph_version,
+                input=request.input,
+                context={**assistant.context, **request.context},
+                config={**assistant.config, **request.config},
+                metadata=request.metadata,
+                resume=request.resume,
+                update=request.update,
+                goto=request.goto,
+                durability=request.durability,
+            )
+            if request.run_timeout is not None:
+                run.config["run_timeout"] = request.run_timeout
+            run.config.setdefault("max_state_bytes", self.limits.max_state_bytes)
+            for budget_name in ("max_model_calls", "max_tool_calls", "max_tokens", "max_cost"):
+                budget_value = getattr(request, budget_name)
+                if budget_value is not None:
+                    run.config[budget_name] = budget_value
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.runs
+                (id,tenant_id,thread_id,assistant_id,graph_id,graph_version,status,
+                 idempotency_key,request_digest,input,context,config,metadata,resume,update,goto_node,durability,
+                 attempt,created_at)
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    run.id,
+                    tenant_id,
+                    thread_id,
+                    run.assistant_id,
+                    run.graph_id,
+                    run.graph_version,
+                    enum_value(run.status),
+                    run.idempotency_key,
+                    run.request_digest,
+                    self._jsonb(run.input) if run.input is not None else None,
+                    self._jsonb(run.context),
+                    self._jsonb(run.config),
+                    self._jsonb(run.metadata),
+                    self._jsonb(run.resume) if run.resume is not None else None,
+                    self._jsonb(run.update) if run.update is not None else None,
+                    run.goto,
+                    enum_value(run.durability),
+                    run.attempt,
+                    run.created_at,
+                ),
+            )
+
             if old_run_row is not None:
                 metadata = dict(old_run_row.get("metadata") or {})
-                metadata["superseded_by_run_id"] = new_run_id
+                metadata["superseded_by_run_id"] = run.id
                 cursor.execute(
                     f"""UPDATE {self._schema}.runs SET metadata=%s
                     WHERE tenant_id=%s AND id=%s""",
                     (self._jsonb(metadata), tenant_id, old_run_id),
                 )
+
             cursor.execute(
                 f"""SELECT * FROM {self._schema}.run_steering_events
                 WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
@@ -1357,53 +1679,60 @@ class PostgresRepository(InMemoryRepository):
                 (tenant_id, old_run_id),
             )
             pending_rows = cursor.fetchall()
-            if not pending_rows:
-                return []
-            pending_ids = [row["id"] for row in pending_rows]
-            cursor.execute(
-                f"""UPDATE {self._schema}.run_steering_events
-                SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
-                (tenant_id, pending_ids),
-            )
-            cursor.execute(
-                f"""SELECT COALESCE(MAX(sequence),0) AS next
-                FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
-                (tenant_id, new_run_id),
-            )
-            next_sequence = int(cursor.fetchone()["next"])
             transferred: list[RunSteeringEvent] = []
-            for row in pending_rows:
-                next_sequence += 1
-                event = RunSteeringEvent(
-                    tenant_id=tenant_id,
-                    run_id=new_run_id,
-                    sequence=next_sequence,
-                    kind=row["kind"],
-                    payload=dict(row["payload"] or {}),
-                    metadata=dict(row["metadata"] or {}),
-                    idempotency_key=row["idempotency_key"],
-                    status="pending",
-                )
+            if pending_rows:
+                pending_ids = [row["id"] for row in pending_rows]
                 cursor.execute(
-                    f"""INSERT INTO {self._schema}.run_steering_events
-                    (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
-                     status,created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (
-                        event.id,
-                        tenant_id,
-                        new_run_id,
-                        event.sequence,
-                        event.kind,
-                        self._jsonb(event.payload),
-                        self._jsonb(event.metadata),
-                        event.idempotency_key,
-                        event.status,
-                        event.created_at,
-                    ),
+                    f"""UPDATE {self._schema}.run_steering_events
+                    SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                    (tenant_id, pending_ids),
                 )
-                transferred.append(event)
-            return transferred
+                # Safe against a concurrent ordinary /steer on the new run:
+                # both this and ``_submit_steering_sync`` first take
+                # ``FOR UPDATE`` on the *new run's* ``runs`` row -- which
+                # this transaction already holds implicitly from the
+                # INSERT above -- before computing MAX(sequence)+1 here.
+                cursor.execute(
+                    f"""SELECT COALESCE(MAX(sequence),0) AS next
+                    FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
+                    (tenant_id, run.id),
+                )
+                next_sequence = int(cursor.fetchone()["next"])
+                for row in pending_rows:
+                    next_sequence += 1
+                    event = RunSteeringEvent(
+                        tenant_id=tenant_id,
+                        run_id=run.id,
+                        sequence=next_sequence,
+                        kind=row["kind"],
+                        payload=dict(row["payload"] or {}),
+                        metadata=dict(row["metadata"] or {}),
+                        idempotency_key=row["idempotency_key"],
+                        status="pending",
+                        source_event_id=row["id"],
+                        created_at=row["created_at"],
+                    )
+                    cursor.execute(
+                        f"""INSERT INTO {self._schema}.run_steering_events
+                        (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
+                         status,created_at,source_event_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (
+                            event.id,
+                            tenant_id,
+                            run.id,
+                            event.sequence,
+                            event.kind,
+                            self._jsonb(event.payload),
+                            self._jsonb(event.metadata),
+                            event.idempotency_key,
+                            event.status,
+                            event.created_at,
+                            event.source_event_id,
+                        ),
+                    )
+                    transferred.append(event)
+            return run, transferred
 
     async def create_schedule(self, tenant_id, request):
         value = Schedule(tenant_id=tenant_id, **request.model_dump())

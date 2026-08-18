@@ -54,8 +54,8 @@ class RunSupersededError(LingxiGraphError):
 
     Resume durably transfers any steering that was pending at resume time
     onto the new Run it creates (see
-    ``repository.transfer_pending_steering`` and issue #16's paused-run
-    steering semantics) -- once that happens the old Run id is a dead end
+    ``repository.resume_run_with_pending_steering`` and issue #16's
+    paused-run steering semantics) -- once that happens the old Run id is a dead end
     for *further* steering, so new steer attempts against it fail loudly
     instead of silently pending forever.
     """

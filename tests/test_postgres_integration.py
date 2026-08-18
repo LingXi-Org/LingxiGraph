@@ -132,6 +132,140 @@ class PostgresIntegrationTests(unittest.TestCase):
                 conn.execute(f'DROP OWNED BY "{role}"')
                 conn.execute(f'DROP ROLE "{role}"')
 
+    def test_resume_run_with_pending_steering_is_atomic_and_race_free(self) -> None:
+        """Issue #16 PR #17 review point 1, PostgreSQL path.
+
+        Regresses both halves of the finding against a real PostgreSQL
+        transaction:
+
+        * A worker hammering ``claim_run`` concurrently with
+          ``resume_run_with_pending_steering`` must never observe the
+          resumed Run before its migrated steering is already present --
+          the previous two-transaction implementation (separate
+          ``create_run`` + ``transfer_pending_steering`` commits) allowed a
+          real window where the new Run was claimable (and even
+          finishable) with nothing migrated onto it.
+        * Sequence numbers assigned to the migrated events and to an
+          ordinary steer submitted against the resumed run afterwards must
+          never collide -- the previous ``_transfer_pending_steering_sync``
+          only locked the *old* run row, not the new one, so its
+          ``MAX(sequence)+1`` could race a concurrent ``_submit_steering_
+          sync`` doing the same computation for the new run.
+        """
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            old_run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            await repo.submit_steering("acme", old_run.id, kind="user_input", payload={"m": 1})
+            await repo.submit_steering("acme", old_run.id, kind="user_input", payload={"m": 2})
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            claims: list[str] = []
+            stop = asyncio.Event()
+
+            async def hammer_claim() -> None:
+                while not stop.is_set():
+                    claimed = await repo.claim_run("worker-a", lease_seconds=30)
+                    if claimed is not None:
+                        claims.append(claimed.id)
+                        if claimed.id != old_run.id:
+                            pending = await repo.list_pending_steering("acme", claimed.id)
+                            self.assertEqual(
+                                len(pending),
+                                2,
+                                "resumed run was claimable before its steering migrated",
+                            )
+                    await asyncio.sleep(0)
+
+            hammer = asyncio.create_task(hammer_claim())
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", thread.id, assistant, request, old_run.id
+            )
+            self.assertEqual([event.sequence for event in transferred], [1, 2])
+            for _ in range(1000):
+                if new_run.id in claims:
+                    break
+                await asyncio.sleep(0.002)
+            stop.set()
+            await hammer
+            self.assertIn(new_run.id, claims)
+
+            extra, _ = await repo.submit_steering(
+                "acme", new_run.id, kind="user_input", payload={"m": 3}
+            )
+            self.assertEqual(extra.sequence, 3)
+            all_events = await repo.list_steering("acme", new_run.id)
+            self.assertEqual(sorted(event.sequence for event in all_events), [1, 2, 3])
+
+            # Identity survives the transfer (review point 3).
+            self.assertTrue(
+                all(event.source_event_id for event in all_events if event.sequence in (1, 2))
+            )
+
+        asyncio.run(scenario())
+
+    def test_commit_steering_consumptions_is_atomic(self) -> None:
+        """Issue #16 PR #17 review point 2, PostgreSQL path: status update
+        and the ``run.steer.consumed`` lifecycle event must land in the
+        same transaction."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+            steering_event = SteeringEvent(
+                id=event.id,
+                run_id=run.id,
+                sequence=event.sequence,
+                kind=event.kind,
+                payload=event.payload,
+                metadata=event.metadata,
+                created_at=event.created_at,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+            stored = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].kind, "run.steer.consumed")
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(all_steering[0].status, "consumed")
+            all_events = await repo.list_events("acme", run.id)
+            self.assertEqual(
+                [e.kind for e in all_events if e.kind == "run.steer.consumed"],
+                ["run.steer.consumed"],
+            )
+
+        asyncio.run(scenario())
+
     @unittest.skipUnless(REDIS_URL, "Redis integration URL not configured")
     def test_redis_cache_pubsub_and_recovery_contract(self) -> None:
         from lingxigraph.cache_redis import RedisCache

@@ -320,37 +320,46 @@ class Worker:
                     payload=row.payload,
                     metadata=row.metadata,
                     created_at=row.created_at,
+                    source_event_id=row.source_event_id,
                 )
             )
 
     async def _sync_steering_out(self, run: Run, graph: Any) -> None:
-        """Flush events the graph has drained back to PostgreSQL + SSE."""
+        """Flush events the graph has drained back to PostgreSQL + SSE.
+
+        Reads (peeks) the channel's local consumption log, durably commits
+        it -- steering status *and* the ``run.steer.consumed`` lifecycle
+        event, together, in one repository call -- and only then acks
+        those entries out of the local log. If the durable commit fails
+        (e.g. a transient DB error), nothing is acked: the entries stay in
+        the channel's consumption log and are retried on the next sync
+        (next heartbeat tick, or the final flush in ``_execute``). This is
+        the issue #16 PR #17 review point 2 fix -- the previous
+        pop-then-write ordering could destroy the local record before the
+        durable write was known to have succeeded, permanently losing a
+        consumption (and its observability event) on a transient failure.
+        """
 
         channel = graph.get_steering_channel(run.id)
-        consumed = channel.pop_consumed()
+        consumed = channel.peek_consumed()
         if not consumed:
             return
-        await self.repository.mark_steering_consumed(
-            run.tenant_id, run.id, [consumption.event.id for consumption in consumed]
-        )
-        for consumption in consumed:
-            event = consumption.event
-            stored = await self.repository.append_event(
-                run.tenant_id,
-                run.id,
-                "run.steer.consumed",
-                {
-                    "steering_event_id": event.id,
-                    "sequence": event.sequence,
-                    "kind": event.kind,
-                    # Where and how long it queued -- see
-                    # SteeringConsumption / issue #16 observability gap.
-                    "queue_latency_seconds": consumption.queue_latency_seconds,
-                    "node": consumption.node,
-                    "namespace": list(consumption.namespace),
-                    "task_id": consumption.task_id,
-                },
+        try:
+            stored_events = await self.repository.commit_steering_consumptions(
+                run.tenant_id, run.id, consumed
             )
+        except Exception:
+            logger.warning(
+                "steering consumption commit failed; will retry at the next safe point",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                exc_info=True,
+            )
+            return
+        # Only ack the ids we actually just committed -- a concurrent
+        # drain() may have appended more to the log between the peek above
+        # and here, and those must be left for the next cycle.
+        channel.ack_consumed(consumption.event.id for consumption in consumed)
+        for stored in stored_events:
             await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
 
     async def _append_event(self, run: Run, event: Event) -> None:

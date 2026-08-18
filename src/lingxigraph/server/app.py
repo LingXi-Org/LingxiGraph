@@ -641,18 +641,18 @@ def create_app(
             durability=previous.durability,
             metadata={"resumed_from_run_id": previous.id},
         )
-        value = await repository.create_run(
-            user.tenant_id, previous.thread_id, assistant, request
-        )
-        # Carry over any steering that was durably accepted while `previous`
-        # was paused -- the worker only pulls pending steering for the run
-        # it is actually executing (the new one), so without this an
-        # accepted-while-paused event would sit forever under a run_id no
-        # worker will ever claim again. Also marks `previous` so any *later*
-        # steer attempt against the stale run_id is rejected instead of
-        # silently pending again (see RunSupersededError).
-        transferred = await repository.transfer_pending_steering(
-            user.tenant_id, previous.id, value.id
+        # Create the resumed Run and carry over any steering that was
+        # durably accepted while `previous` was paused as a single atomic
+        # repository operation (issue #16 PR #17 review point 1) -- the
+        # worker only pulls pending steering for the run it is actually
+        # executing (the new one), so without atomicity a worker could
+        # claim and even finish the new Run before the migration below
+        # ever ran, leaving the migrated steering permanently unconsumed.
+        # This also marks `previous` so any *later* steer attempt against
+        # the stale run_id is rejected instead of silently pending again
+        # (see RunSupersededError).
+        value, transferred = await repository.resume_run_with_pending_steering(
+            user.tenant_id, previous.thread_id, assistant, request, previous.id
         )
         for event in transferred:
             await repository.append_event(
@@ -664,6 +664,12 @@ def create_app(
                     "sequence": event.sequence,
                     "kind": event.kind,
                     "transferred_from_run_id": previous.id,
+                    # Stable identity (review point 3): the id this
+                    # transferred event's original ``/steer`` call actually
+                    # returned to the caller, so it can correlate that
+                    # response to the eventual ``run.steer.consumed`` event
+                    # here even though the event's own ``id`` changed.
+                    "source_event_id": event.source_event_id,
                 },
             )
         if transferred:

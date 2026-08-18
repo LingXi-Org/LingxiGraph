@@ -15,7 +15,7 @@ runtimes *is* this module, not a separate code path.
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -46,6 +46,13 @@ class SteeringEvent:
     payload: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    #: Set when this event is a paused-run -> resumed-run transfer of an
+    #: originally-accepted event (see ``Repository.resume_run_with_pending_
+    #: steering`` / issue #16 PR #17 review point 3): the id of the
+    #: original event a client's ``/steer`` call actually received, so
+    #: downstream ``run.steer.consumed`` observability can be correlated
+    #: back to it even though ``id`` itself changed across the transfer.
+    source_event_id: str | None = None
 
 
 def validate_steering_payload(
@@ -261,20 +268,56 @@ class SteeringChannel:
     def pop_consumed(self) -> tuple[SteeringConsumption, ...]:
         """Return and clear the log of events drained since the last call.
 
-        A server-mode worker polls this (e.g. on its heartbeat cadence) to
-        mark the corresponding PostgreSQL rows ``consumed`` and emit
-        ``run.steer.consumed`` observability events -- consumption is
-        recorded as soon as the graph drains an event, independent of
-        checkpoint commit timing in this implementation (documented scope
-        cut; see issue #16 design notes). Each entry is a
-        :class:`SteeringConsumption`, carrying queue latency and the
-        consuming node/namespace/task_id alongside the raw event.
+        Destructive: callers that must durably persist a consumption
+        before it is safe to forget it locally (any server-mode worker --
+        see :meth:`peek_consumed`/:meth:`ack_consumed`) must **not** use
+        this method, since a transient failure between the pop and the
+        durable write would silently lose the record (issue #16 PR #17
+        review point 2). This remains the right call for a caller that
+        either has nothing durable to write (plain embedded/library usage)
+        or has already durably committed and just wants to drain its own
+        bookkeeping.  Each entry is a :class:`SteeringConsumption`,
+        carrying queue latency and the consuming node/namespace/task_id
+        alongside the raw event.
         """
 
         with self._lock:
             consumed = tuple(self._consumed_log)
             self._consumed_log.clear()
             return consumed
+
+    def peek_consumed(self) -> tuple[SteeringConsumption, ...]:
+        """Read-only view of the not-yet-acked consumption log.
+
+        Use with :meth:`ack_consumed` for durable consumers: read the
+        entries, durably commit them (DB status update + lifecycle event),
+        and only then ack the specific ids that succeeded. Unlike
+        :meth:`pop_consumed` this never destroys data a failed durable
+        write could not yet account for.
+        """
+
+        with self._lock:
+            return tuple(self._consumed_log)
+
+    def ack_consumed(self, event_ids: Iterable[str]) -> None:
+        """Remove specific entries from the consumption log once durably committed.
+
+        Only entries whose ``event.id`` is in ``event_ids`` are removed --
+        anything appended by a concurrent :meth:`drain` between the
+        matching :meth:`peek_consumed` and this call is left alone so it
+        gets picked up on the next cycle instead of being silently
+        dropped.
+        """
+
+        ids = set(event_ids)
+        if not ids:
+            return
+        with self._lock:
+            if not self._consumed_log:
+                return
+            self._consumed_log[:] = [
+                entry for entry in self._consumed_log if entry.event.id not in ids
+            ]
 
 
 __all__ = [

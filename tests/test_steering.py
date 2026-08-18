@@ -469,6 +469,205 @@ class RepositorySteeringTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class AtomicResumeMigrationTests(unittest.TestCase):
+    """Issue #16 PR #17 review point 1: resume-run creation and its steering
+    migration must be a single atomic operation -- a worker must never be
+    able to claim (let alone finish) the resumed Run before the steering
+    that was pending on the paused run has already been migrated onto it."""
+
+    def test_claim_run_never_observes_the_resumed_run_before_steering_migrated(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.submit_steering("acme", old_run.id, kind="user_input", payload={"m": 1})
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            claims: list[str] = []
+            stop = asyncio.Event()
+
+            async def hammer_claim() -> None:
+                # Simulates a worker's poll loop racing the resume call --
+                # before the fix, ``create_run`` committed the new Run as
+                # ``pending`` (claimable) *before* the separate
+                # ``transfer_pending_steering`` call ran, so this could
+                # observe (and even finish) the new Run with nothing
+                # migrated onto it yet.
+                while not stop.is_set():
+                    claimed = await repo.claim_run("worker-a", lease_seconds=30)
+                    if claimed is not None:
+                        claims.append(claimed.id)
+                        if claimed.id != old_run.id:
+                            pending = await repo.list_pending_steering("acme", claimed.id)
+                            self.assertEqual(
+                                len(pending),
+                                1,
+                                "resumed run was claimable before its steering migrated",
+                            )
+                    await asyncio.sleep(0)
+
+            hammer = asyncio.create_task(hammer_claim())
+            from lingxigraph.server.models import RunCreate
+
+            request = RunCreate(
+                assistant_id=assistant.id,
+                resume=1,
+                metadata={"resumed_from_run_id": old_run.id},
+            )
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", old_run.thread_id, assistant, request, old_run.id
+            )
+            self.assertEqual(len(transferred), 1)
+            for _ in range(500):
+                if new_run.id in claims:
+                    break
+                await asyncio.sleep(0.001)
+            stop.set()
+            await hammer
+            self.assertIn(new_run.id, claims)
+
+        asyncio.run(scenario())
+
+    def test_transferred_and_new_steering_sequences_never_collide(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.submit_steering("acme", old_run.id, kind="user_input", payload={"m": 1})
+            await repo.submit_steering("acme", old_run.id, kind="user_input", payload={"m": 2})
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            from lingxigraph.server.models import RunCreate
+
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", old_run.thread_id, assistant, request, old_run.id
+            )
+            self.assertEqual([event.sequence for event in transferred], [1, 2])
+            # A concurrent-in-spirit ordinary /steer against the resumed
+            # run must land on the next free sequence, never colliding
+            # with the migrated ones.
+            extra, _ = await repo.submit_steering(
+                "acme", new_run.id, kind="user_input", payload={"m": 3}
+            )
+            self.assertEqual(extra.sequence, 3)
+            all_events = await repo.list_steering("acme", new_run.id)
+            self.assertEqual(sorted(event.sequence for event in all_events), [1, 2, 3])
+
+        asyncio.run(scenario())
+
+
+class DurableAckOrderingTests(unittest.TestCase):
+    """Issue #16 PR #17 review point 2: the local consumption log must only
+    be acked *after* the durable commit (steering status + lifecycle event)
+    has actually succeeded -- never popped destructively beforehand."""
+
+    def test_channel_peek_and_ack_never_lose_entries_appended_concurrently(self) -> None:
+        channel = SteeringChannel("run-x")
+        channel.submit(kind="user_input", payload={"i": 1})
+        channel.drain(node="a")
+        first_batch = channel.peek_consumed()
+        self.assertEqual(len(first_batch), 1)
+        # Simulate a second drain happening on another task before the
+        # first batch is acked -- its entry must survive the ack below.
+        channel.submit(kind="user_input", payload={"i": 2})
+        channel.drain(node="b")
+        channel.ack_consumed(entry.event.id for entry in first_batch)
+        remaining = channel.peek_consumed()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].node, "b")
+
+    def test_worker_retries_a_transient_durable_commit_failure_without_losing_it(
+        self,
+    ) -> None:
+        from lingxigraph.server.registry import GraphRegistry
+        from lingxigraph.server.worker import Worker
+        from lingxigraph.steering import SteeringEvent
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            accepted, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+
+            channel = SteeringChannel(run.id, owned_by_executor=False)
+            channel.ingest(
+                SteeringEvent(
+                    id=accepted.id,
+                    run_id=run.id,
+                    sequence=accepted.sequence,
+                    kind=accepted.kind,
+                    payload=accepted.payload,
+                    metadata=accepted.metadata,
+                    created_at=accepted.created_at,
+                )
+            )
+            # Simulate the graph safe point actually draining it -- this is
+            # what populates the channel's local consumption log that
+            # ``_sync_steering_out`` must not lose.
+            channel.drain(node="the_node", task_id="task-0")
+
+            class FakeGraph:
+                def get_steering_channel(self, run_id: str):
+                    return channel
+
+            worker = Worker(GraphRegistry({}), repo)
+
+            calls = {"n": 0}
+            real_commit = repo.commit_steering_consumptions
+
+            async def flaky_commit(tenant_id, run_id, consumptions):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise ConnectionError("transient database hiccup")
+                return await real_commit(tenant_id, run_id, consumptions)
+
+            repo.commit_steering_consumptions = flaky_commit  # type: ignore[method-assign]
+
+            # First sync hits the injected transient failure: nothing may
+            # be lost -- the DB row must still read pending and the
+            # channel must still hold the unacked consumption record.
+            await worker._sync_steering_out(run, FakeGraph())
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(len(still_pending), 1)
+            self.assertEqual(len(channel.peek_consumed()), 1)
+            consumed_events = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(consumed_events, [])
+
+            # A later safe point (next heartbeat tick) retries and this
+            # time the durable commit succeeds -- the consumption is fully
+            # recorded exactly once, not lost and not duplicated.
+            await worker._sync_steering_out(run, FakeGraph())
+            self.assertEqual(calls["n"], 2)
+            pending_after = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(pending_after, [])
+            self.assertEqual(channel.peek_consumed(), ())
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(all_steering[0].status, "consumed")
+            consumed_events_after = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(len(consumed_events_after), 1)
+
+        asyncio.run(scenario())
+
+
 def _assistant_create():
     from lingxigraph.server.models import AssistantCreate
 
@@ -943,6 +1142,95 @@ class ServerSteeringTests(unittest.TestCase):
             )
             self.assertEqual(stale.status_code, 409)
             self.assertEqual(stale.json()["code"], "run_superseded")
+
+    def test_paused_steer_identity_and_latency_survive_resume_transfer(self) -> None:
+        """Issue #16 PR #17 review point 3: a paused-run transfer must
+        preserve the *original* event's identity and acceptance time.
+
+        Proves both halves of the fix end to end:
+        * The id a client's paused ``/steer`` call got back
+          (``accepted_id``) is traceable, via ``source_event_id``, all the
+          way through the resumed run's ``run.steer.accepted`` and
+          ``run.steer.consumed`` events -- never silently replaced by an
+          unrelated new id.
+        * ``queue_latency_seconds`` on the eventual ``consumed`` event is
+          computed from the *original* acceptance time, so it includes the
+          time the event spent waiting while the run was paused, not just
+          the time since the resume/transfer moment.
+        """
+
+        from lingxigraph import interrupt
+
+        paused_builder = StateGraph(State)
+
+        def approval(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            value = interrupt({"question": "approve?"})
+            return {"ticks": int(value)}
+
+        def after_approval(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            drained = [event.payload["message"] for event in runtime.drain_steering()]
+            return {"drained": drained}
+
+        paused_builder.add_node("approval", approval)
+        paused_builder.add_node("after_approval", after_approval)
+        paused_builder.add_edge(START, "approval").add_edge("approval", "after_approval")
+        paused_builder.add_edge("after_approval", END)
+        registry = GraphRegistry({"approval": paused_builder.compile()})
+
+        app = create_app(
+            registry=registry, authenticator=Authenticator.insecure_dev(), embedded_worker=True
+        )
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants", headers=headers, json={"graph_id": "approval"}
+            ).json()
+            thread = client.post("/v1/threads", headers=headers, json={}).json()
+            run = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"ticks": 0}},
+            ).json()
+            run_id = run["id"]
+            wait_for_status(client, run_id, headers, {"paused"})
+
+            accepted = client.post(
+                f"/v1/runs/{run_id}/steer",
+                headers=headers,
+                json={"kind": "user_input", "payload": {"message": "while-paused"}},
+            ).json()
+            accepted_id = accepted["id"]
+
+            # A real pause-wait window: the queue latency computed after
+            # resume must include (at least) this much time.
+            pause_wait_seconds = 0.3
+            time.sleep(pause_wait_seconds)
+
+            resumed = client.post(
+                f"/v1/runs/{run_id}/resume", headers=headers, json={"resume": 9}
+            ).json()
+            new_run_id = resumed["id"]
+            result = wait_for_status(client, new_run_id, headers, {"succeeded", "failed"})
+            self.assertEqual(result.json()["status"], "succeeded", result.text)
+
+            new_events = asyncio.run(app.state.repository.list_events("acme", new_run_id))
+            accepted_transfer = next(
+                event for event in new_events if event.kind == "run.steer.accepted"
+            )
+            # The transferred event's id changed (it is a new durable row),
+            # but its source_event_id must point back at the exact id the
+            # client received from its paused-run /steer call.
+            self.assertNotEqual(accepted_transfer.data["steering_event_id"], accepted_id)
+            self.assertEqual(accepted_transfer.data["source_event_id"], accepted_id)
+
+            consumed = next(event for event in new_events if event.kind == "run.steer.consumed")
+            self.assertEqual(consumed.data["source_event_id"], accepted_id)
+            self.assertGreaterEqual(
+                consumed.data["queue_latency_seconds"], pause_wait_seconds * 0.9
+            )
+
+            steering_rows = asyncio.run(app.state.repository.list_steering("acme", new_run_id))
+            self.assertEqual(steering_rows[0].source_event_id, accepted_id)
 
 
 def _assistant_create_named(graph_id: str):

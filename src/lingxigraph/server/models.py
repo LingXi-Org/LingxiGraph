@@ -154,6 +154,17 @@ class RunSteeringEvent(ApiModel):
     status: Literal["pending", "delivered", "consumed", "superseded"] = "pending"
     created_at: datetime = Field(default_factory=utcnow)
     consumed_at: datetime | None = None
+    #: Stable logical identity across a paused-run -> resumed-run transfer
+    #: (see ``Repository.resume_run_with_pending_steering`` / issue #16 PR
+    #: #17 review point 3). ``None`` for an event that was never
+    #: transferred. When set, this is the ``id`` of the original
+    #: ``superseded`` row the client's ``/steer`` call actually received --
+    #: external callers correlate "the id I got back" to "the id that was
+    #: eventually consumed" via this field rather than the (new,
+    #: post-transfer) ``id``. ``created_at`` on the transferred row is also
+    #: preserved from the original so ``queue_latency_seconds`` includes
+    #: the time an event spent waiting while the run was paused.
+    source_event_id: str | None = None
 
 
 class RunEvent(ApiModel):
