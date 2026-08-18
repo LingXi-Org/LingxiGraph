@@ -388,26 +388,6 @@ class InMemoryRepository:
         await self._notify()
         return updated.model_copy(deep=True)
 
-    async def retry_run(
-        self, tenant_id: str, run_id: str, *, error: dict[str, Any] | None = None
-    ) -> Run:
-        async with self._lock:
-            key = (tenant_id, run_id)
-            run = self._runs[key]
-            updated = run.model_copy(
-                update={
-                    "status": RunStatus.PENDING.value,
-                    "error": error,
-                    "finished_at": None,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "steering_closed": False,
-                }
-            )
-            self._runs[key] = updated
-        await self._notify()
-        return updated.model_copy(deep=True)
-
     async def finish_run_if_owned(
         self,
         tenant_id: str,
@@ -1656,12 +1636,6 @@ class PostgresRepository(InMemoryRepository):
 
     async def finish_run(self, tenant_id, run_id, status, *, output=None, error=None):
         await asyncio.to_thread(self._finish_run_sync, tenant_id, run_id, status, output, error)
-        value = await self.get_run(tenant_id, run_id)
-        assert value is not None
-        return value
-
-    async def retry_run(self, tenant_id, run_id, *, error=None):
-        await asyncio.to_thread(self._retry_run_sync, tenant_id, run_id, error, False)
         value = await self.get_run(tenant_id, run_id)
         assert value is not None
         return value

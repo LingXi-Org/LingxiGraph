@@ -2834,6 +2834,247 @@ class ServerSteeringTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
+    """Coverage for the "lease no longer owned" branches of every fenced
+    write the Worker performs during finalization -- these can only be
+    reached by simulating a lease loss between the Worker deciding what to
+    do and the repository actually committing it, so they're exercised
+    here by monkeypatching the fenced repository methods to return
+    ``None`` (exactly what a losing CAS/fence looks like from the
+    caller's perspective), rather than by orchestrating a real multi-
+    worker race (already covered elsewhere against real Postgres)."""
+
+    def test_retry_or_dead_letter_abandons_when_retry_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+
+            async def lost_lease(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            repo.retry_run_if_owned = lost_lease  # type: ignore[method-assign]
+            await worker._retry_or_dead_letter(
+                claimed, {"code": "delivery_retry", "message": "transient"}
+            )
+            # No exception, no crash, and (since the fenced write never
+            # touched anything) the run's real status is whatever it was
+            # before -- nothing durable to assert beyond "this returned".
+
+        asyncio.run(scenario())
+
+    def test_retry_or_dead_letter_abandons_when_dead_letter_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            claimed.attempt = 999  # force the max-attempts (dead-letter) branch
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a", max_delivery_attempts=1)
+
+            async def lost_lease(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            repo.finish_run_if_owned = lost_lease  # type: ignore[method-assign]
+            await worker._retry_or_dead_letter(
+                claimed, {"code": "delivery_retry", "message": "transient"}
+            )
+
+        asyncio.run(scenario())
+
+    def test_commit_intent_finalize_abandons_when_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+
+            async def lost_lease(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            repo.finish_run_if_owned = lost_lease  # type: ignore[method-assign]
+            intent = Worker._Intent(kind="finish", status=RunStatus.SUCCEEDED, output={})
+            committed = await worker._commit_intent(claimed, intent)
+            self.assertFalse(committed)
+
+        asyncio.run(scenario())
+
+    def test_final_steering_flush_returns_false_when_heartbeat_confirms_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            registry = make_registry()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme",
+                None,
+                assistant,
+                _run_create(assistant.id, {"ticks": 0, "drained": []}),
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            graph = registry.get("steerable").with_runtime()
+            channel = graph.get_steering_channel(run.id)
+            worker = Worker(make_registry(), repo, worker_id="worker-a")
+            await worker._sync_steering_in(claimed, graph)
+            channel.drain()
+
+            async def always_fails(*args: Any, **kwargs: Any) -> None:
+                raise ConnectionError("transient")
+
+            async def lease_gone(*args: Any, **kwargs: Any) -> bool:
+                return False
+
+            repo.commit_steering_consumptions_if_owned = always_fails  # type: ignore[method-assign]
+            repo.heartbeat = lease_gone  # type: ignore[method-assign]
+            result = await worker._final_steering_flush(claimed, graph, base_delay=0.001, max_delay=0.001)
+            self.assertFalse(result)
+
+        asyncio.run(scenario())
+
+    def test_final_steering_flush_returns_false_when_commit_reports_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            registry = make_registry()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme",
+                None,
+                assistant,
+                _run_create(assistant.id, {"ticks": 0, "drained": []}),
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            graph = registry.get("steerable").with_runtime()
+            channel = graph.get_steering_channel(run.id)
+            worker = Worker(make_registry(), repo, worker_id="worker-a")
+            await worker._sync_steering_in(claimed, graph)
+            channel.drain()
+
+            async def lost_lease(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            repo.commit_steering_consumptions_if_owned = lost_lease  # type: ignore[method-assign]
+            result = await worker._final_steering_flush(claimed, graph)
+            self.assertFalse(result)
+
+        asyncio.run(scenario())
+
+    def test_sync_steering_out_skips_ack_when_commit_fails_transiently(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            registry = make_registry()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme",
+                None,
+                assistant,
+                _run_create(assistant.id, {"ticks": 0, "drained": []}),
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            graph = registry.get("steerable").with_runtime()
+            channel = graph.get_steering_channel(run.id)
+            worker = Worker(make_registry(), repo, worker_id="worker-a")
+            await worker._sync_steering_in(claimed, graph)
+            channel.drain()
+
+            async def always_fails(*args: Any, **kwargs: Any) -> None:
+                raise ConnectionError("transient")
+
+            repo.commit_steering_consumptions_if_owned = always_fails  # type: ignore[method-assign]
+            await worker._sync_steering_out(claimed, graph)
+            self.assertEqual(len(channel.peek_consumed()), 1)
+
+        asyncio.run(scenario())
+
+    def test_sync_steering_out_skips_ack_when_lease_lost(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            registry = make_registry()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme",
+                None,
+                assistant,
+                _run_create(assistant.id, {"ticks": 0, "drained": []}),
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            graph = registry.get("steerable").with_runtime()
+            channel = graph.get_steering_channel(run.id)
+            worker = Worker(make_registry(), repo, worker_id="worker-a")
+            await worker._sync_steering_in(claimed, graph)
+            channel.drain()
+
+            async def lost_lease(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            repo.commit_steering_consumptions_if_owned = lost_lease  # type: ignore[method-assign]
+            await worker._sync_steering_out(claimed, graph)
+            self.assertEqual(len(channel.peek_consumed()), 1)
+
+        asyncio.run(scenario())
+
+
 def _assistant_create_named(graph_id: str):
     from lingxigraph.server.models import AssistantCreate
 
