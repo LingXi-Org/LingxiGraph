@@ -189,7 +189,7 @@ steering 必须已经全部就位——不存在"新 Run 已可被执行，但�
 ### payload 大小限制
 
 `payload` + `metadata` 序列化后大小受限（默认约 32KB，或服务端事件字节上限，两者先
-到者生效）；超限返回 `413`/`422`，错误码 `payload_too_large`，不会产生任何 durable
+到者生效）；超限返回 HTTP `413`，错误码 `payload_too_large`，不会产生任何 durable
 写入。JSON 值必须是可安全序列化的普通类型（字符串、数字、布尔、null、数组、对象）；
 不支持二进制、循环引用或不可 JSON 化的自定义类型。
 
