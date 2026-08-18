@@ -36,6 +36,7 @@ Agent Server 的默认地址为 `http://localhost:8124`。业务资源使用版�
 | GET | `/v1/runs/{run_id}/join` | 最长 300 秒等待 run |
 | GET | `/v1/runs/{run_id}/stream` | SSE 事件流 |
 | POST | `/v1/runs/{run_id}/cancel` | 请求协作式取消 |
+| POST | `/v1/runs/{run_id}/steer` | durably 注入运行中输入 |
 | POST | `/v1/runs/{run_id}/resume` | 恢复 paused run |
 | POST | `/v1/runs/{run_id}/redrive` | 重驱 failed/dead-letter run |
 | POST | `/v1/store/batch` | 批量 Store 操作 |
@@ -63,8 +64,11 @@ stateDiagram-v2
   paused --> cancelled: cancel（无存活 worker）
   failed --> pending: redrive
   dead_letter --> pending: redrive
-  paused --> pending: resume creates new run
+  state "new run: pending" as resumed_pending
+  paused --> resumed_pending: resume creates descendant run
 ```
+
+`resume` 不会把旧 run 的 `paused` 状态改成 `pending`：旧 run 仍保持 `paused`，并通过类型化的 `superseded_by_run_id` 标记已被取代；新创建的后继 run 才从 `pending` 开始执行。
 
 稳定状态值为 `pending`、`running`、`paused`、`succeeded`、`failed`、`cancelling`、`cancelled`、`timed_out`、`dead_letter`。
 
