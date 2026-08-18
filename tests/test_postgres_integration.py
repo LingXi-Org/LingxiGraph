@@ -763,6 +763,129 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_supersede_pending_steering_if_owned_postgres_path(self) -> None:
+        """Issue #16 PR #17 review round 8, point 1 (BLOCKER), PostgreSQL
+        path: the fenced ``supersede_pending_steering_if_owned`` must
+        durably transition still-pending steering rows to ``superseded``
+        and record a matching ``run.steer.superseded`` lifecycle event, and
+        must be rejected outright for a worker whose lease has already been
+        reclaimed by a new owner."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+
+            claimed_a = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed_a is not None
+
+            # A's lease expires; B claims the same run at a new attempt.
+            await asyncio.sleep(1.2)
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertEqual(claimed_b.attempt, claimed_a.attempt + 1)
+
+            # A's now-stale attempt must be rejected outright, touching
+            # nothing.
+            stale_result = await repo.supersede_pending_steering_if_owned(
+                "acme", run.id, "worker-a", claimed_a.attempt
+            )
+            self.assertIsNone(stale_result)
+            self.assertEqual(
+                [row.id for row in await repo.list_pending_steering("acme", run.id)],
+                [event.id],
+            )
+
+            # B, the current owner, supersedes it normally.
+            stored = await repo.supersede_pending_steering_if_owned(
+                "acme", run.id, "worker-b", claimed_b.attempt
+            )
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].kind, "run.steer.superseded")
+            self.assertEqual(stored[0].data["steering_event_id"], event.id)
+            self.assertEqual(stored[0].data["reason"], "late_boundary_race")
+            self.assertIsNone(stored[0].data["superseded_by_run_id"])
+
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(all_steering[0].status, "superseded")
+
+            # Idempotent under retry: calling again must not duplicate the
+            # lifecycle event (nothing left pending to supersede either).
+            second = await repo.supersede_pending_steering_if_owned(
+                "acme", run.id, "worker-b", claimed_b.attempt
+            )
+            self.assertEqual(second, [])
+            superseded_events = [
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.superseded"
+            ]
+            self.assertEqual(len(superseded_events), 1)
+
+        asyncio.run(scenario())
+
+    def test_resume_transfer_emits_superseded_event_idempotently_postgres_path(self) -> None:
+        """Issue #16 PR #17 review round 8, point 3 (BLOCKER), PostgreSQL
+        path: the paused-run resume-transfer migration must record exactly
+        one ``run.steer.superseded`` event per transferred steering row, in
+        the same transaction as the status transition."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            old_run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            original, _ = await repo.submit_steering(
+                "acme", old_run.id, kind="user_input", payload={"m": 1}
+            )
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme",
+                thread.id,
+                assistant,
+                RunCreate(assistant_id=assistant.id),
+                old_run.id,
+            )
+            self.assertEqual(len(transferred), 1)
+
+            old_events = await repo.list_events("acme", old_run.id)
+            superseded_events = [e for e in old_events if e.kind == "run.steer.superseded"]
+            self.assertEqual(len(superseded_events), 1)
+            self.assertEqual(superseded_events[0].data["steering_event_id"], original.id)
+            self.assertEqual(superseded_events[0].data["reason"], "resume_transfer")
+            self.assertEqual(superseded_events[0].data["superseded_by_run_id"], new_run.id)
+            self.assertEqual(
+                superseded_events[0].data["replacement_steering_event_id"],
+                transferred[0].id,
+            )
+
+            old_steering = await repo.list_steering("acme", old_run.id)
+            self.assertEqual(old_steering[0].status, "superseded")
+
+        asyncio.run(scenario())
+
     @unittest.skipUnless(REDIS_URL, "Redis integration URL not configured")
     def test_redis_cache_pubsub_and_recovery_contract(self) -> None:
         from lingxigraph.cache_redis import RedisCache

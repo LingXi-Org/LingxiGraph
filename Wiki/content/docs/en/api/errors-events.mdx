@@ -80,12 +80,24 @@ data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{}
 ### Steering lifecycle events
 
 Besides ordinary execution events (`node_completed`, etc.), mid-run input (steering)
-produces two dedicated SSE event kinds across its lifecycle:
+produces three dedicated SSE event kinds across its lifecycle:
 
 | `kind` | Emitted when | Key fields |
 | --- | --- | --- |
 | `run.steer.accepted` | A `/steer` call is durably accepted (202) | `steering_event_id`, `source_event_id` (if from a resume migration), `sequence`, `kind` |
-| `run.steer.consumed` | Graph code calls `drain_steering()` and that consumption is durably committed by `commit_steering_consumptions()` | `steering_event_id`, `source_event_id`, `sequence`, `kind`, `queue_latency_seconds`, `node`, `namespace`, `task_id` |
+| `run.steer.consumed` | Graph code calls `drain_steering()` and that consumption is durably committed by `commit_steering_consumptions_if_owned()` | `steering_event_id`, `source_event_id`, `sequence`, `kind`, `queue_latency_seconds`, `node`, `namespace`, `task_id` |
+| `run.steer.superseded` | A steering event's row durably transitions to the `superseded` disposition without ever being consumed — either because a paused run it belonged to was resumed (its still-pending steering is migrated onto the new run) or because it landed after the owning worker's last safe point closed (see below) | `steering_event_id`, `source_event_id`, `reason` (`resume_transfer` or `late_boundary_race`), `superseded_by_run_id` (set for `resume_transfer`, `null` for `late_boundary_race`), `replacement_steering_event_id` (set for `resume_transfer`, `null` for `late_boundary_race`) |
+
+`run.steer.superseded`'s `late_boundary_race` reason covers a narrow, deliberate race: a
+`/steer` call can durably commit its row a moment before the owning worker closes new
+admission, even though the graph has already produced its final output and there is no safe
+point left for it to ever observe that event. Rather than forcing the run through an
+indefinite retry loop just because a steering event happened to exist — which would penalize
+a graph that legitimately never calls `drain_steering()` at all — the Runtime durably
+transitions that row to `superseded` and finalizes the run with its already-computed outcome.
+A `run.steer.superseded` event is never silently dropped in this case; it is always paired
+with the disposition change, in the same durable transaction, and is idempotent under retry
+(a repeated attempt to supersede an already-superseded row emits no duplicate event).
 
 Field meanings:
 
@@ -108,15 +120,18 @@ Field meanings:
 - `task_id`: distinguishes the specific task among parallel/`Send` tasks in the same
   superstep.
 
-**PostgreSQL is the durable source of truth; Redis is only an optional accelerator.** Both
-`run.steer.accepted` and `run.steer.consumed` are durably written to PostgreSQL before
-becoming visible anywhere else. Redis pub/sub is used only to hint workers that "steering may
-be waiting," reducing polling latency. Even if that Redis notification is lost (a dropped
-connection, a Redis restart), a worker still checks/polls PostgreSQL at its next safe point
-and eventually consumes the event — a lost Redis notification never permanently drops
-steering. Similarly, `commit_steering_consumptions()` is idempotent: when a worker retries
-the same consumption batch after a transient failure, only events that actually transition
-status produce a new `run.steer.consumed` — already-consumed events are never re-emitted.
+**PostgreSQL is the durable source of truth; Redis is only an optional accelerator.** All three
+of `run.steer.accepted`, `run.steer.consumed`, and `run.steer.superseded` are durably written
+to PostgreSQL before becoming visible anywhere else. Redis pub/sub is used only to hint
+workers that "steering may be waiting," reducing polling latency. Even if that Redis
+notification is lost (a dropped connection, a Redis restart), a worker still checks/polls
+PostgreSQL at its next safe point and eventually consumes the event — a lost Redis
+notification never permanently drops steering. Similarly, the production Worker path,
+`commit_steering_consumptions_if_owned()`, is idempotent: when a worker retries the same
+consumption batch after a transient failure, only events that actually transition status
+produce a new `run.steer.consumed` — already-consumed events are never re-emitted. The same
+holds for superseding a stale row: retrying an already-superseded transition emits no
+duplicate `run.steer.superseded`.
 
 ## Retry policy
 

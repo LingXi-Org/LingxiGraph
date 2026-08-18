@@ -60,13 +60,16 @@ sequenceDiagram
   N->>Ch: 在安全点调用 drain_steering()
   Ch-->>N: 有序、去重后的事件
   N-->>W: 消费记录（node、namespace、task_id、latency）
-  W->>PG: commit_steering_consumptions()（状态更新 + run.steer.consumed，同一事务）
+  W->>PG: commit_steering_consumptions_if_owned()（状态更新 + run.steer.consumed，同一事务）
 ```
 
 PostgreSQL 的 `run_steering_events` 表是每一条 steering 事件是否存在及其状态的唯一真相
 来源。schema 保留了 `delivered` 这个状态值以便将来扩展，但目前实现的流程从不会写入
-它——真实的状态转换是 `pending` → `consumed`（通过一次原子的 `commit_steering_
-consumptions()` 调用直接完成），迁移时为 `superseded`。请把 `delivered` 当作代码里
+它——真实的状态转换是 `pending` → `consumed`（通过一次原子的
+`commit_steering_consumptions_if_owned()` 调用直接完成），或者 `pending`/`delivered` →
+`superseded`——原因可能是它所属的 paused run 被 resume（其仍 pending 的 steering 被迁移到
+新 run），也可能是它在所属 worker 的最后安全点关闭之后才 durably 落地（一种狭窄的竞争；
+见下文"终结流程与 steering 准入边界"一节）。请把 `delivered` 当作代码里
 可能需要读取/放行的一个状态值，而不是当前任何路径会产生的状态。Redis
 通知只是为了降低轮询延迟的优化手段；丢失它从不会丢失一条 steering 事件——worker 在每个
 安全点的周期性检查会退化为直接读 PostgreSQL。`SteeringChannel` 是 worker 用来把已取到的
@@ -91,7 +94,7 @@ superstep 前、重试前、resume 之后——每一次这样的调度切换都
 - 在**单个存活的 `SteeringChannel`** 内——同一个 worker、同一个进程内实例，跨节点的任意
   次内部重试——`drain_steering()` 永远不会返回同一事件两次：原子 drain-once；
 - **这不是系统级的恰好一次保证。** 如果 worker 在 `drain_steering()` 已经把某条事件交给
-  节点、但 `commit_steering_consumptions()` 尚未把这次消费 durably 记录下来之前崩溃（或
+  节点、但 `commit_steering_consumptions_if_owned()` 尚未把这次消费 durably 记录下来之前崩溃（或
   它的 lease 被重新分配），PostgreSQL 里那一行仍然是 `pending`/`delivered`——接管该 run、
   从 PostgreSQL 重建 channel 的新 worker 会合理地重新投递同一条事件。跨越一次崩溃，
   steering 的投递语义是**至少一次（at-least-once）**，不是恰好一次。如果业务要对 drain
@@ -103,14 +106,14 @@ superstep 前、重试前、resume 之后——每一次这样的调度切换都
   drain 之后再次重放同一提交，返回的仍然是那条（现已 consumed 的）原事件，而不是一条新的
   pending 事件。这只对 accept 一侧（重复的 `/steer` 调用）去重，本身并不能让跨崩溃的
   drain 一侧变成恰好一次——见上一条；
-- consumed-commit（`commit_steering_consumptions()`）与图自身为消费它的那个 superstep
+- consumed-commit（`commit_steering_consumptions_if_owned()`）与图自身为消费它的那个 superstep
   所做的 checkpoint commit 是两个独立的 durable 操作，不是同一个分布式事务（见下方
   "consumption 与 checkpoint commit 的当前关系"）——因此不存在覆盖"steering 投递 + 图
   状态"两者的系统级恰好一次处理保证。
 
 ## 重试、worker 崩溃与 Redis 丢失
 
-- **worker 重试：** `commit_steering_consumptions()` 是幂等的——一个 worker 提交某批
+- **worker 重试：** `commit_steering_consumptions_if_owned()` 是幂等的——一个 worker 提交某批
   consumption 后、在看到 ack 之前连接断开并重试同一批，不会产生重复的
   `run.steer.consumed`；只有在这次调用中真正发生状态转换的 steering 行才会产生一条；
 - **worker 崩溃：** 因为投递状态存放在 PostgreSQL 里，而不是崩溃 worker 的内存里，接管该
@@ -119,6 +122,35 @@ superstep 前、重试前、resume 之后——每一次这样的调度切换都
 - **Redis 丢失：** Redis 只是加速器，从不是正确性所依赖的东西。如果 pub/sub 通知从未
   到达——连接重置、Redis 重启、消息丢失——worker 自身在每个安全点对 PostgreSQL 的周期性
   检查仍然会发现并投递该事件，只是延迟略高，而不是彻底丢失更新。
+
+## 终结流程与 steering 准入边界
+
+一旦图执行结束，拥有该 run 的 worker 会先原子地封闭新的 steering 准入
+（`close_steering()`），然后才开始对图已经消费的内容做最终 durable flush。从这一刻起，
+新的 `/steer` 调用会收到一个稳定的 `409 run_finalizing`——因为已经不再存在任何安全点能让
+图消费一条新接受的事件。
+
+但这仍然留下一种狭窄的竞争：某次 `/steer` 调用可能恰好在 `close_steering()` 抢到同一把
+run 行锁**之前**先抢到锁并完成 durable 提交——即便此时图早已产生终态输出，本该负责摄入
+该事件的心跳循环也早已停止。final flush 完成之后，Runtime 会专门检查这种情况：任何仍处于
+`pending`/`delivered` 的 steering 行都会被 durably 转为 `superseded`（原因为
+`late_boundary_race`），并伴随一条 `run.steer.superseded` 生命周期事件，二者在同一个
+lease/attempt-fenced 写入中一起完成。随后该 run 会以之前已经算出的结果
+（`succeeded`、`paused`、`failed` 等）正常终结——**不会**仅仅因为存在一条 steering 事件
+就被强制进入重试循环。一个本就合法地从不调用 `drain_steering()` 的图（见上文"安全点由
+应用选择"，这是文档明确允许的选择）不会因此受到惩罚：它会在第一次投递尝试就正常终结，
+就像这条 steering 事件从未到达过一样，而该事件的最终归宿会被记录为 `superseded`，绝不会
+被静默丢弃。
+
+**最终归宿策略，精确表述如下：** 一个 terminal run **自身**的终结决策绝不能让一条输了竞争
+的 steering 事件被静默搁置、没有任何 durable、可观测的归宿——这正是上面机制所保证的。但这
+**并不**意味着任何 terminal run 在任何情况下都不可能留有 `pending` 的 steering 行：一次普通
+的、由客户端发起的 cancel（或者一个耗尽投递尝试次数而被 dead-letter 的 run）完全可能合法地
+留下图根本没来得及消费的、仍是 `pending` 的 steering——这是刻意保留的 durable 历史记录，而
+不是 bug；之后如果该 run 被 redrive，这条仍 pending 的行会像任何其他排队中的 steering 一样
+被重新拾起。这两种情况是不同的：上面的边界竞争归宿之所以存在，是因为那条具体的 steering
+事件确实**再也不会有任何投递机会**去消费它；而一次普通 cancel 未被消费的 steering 仍然拥有
+一条合法的未来投递路径（redrive），如果给它打上 `superseded` 反而会错误地堵死这条路径。
 
 ## 并行 superstep、`Send` 与 subgraph 共享同一个 channel
 
@@ -133,7 +165,7 @@ subgraph 深度，最终消费了这条事件。
 ## consumption 与 checkpoint commit 的当前关系（明确的 scope 边界）
 
 在当前版本中，把一条 steering 事件标记为 `consumed`（通过
-`commit_steering_consumptions()`）与图自身为消费它的那个 superstep 所做的 checkpoint
+`commit_steering_consumptions_if_owned()`）与图自身为消费它的那个 superstep 所做的 checkpoint
 commit，是两个独立的 durable 操作，**没有**被包在同一个分布式事务里。这在实践中意味着：
 如果某个节点 drain 了 steering 之后、其 checkpoint 尚未写入之前进程就退出了，
 checkpoint 级别的重试会重新执行该节点——但那条 steering 事件已经被标记为

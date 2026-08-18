@@ -23,6 +23,7 @@ from lingxigraph.steering import (
     SteeringPayloadTooLarge,
     validate_steering_payload,
 )
+from lingxigraph.types import RunStatus
 
 
 class State(TypedDict, total=False):
@@ -1428,10 +1429,11 @@ class SteeringClosedGateTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_steer_that_wins_the_lock_race_before_gate_close_gets_a_real_rerun_chance(
+    def test_steer_that_wins_the_lock_race_before_gate_close_is_superseded_not_rerun(
         self,
     ) -> None:
-        """Issue #16 PR #17 review round 7, point 1 (BLOCKER, TOCTOU).
+        """Issue #16 PR #17 review round 8, point 1 (BLOCKER) -- CHOSEN FIX:
+        "seal admission at the safe boundary + supersede late events".
 
         A ``/steer`` call can win the run row's lock *before*
         ``close_steering()`` does, even though the graph has already
@@ -1439,11 +1441,15 @@ class SteeringClosedGateTests(unittest.TestCase):
         the gate closed" is not the same as "landed before the graph's
         last safe point". This artificially blocks ``close_steering()``,
         completes a ``submit_steering()`` while it is blocked (simulating
-        the race winner), then releases the block. The final outcome must
-        never be "succeeded" with the steering row stuck ``pending``
-        forever -- it must instead not go terminal, with a pending-rerun
-        scheduled so a fresh delivery attempt gives the event a real
-        chance to be consumed.
+        the race winner), then releases the block. Round 7's fix forced an
+        indefinite retry loop onto this run -- but the ``double`` graph
+        below never calls ``drain_steering()`` at all, so forcing a rerun
+        penalized a graph that is correctly, deliberately ignoring
+        steering. The run must instead finalize normally on this very
+        attempt, and the late-landing steering event must end up with a
+        durable ``superseded`` disposition and matching
+        ``run.steer.superseded`` lifecycle event -- never silently
+        dropped, never forcing a rerun.
         """
 
         from lingxigraph.server.worker import Worker
@@ -1494,38 +1500,176 @@ class SteeringClosedGateTests(unittest.TestCase):
             final_status = (
                 final.status.value if hasattr(final.status, "value") else final.status
             )
-            # Never "succeeded" with a permanently-pending steering row.
-            self.assertNotEqual(final_status, "succeeded")
-            self.assertEqual(final_status, "pending")
-            still_pending = await repo.list_pending_steering("acme", run.id)
-            self.assertEqual([event.id for event in still_pending], [accepted.id])
+            # The run finalizes normally on this attempt -- never forced
+            # into a retry loop just because a steering event existed that
+            # the graph never looked at.
+            self.assertEqual(final_status, "succeeded")
 
-            # A fresh delivery attempt claims the run and syncs the
-            # still-pending row into a brand new channel, exactly the
-            # "real chance to be consumed" the fix guarantees -- proven
-            # here by the steering row actually being ingested (its
-            # ``status`` moves to ``delivered``) rather than being
-            # silently stranded ``pending`` behind a closed gate. (The
-            # ``double`` graph used here never calls ``drain_steering()``,
-            # so it does not itself consume the event -- that half of the
-            # contract is covered end-to-end by ``make_registry``'s
-            # ``steerable`` graph elsewhere in this module; what matters
-            # here is that the event is no longer permanently stuck behind
-            # a gate that was closed out from under it.)
-            worker_b = Worker(make_registry_double(), repo, worker_id="worker-b")
-            claimed = await worker_b.run_once()
-            self.assertTrue(claimed)
-            final_after_rerun = await repo.get_run("acme", run.id)
-            final_after_rerun_status = (
-                final_after_rerun.status.value
-                if hasattr(final_after_rerun.status, "value")
-                else final_after_rerun.status
+            # The late-landing steering event is durably superseded, not
+            # left pending, not silently dropped.
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(still_pending, [])
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(len(all_steering), 1)
+            self.assertEqual(all_steering[0].id, accepted.id)
+            self.assertEqual(all_steering[0].status, "superseded")
+
+            # A durable, observable run.steer.superseded lifecycle event
+            # was recorded for it -- not the resume-transfer reason, since
+            # this is the late-boundary-race disposition.
+            events = await repo.list_events("acme", run.id)
+            superseded_events = [e for e in events if e.kind == "run.steer.superseded"]
+            self.assertEqual(len(superseded_events), 1)
+            self.assertEqual(superseded_events[0].data["steering_event_id"], accepted.id)
+            self.assertEqual(superseded_events[0].data["reason"], "late_boundary_race")
+            self.assertIsNone(superseded_events[0].data["superseded_by_run_id"])
+
+        asyncio.run(scenario())
+
+    def test_graph_that_never_drains_steering_still_finalizes_on_first_attempt(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 8, point 1 (BLOCKER) required
+        regression coverage (a): a graph that never calls
+        ``drain_steering()`` at all, receiving one ordinary steering
+        event, must still finalize successfully on its first attempt --
+        no forced rerun just because steering happened to exist. This is
+        the deliberate-ignore case explicitly allowed by issue #16 ("a
+        node may call drain_steering() once, in a loop, or not at all")."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
             )
-            # Still not falsely reported succeeded/terminal while the
-            # event remains genuinely undrained -- the graph itself never
-            # calls ``drain_steering()`` here, so it keeps retrying rather
-            # than ever silently dropping the event.
-            self.assertNotEqual(final_after_rerun_status, "succeeded")
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "ignored"}
+            )
+            self.assertTrue(created)
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+            claimed = await worker.run_once()
+            self.assertTrue(claimed)
+
+            final = await repo.get_run("acme", run.id)
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
+            self.assertEqual(final_status, "succeeded")
+            self.assertEqual(final.attempt, 1)
+
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(len(all_steering), 1)
+            self.assertEqual(all_steering[0].status, "superseded")
+            events = await repo.list_events("acme", run.id)
+            superseded_events = [e for e in events if e.kind == "run.steer.superseded"]
+            self.assertEqual(len(superseded_events), 1)
+            self.assertEqual(superseded_events[0].data["steering_event_id"], accepted.id)
+
+        asyncio.run(scenario())
+
+
+class RetryCommitCancelWinsEventTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 8, point 2 (BLOCKER).
+
+    ``retry_run_if_owned`` already correctly coerces the transition to
+    ``cancelled`` when the run is ``cancelling`` at commit time -- it must
+    never be sent back to ``pending``. But the Worker used to only check
+    ``updated is not None`` before unconditionally appending a
+    ``worker_retrying`` event, so a durable "retrying" event could be
+    appended even though the actual write coerced the run to
+    ``cancelled``. These tests prove the Worker now branches on the
+    *actual* resulting status for both retry call sites.
+    """
+
+    def test_retry_or_dead_letter_does_not_emit_worker_retrying_when_cancel_wins(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            self.assertTrue(await repo.request_cancel("acme", run.id))
+            cancelling = await repo.get_run("acme", run.id)
+            self.assertEqual(cancelling.status, "cancelling")
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+            await worker._retry_or_dead_letter(
+                claimed, {"code": "delivery_retry", "message": "transient"}
+            )
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "cancelled")
+            events = await repo.list_events("acme", run.id)
+            self.assertEqual([e for e in events if e.kind == "worker_retrying"], [])
+
+        asyncio.run(scenario())
+
+    def test_commit_intent_retry_does_not_emit_worker_retrying_when_cancel_wins(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            self.assertTrue(await repo.request_cancel("acme", run.id))
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+            intent = Worker._Intent(
+                kind="retry",
+                status=RunStatus.PENDING,
+                error={"code": "delivery_retry", "message": "transient"},
+            )
+            committed = await worker._commit_intent(claimed, intent)
+            self.assertTrue(committed)
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "cancelled")
+            events = await repo.list_events("acme", run.id)
+            self.assertEqual([e for e in events if e.kind == "worker_retrying"], [])
+
+        asyncio.run(scenario())
+
+    def test_ordinary_retry_still_emits_worker_retrying_when_pending(self) -> None:
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+            await worker._retry_or_dead_letter(
+                claimed, {"code": "delivery_retry", "message": "transient"}
+            )
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "pending")
+            events = await repo.list_events("acme", run.id)
+            self.assertEqual(len([e for e in events if e.kind == "worker_retrying"]), 1)
 
         asyncio.run(scenario())
 

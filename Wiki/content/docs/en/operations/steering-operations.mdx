@@ -71,13 +71,22 @@ execution ends, before that final flush starts.
 
 A closed gate on its own is not sufficient to prevent a permanently-pending steering row: a
 `/steer` call can win the run row's lock a moment *before* `close_steering()` does, even though
-the graph has already finished. The worker's post-flush check (`list_pending_steering()`,
-`Worker._execute`) is what actually catches that case — if anything is still `pending`/
-`delivered` after the final flush has committed everything it could, the run is **not**
-finalized to a terminal/paused status; instead it is routed through the ordinary
-retry/dead-letter path (error code `steering_pending_rerun`) so a fresh delivery attempt gives
-the event a real chance to be consumed. **A terminal run must never carry a permanently-pending
-steering row.**
+the graph has already finished. The worker's post-flush check
+(`supersede_pending_steering_if_owned()`, `Worker._execute`) is what actually catches that
+case — if anything is still `pending`/`delivered` after the final flush has committed
+everything it could, that row is durably transitioned to `superseded` (reason
+`late_boundary_race`), paired with a `run.steer.superseded` lifecycle event, in the same
+lease/attempt-fenced write as the rest of finalization. The run then finalizes normally with
+its already-computed outcome — it is **not** routed through a retry/dead-letter loop just
+because a steering event happened to exist, since doing so would force a rerun onto a graph
+that may be correctly, deliberately never calling `drain_steering()` at all. **A terminal run's
+own finalization decision can never silently strand a race-losing steering event without a
+durable, observable disposition** — but this does not mean no terminal run can ever carry a
+`pending` steering row for any reason: an ordinary client-initiated cancel, or a run that
+exhausts delivery attempts and is dead-lettered, can legitimately leave steering the graph
+never got around to draining still `pending` as deliberate durable history, picked back up by
+a later redrive like any other queued steering. See the steering concept page's "Finalization
+and the steering admission boundary" section for the full policy.
 
 ## Idempotent replay is safe across every admission gate
 
@@ -136,13 +145,15 @@ If a steering event stays `pending` far longer than expected:
    current attempt (`true` means the gate is shut) and retry against a fresh run instead of the
    same one. A replay with the same Idempotency-Key is always safe here, even after the gate
    closes — see "Idempotent replay is safe across every admission gate".
-6. If worker logs show `steering_pending_rerun`, that is the round 7 TOCTOU fix working as
-   intended: a steering event was durably accepted with no safe point left in that delivery
-   attempt to consume it, so the run was deliberately kept non-terminal and rescheduled instead
-   of finalizing with a permanently-pending row. Expect the next delivery attempt to pick the
-   event up normally; this is not itself a bug, but a repeating pattern for the same run
-   suggests steering is consistently arriving after the graph already reaches its terminal
-   node, which is worth investigating at the application/graph level.
+6. If a steering event's status is `superseded` with `reason: late_boundary_race` in its
+   `run.steer.superseded` event data (rather than `reason: resume_transfer`), that is the
+   finalization-boundary fix working as intended: the event was durably accepted with no safe
+   point left in that delivery attempt to consume it, so it was given a durable, observable
+   `superseded` disposition instead of the run finalizing with a permanently-pending row or
+   being forced through a needless rerun. This is not itself a bug; a repeating pattern of
+   `late_boundary_race` for the same run suggests steering is consistently arriving after the
+   graph already reaches its terminal node, which is worth investigating at the
+   application/graph level.
 
 ## The normal `run.steer.accepted → consumed` lifecycle
 

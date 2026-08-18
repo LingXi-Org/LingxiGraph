@@ -295,50 +295,48 @@ class Worker:
             # attempts (issue #16 PR #17 review round 5, point 2).
             flushed = await self._final_steering_flush(run, graph)
             if flushed:
-                # Issue #16 PR #17 review round 7, point 1 (BLOCKER): the
-                # flush above commits everything this attempt's channel
-                # actually drained -- but it cannot know about a steering
-                # row that was durably accepted (by a concurrent ``/steer``
-                # racing ``close_steering``'s lock, or simply too late for
-                # any safe point this attempt reached) and therefore was
-                # never ingested into the channel at all. Checking for any
-                # still-``pending``/``delivered`` row *after* the flush has
-                # already run is what actually distinguishes "genuinely
-                # never drained" from "drained but not yet committed" (the
-                # latter no longer applies once the flush above has run).
-                # Only relevant when we actually closed admission -- a
+                # Issue #16 PR #17 review round 8, point 1 (BLOCKER):
+                # CHOSEN FIX -- "seal admission at the safe boundary +
+                # supersede late events". Round 7's fix forced an
+                # indefinite retry/dead-letter loop onto any run that ever
+                # had undrained steering, even when the graph legitimately
+                # never calls ``drain_steering()`` at all -- hardcoding an
+                # application decision ("does undrained steering mean
+                # rerun?") into the Runtime in violation of issue #16's
+                # Runtime/application boundary. The flush above commits
+                # everything this attempt's channel actually drained, but
+                # it cannot know about a steering row that was durably
+                # accepted (by a concurrent ``/steer`` racing
+                # ``close_steering``'s lock, or simply too late for any
+                # safe point this attempt reached) and therefore was never
+                # ingested into the channel at all. Any such row is now
+                # durably transitioned to a ``superseded`` disposition --
+                # never silently dropped, never forcing a rerun -- and the
+                # run finalizes with its originally computed intent. Only
+                # relevant when we actually closed admission -- a
                 # ``paused`` outcome intentionally leaves steering open for
                 # the eventual ``/resume`` transfer instead.
-                undrained_steering = (
-                    closing_steering
-                    and bool(
-                        await self.repository.list_pending_steering(run.tenant_id, run.id)
+                if closing_steering:
+                    superseded = await self.repository.supersede_pending_steering_if_owned(
+                        run.tenant_id, run.id, self.worker_id, run.attempt
                     )
-                )
-                if not undrained_steering:
-                    committed = await self._commit_intent(run, intent)
-                    if committed:
-                        graph.forget_steering(run.id)
-                    return
-
-                # A steering event is still durably pending with no safe
-                # point left in this attempt to ever consume it. Never
-                # commit the terminal/paused intent computed above --
-                # instead route the run through the same retry/dead-letter
-                # path a flush failure uses, so a fresh delivery attempt
-                # claims the run, ``_sync_steering_in`` ingests the
-                # still-pending row into a brand new channel, and it gets
-                # one real chance to be observed by the graph.
-                pending_error = {
-                    "code": "steering_pending_rerun",
-                    "message": (
-                        "steering input was durably accepted with no safe point left in this "
-                        "delivery attempt to consume it; scheduling a rerun so it gets a real "
-                        "chance to be consumed instead of finalizing with a permanently-pending "
-                        "event"
-                    ),
-                }
-                await self._retry_or_dead_letter(run, pending_error)
+                    if superseded is None:
+                        # Lease was reclaimed by a new owner between the
+                        # final flush and this call -- same as any other
+                        # fenced write losing the race: abandon without
+                        # touching the run further, the new owner is now
+                        # solely responsible for it.
+                        logger.warning(
+                            "run finalization abandoned: lease no longer owned before "
+                            "superseding stale steering",
+                            extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                        )
+                        return
+                    for stored in superseded:
+                        await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+                committed = await self._commit_intent(run, intent)
+                if committed:
+                    graph.forget_steering(run.id)
                 return
 
             # The flush never durably succeeded (the worker is draining, or
@@ -418,21 +416,7 @@ class Worker:
                     extra={"run_id": run.id, "tenant_id": run.tenant_id},
                 )
                 return False
-            stored = await self.repository.append_event(
-                run.tenant_id,
-                run.id,
-                "worker_retrying",
-                {
-                    "attempt": run.attempt,
-                    "max_attempts": self.max_delivery_attempts,
-                    "error": intent.error,
-                },
-            )
-            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-            logger.warning(
-                "run delivery scheduled for retry",
-                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
-            )
+            await self._emit_retry_outcome_event(run, updated, intent.error)
             return True
 
         updated = await self.repository.finish_run_if_owned(
@@ -473,6 +457,54 @@ class Worker:
             )
         return True
 
+    async def _emit_retry_outcome_event(
+        self, run: Run, updated: Run, error: dict[str, Any] | None
+    ) -> None:
+        """Emit the correct lifecycle event for a fenced retry write's
+        *actual* resulting status.
+
+        Issue #16 PR #17 review round 8, point 2 (BLOCKER):
+        ``retry_run_if_owned`` already correctly coerces the transition to
+        ``cancelled`` when the same fenced transaction observes the run is
+        ``cancelling`` -- it does not send it back to ``pending``. But the
+        caller used to only check ``updated is not None`` and then
+        unconditionally append a ``worker_retrying`` event and log
+        "pending", regardless of what the write actually did. That made the
+        SSE/audit/operator-facing event stream self-contradictory: a
+        "retrying" event could be durably appended even though the run's
+        real, already-committed status was ``cancelled``. This branches on
+        ``updated.status`` -- the actual resulting status -- instead: only
+        an actual ``pending`` result emits ``worker_retrying``; an actual
+        ``cancelled`` result emits nothing here (the cancellation path's
+        own event/logging already covers it) since no durable status
+        change happened as a result of "retry" beyond what cancellation
+        itself dictated.
+        """
+
+        final_status = updated.status if isinstance(updated.status, str) else updated.status.value
+        if final_status != RunStatus.PENDING.value:
+            if final_status == RunStatus.CANCELLED.value:
+                logger.info(
+                    "run cancelled during finalization, retry request superseded by cancel",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "cancelled"},
+                )
+            return
+        stored = await self.repository.append_event(
+            run.tenant_id,
+            run.id,
+            "worker_retrying",
+            {
+                "attempt": run.attempt,
+                "max_attempts": self.max_delivery_attempts,
+                "error": error,
+            },
+        )
+        await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+        logger.warning(
+            "run delivery scheduled for retry",
+            extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+        )
+
     async def _retry_or_dead_letter(self, run: Run, error: dict[str, Any]) -> None:
         """Route a run that could not safely finalize into the ordinary
         retry/dead-letter path, fenced on ``(lease_owner, attempt)``.
@@ -496,21 +528,7 @@ class Worker:
                     extra={"run_id": run.id, "tenant_id": run.tenant_id},
                 )
                 return
-            stored = await self.repository.append_event(
-                run.tenant_id,
-                run.id,
-                "worker_retrying",
-                {
-                    "attempt": run.attempt,
-                    "max_attempts": self.max_delivery_attempts,
-                    "error": error,
-                },
-            )
-            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-            logger.warning(
-                "run finalization retried",
-                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
-            )
+            await self._emit_retry_outcome_event(run, updated, error)
         else:
             updated = await self.repository.finish_run_if_owned(
                 run.tenant_id,

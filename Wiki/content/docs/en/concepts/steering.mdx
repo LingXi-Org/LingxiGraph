@@ -65,14 +65,17 @@ sequenceDiagram
   N->>Ch: drain_steering() at a safe point
   Ch-->>N: ordered, deduplicated events
   N-->>W: consumption record (node, namespace, task_id, latency)
-  W->>PG: commit_steering_consumptions() (status + run.steer.consumed, one transaction)
+  W->>PG: commit_steering_consumptions_if_owned() (status + run.steer.consumed, one transaction)
 ```
 
 PostgreSQL's `run_steering_events` table is the single source of truth for every steering
 event's existence and status. The schema reserves a `delivered` value for forward
 compatibility, but the currently implemented flow never writes it — the real transition is
-`pending` → `consumed` directly (via a single atomic `commit_steering_consumptions()` call),
-or `superseded` on transfer. Treat `delivered` as a status your code may need to read/allow
+`pending` → `consumed` directly (via a single atomic `commit_steering_consumptions_if_owned()` call),
+or `pending`/`delivered` → `superseded` — either because the paused run it belonged to was
+resumed (its still-pending steering migrates onto the new run) or because it durably landed
+after the owning worker's last safe point closed (a narrow race; see "Finalization and the
+steering admission boundary" below). Treat `delivered` as a status your code may need to read/allow
 today, not one anything currently produces. The Redis notification is purely an optimization
 to reduce polling latency; losing
 it never loses a steering event — the worker's periodic safe-point checks fall back to reading
@@ -102,7 +105,7 @@ break the deterministic replay guarantees the rest of the runtime depends on.
   atomic drain-once.
 - **This is not a system-wide exactly-once guarantee.** If a worker crashes (or its lease is
   reassigned) after `drain_steering()` has handed an event to a node but *before*
-  `commit_steering_consumptions()` durably records that consumption, the PostgreSQL row is
+  `commit_steering_consumptions_if_owned()` durably records that consumption, the PostgreSQL row is
   still `pending`/`delivered` — a new worker rebuilding the channel from PostgreSQL for that run
   will legitimately redeliver the same event. Across a crash, steering delivery is
   **at-least-once**, not exactly-once. Applications performing an irreversible side effect from
@@ -115,14 +118,14 @@ break the deterministic replay guarantees the rest of the runtime depends on.
   already drained still returns the original (now-consumed) event, not a new pending one. This
   dedupes the *accept* side (repeated `/steer` calls); it does not by itself make the *drain*
   side exactly-once across a crash — see above.
-- The consumed-commit (`commit_steering_consumptions()`) and the graph's own checkpoint commit
+- The consumed-commit (`commit_steering_consumptions_if_owned()`) and the graph's own checkpoint commit
   for the superstep that drained the event are two separate durable operations, not one
   distributed transaction (see "Consumption vs. checkpoint commit" below) — so there is no
   system-wide exactly-once processing guarantee spanning steering delivery *and* graph state.
 
 ## Retry, worker crash, and Redis loss
 
-- **Worker retry**: `commit_steering_consumptions()` is idempotent — a worker that commits a
+- **Worker retry**: `commit_steering_consumptions_if_owned()` is idempotent — a worker that commits a
   consumption batch, loses the connection before seeing the ack, and retries the same batch
   will not create a duplicate `run.steer.consumed` event; only steering rows that actually
   transition status in a given call produce one.
@@ -134,6 +137,41 @@ break the deterministic replay guarantees the rest of the runtime depends on.
   notification never arrives — connection reset, Redis restarted, message lost — the worker's
   own periodic PostgreSQL checks at each safe point still discover and deliver the event, just
   with slightly higher latency instead of a lost update.
+
+## Finalization and the steering admission boundary
+
+Once graph execution ends, the owning worker atomically seals new steering admission
+(`close_steering()`) before it starts the final durable flush of whatever the graph already
+drained. From that instant on, a fresh `/steer` call is refused with a stable `409
+run_finalizing` — there is no safe point left for the graph to ever consume a newly accepted
+event.
+
+This still leaves one narrow race: a `/steer` call can win the run row's lock, and durably
+commit its row, a moment *before* `close_steering()` wins that same lock — even though the
+graph has already produced its terminal output and the heartbeat loop that would have
+ingested the event has already stopped. Once the final flush completes, the Runtime checks for
+exactly this: any steering row still `pending`/`delivered` at that point is durably
+transitioned to `superseded` (reason `late_boundary_race`), paired with a `run.steer.superseded`
+lifecycle event, in the same lease/attempt-fenced write as the rest of finalization. The run
+then finalizes normally with its already-computed outcome (`succeeded`, `paused`, `failed`,
+etc.) — it is **not** forced through a retry loop just because a steering event happened to
+exist. A graph that legitimately never calls `drain_steering()` at all (a documented, allowed
+choice — see "Safe points are application-chosen" above) is never penalized by this: it
+finalizes on its first attempt exactly as if the steering event had never arrived, and that
+event's disposition is recorded as `superseded`, not silently dropped.
+
+**Final disposition policy, stated precisely:** a terminal run's *own* finalization decision
+can never silently strand a race-losing steering event without a durable, observable
+disposition — that is what the mechanism above guarantees. It does **not** mean no terminal run
+can ever have a `pending` steering row for any reason at all: an ordinary client-initiated
+cancel (or a run that exhausts delivery attempts and is dead-lettered) can legitimately leave
+steering that the graph simply never got around to draining still `pending` — that is
+deliberate, retained durable history, not a bug, and a later redrive of that run picks the
+still-pending row back up like any other queued steering. The two cases are different: the
+boundary-race disposition above exists because that specific steering event durably has *no
+delivery attempt left, ever* that could consume it; an ordinary cancel's unconsumed steering
+still has a legitimate future delivery path (redrive) that a `superseded` disposition would
+incorrectly foreclose.
 
 ## Parallel supersteps, `Send`, and subgraphs share one channel
 
@@ -149,7 +187,7 @@ up consuming a given event.
 ## Consumption vs. checkpoint commit — current scope cut
 
 As of this release, marking a steering event `consumed` (via
-`commit_steering_consumptions()`) is a separate durable operation from the graph's own
+`commit_steering_consumptions_if_owned()`) is a separate durable operation from the graph's own
 checkpoint commit for the superstep that drained it. They are not wrapped in one distributed
 transaction. In practice this means: if a node drains steering and then the process dies before
 its checkpoint is written, the checkpoint-level retry will re-execute the node — but the

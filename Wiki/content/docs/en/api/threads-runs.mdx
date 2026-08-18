@@ -212,7 +212,7 @@ not itself a named lifecycle event (there is no `run.steer.available` event in t
 it is purely a low-latency hint. Even if that notification is lost, a worker still eventually
 discovers and consumes the event via PostgreSQL's own periodic safe-point checks. Only once
 graph code at some safe point actually calls `runtime.drain_steering()` and that consumption
-is durably committed by `commit_steering_consumptions()` does `run.steer.consumed` appear.
+is durably committed by `commit_steering_consumptions_if_owned()` does `run.steer.consumed` appear.
 Callers must not assume the graph has "seen" the input just because they got a 202 — there is
 no endpoint to poll a steering event's status directly; watch the run's event stream
 (`GET /v1/runs/{run_id}/stream`) or event list for `run.steer.consumed` to confirm it was

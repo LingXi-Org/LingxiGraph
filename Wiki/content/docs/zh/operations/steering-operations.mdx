@@ -64,11 +64,19 @@ alembic upgrade head
 
 仅仅关闭闸门本身并不足以防止一条永久 pending 的 steering 行：`/steer` 请求有可能在
 `close_steering()` 之前赢得该 run 行的锁——即使此时图早已执行完毕。真正能捕获这种情况的
-是 worker 在 flush 之后的检查（`list_pending_steering()`，见 `Worker._execute`）——如果
-final flush 已经提交了它能提交的一切之后，仍然存在 `pending`/`delivered` 的行，该 run
-就**不会**被最终确定为终态/暂停状态；而是走常规的 retry/dead-letter 路径（错误码
-`steering_pending_rerun`），让一次新的投递尝试给这条事件一次真正被消费的机会。
-**一个终态 run 绝不能携带一条永久 pending 的 steering 行。**
+是 worker 在 flush 之后的检查（`supersede_pending_steering_if_owned()`，见
+`Worker._execute`）——如果 final flush 已经提交了它能提交的一切之后，仍然存在
+`pending`/`delivered` 的行，该行会被 durably 转为 `superseded`（原因为
+`late_boundary_race`），并伴随一条 `run.steer.superseded` 生命周期事件，二者在同一个
+lease/attempt-fenced 写入中完成。随后该 run 会以之前已经算出的结果正常终结——**不会**
+仅仅因为存在一条 steering 事件就走 retry/dead-letter 循环，因为那样会给一个本就合法地
+从不调用 `drain_steering()` 的图强加一次不必要的重跑。**一个终态 run 自身的终结决策绝不能
+让一条输了竞争的 steering 事件被静默搁置、没有任何 durable、可观测的归宿**——但这并不
+意味着任何终态 run 都不可能携带 `pending` 的 steering 行：一次普通的、由客户端发起的
+cancel，或者一个耗尽投递尝试次数而被 dead-letter 的 run，完全可能合法地留下图根本没来得
+及消费的、仍是 `pending` 的 steering，作为刻意保留的 durable 历史记录，之后由 redrive 像
+任何其他排队中的 steering 一样重新拾起。完整策略见 steering 概念页"终结流程与 steering
+准入边界"一节。
 
 ## 幂等重放在所有准入闸门前都是安全的
 
@@ -121,11 +129,13 @@ resume 之后）去拉取该 run 新产生的 steering。因此投递延迟主�
    执行完毕——检查当前 attempt 的 `runs.steering_closed`（`true` 表示闸门已关闭），并对
    一个全新的 run 重试，而不是同一个 run。这里用相同 Idempotency-Key 重放永远是安全的，
    即使在闸门关闭之后也一样——见"幂等重放在所有准入闸门前都是安全的"；
-6. 如果 worker 日志出现 `steering_pending_rerun`，这正是 round 7 TOCTOU 修复按预期
-   工作：某条 steering 事件已经 durably 被接受，但该投递尝试已经没有安全点可以消费它了，
-   所以该 run 被刻意保持在非终态并重新调度，而不是带着一条永久 pending 的行走向终态。
-   预期下一次投递尝试会正常拿到这条事件；这本身不是 bug，但如果同一个 run 反复出现这种
-   模式，就值得在应用/图层面排查为什么 steering 总是在图到达终止节点之后才到达。
+6. 如果某条 steering 事件的 `run.steer.superseded` 事件数据里 `reason` 是
+   `late_boundary_race`（而不是 `resume_transfer`），这正是终结边界修复按预期工作：该事件
+   已经 durably 被接受，但该投递尝试已经没有安全点可以消费它了，所以它被赋予了一个
+   durable、可观测的 `superseded` 归宿，而不是让 run 带着一条永久 pending 的行走向终态，
+   也不会被强加一次不必要的重跑。这本身不是 bug；但如果同一个 run 反复出现
+   `late_boundary_race`，就值得在应用/图层面排查为什么 steering 总是在图到达终止节点之后
+   才到达。
 
 ## 正常的 `run.steer.accepted → consumed` 生命周期
 

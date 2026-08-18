@@ -804,6 +804,114 @@ class InMemoryRepository:
                 if event.status in ("pending", "delivered")
             ]
 
+    def _ensure_steer_superseded_event_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        reason: str,
+        superseded_by_run_id: str | None = None,
+        replacement_steering_event_id: str | None = None,
+    ) -> RunEvent:
+        """Idempotently ensure ``run.steer.superseded`` exists for one event.
+
+        Issue #16 PR #17 review round 8, point 3 (BLOCKER): issue #16's
+        observability section requires a durable ``run.steer.superseded``
+        lifecycle event for every steering row that transitions to the
+        ``superseded`` disposition -- both the paused-run resume-transfer
+        case and the late-boundary-race disposition (round 8, point 1).
+        Keyed on the steering event's id, never appending twice for the
+        same id, so a retried transaction (e.g. a resume attempt retried
+        after a transient failure, or a repeated late-race supersede call)
+        converges on exactly one event per steering event id -- the same
+        idempotency discipline as
+        :meth:`_ensure_steer_accepted_event_locked`. Assumes ``self._lock``
+        is already held.
+        """
+
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        for existing in run_events:
+            if (
+                existing.kind == "run.steer.superseded"
+                and existing.data.get("steering_event_id") == steering_event.id
+            ):
+                return existing
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "source_event_id": steering_event.source_event_id or steering_event.id,
+            "reason": reason,
+            "superseded_by_run_id": superseded_by_run_id,
+            "replacement_steering_event_id": replacement_steering_event_id,
+        }
+        event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=len(run_events) + 1,
+            kind="run.steer.superseded",
+            data=data,
+        )
+        run_events.append(event)
+        return event
+
+    async def supersede_pending_steering_if_owned(
+        self, tenant_id: str, run_id: str, worker_id: str, attempt: int
+    ) -> list[RunEvent] | None:
+        """Durably supersede any steering row still pending/delivered.
+
+        Issue #16 PR #17 review round 8, point 1 (BLOCKER) -- CHOSEN FIX:
+        "seal admission at the safe boundary + supersede late events".
+        ``close_steering()`` already seals *new* admission the instant
+        graph execution ends; this closes the remaining gap round 7's fix
+        mishandled -- a steering event that durably lands *after* the
+        graph's last safe point but *before* (or racing) the seal itself.
+        Rather than forcing the run through an indefinite retry/dead-letter
+        loop (round 7's approach, which hardcoded an application decision
+        -- "does undrained steering mean rerun?" -- into the Runtime, in
+        violation of issue #16's Runtime/application boundary), any row
+        still ``pending``/``delivered`` once the final flush has completed
+        is durably transitioned to ``superseded`` here, in the same
+        lease/attempt-fenced call as everything else this finalization
+        window does. The run is then free to finalize with its originally
+        computed intent -- a graph that legitimately never calls
+        ``drain_steering()`` is not penalized just because a steering
+        event happened to exist.
+
+        Fenced exactly like ``commit_steering_consumptions_if_owned``: a
+        ``None`` result means this worker's lease was already reclaimed by
+        a new owner between the final flush and this call, and the caller
+        must not treat any of this run's finalization as decided by this
+        attempt.
+        """
+
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            events = self._steering.get((tenant_id, run_id), [])
+            stale = [event for event in events if event.status in ("pending", "delivered")]
+            if not stale:
+                return []
+            stored: list[RunEvent] = []
+            for index, event in enumerate(events):
+                if event.status in ("pending", "delivered"):
+                    events[index] = event.model_copy(update={"status": "superseded"})
+                    stored.append(
+                        self._ensure_steer_superseded_event_locked(
+                            tenant_id,
+                            run_id,
+                            event,
+                            reason="late_boundary_race",
+                        )
+                    )
+        await self._notify()
+        return stored
+
     async def mark_steering_consumed(
         self, tenant_id: str, run_id: str, event_ids: Sequence[str]
     ) -> None:
@@ -1024,6 +1132,20 @@ class InMemoryRepository:
             # permanently loses the accepted record for the transferred run.
             self._ensure_steer_accepted_event_locked(
                 tenant_id, new_run_id, new_event, transferred_from_run_id=old_run_id
+            )
+            # Issue #16 PR #17 review round 8, point 3 (BLOCKER): the old
+            # row's transition to ``superseded`` above must be paired with
+            # a durable ``run.steer.superseded`` lifecycle event, recorded
+            # in this same locked migration -- otherwise an SSE/RunEvent-
+            # only client has no way to learn the old row stopped being
+            # pending or which new run/event now owns it.
+            self._ensure_steer_superseded_event_locked(
+                tenant_id,
+                old_run_id,
+                event,
+                reason="resume_transfer",
+                superseded_by_run_id=new_run_id,
+                replacement_steering_event_id=new_event.id,
             )
             transferred.append(new_event.model_copy(deep=True))
         return transferred
@@ -1973,6 +2095,135 @@ class PostgresRepository(InMemoryRepository):
             ),
         )
 
+    def _ensure_steer_superseded_event_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        reason: str,
+        superseded_by_run_id: str | None = None,
+        replacement_steering_event_id: str | None = None,
+    ) -> None:
+        """SQL counterpart of
+        :meth:`InMemoryRepository._ensure_steer_superseded_event_locked`
+        (issue #16 PR #17 review round 8, point 3, BLOCKER). Must be
+        called with the target run's row already locked (``FOR UPDATE`` /
+        an implicit lock from an earlier ``INSERT``/``UPDATE`` in this
+        same transaction), same discipline as
+        ``_ensure_steer_accepted_event_sync``.
+        """
+
+        cursor.execute(
+            f"""SELECT 1 FROM {self._schema}.run_events
+            WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.superseded'
+              AND data->>'steering_event_id'=%s""",
+            (tenant_id, run_id, steering_event.id),
+        )
+        if cursor.fetchone() is not None:
+            return
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        sequence = int(cursor.fetchone()["next"])
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "source_event_id": steering_event.source_event_id or steering_event.id,
+            "reason": reason,
+            "superseded_by_run_id": superseded_by_run_id,
+            "replacement_steering_event_id": replacement_steering_event_id,
+        }
+        run_event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=sequence,
+            kind="run.steer.superseded",
+            data=data,
+        )
+        cursor.execute(
+            f"""INSERT INTO {self._schema}.run_events
+            (id,tenant_id,run_id,sequence,kind,data,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                run_event.id,
+                tenant_id,
+                run_id,
+                sequence,
+                "run.steer.superseded",
+                self._jsonb(data),
+                run_event.created_at,
+            ),
+        )
+
+    async def supersede_pending_steering_if_owned(
+        self, tenant_id, run_id, worker_id, attempt
+    ) -> list[RunEvent] | None:
+        return await asyncio.to_thread(
+            self._supersede_pending_steering_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+        )
+
+    def _supersede_pending_steering_if_owned_sync(
+        self, tenant_id: str, run_id: str, worker_id: str, attempt: int
+    ) -> list[RunEvent] | None:
+        """SQL counterpart of
+        :meth:`InMemoryRepository.supersede_pending_steering_if_owned` --
+        see its docstring (issue #16 PR #17 review round 8, point 1,
+        BLOCKER) for the "seal + supersede" design this implements.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            if cursor.fetchone() is None:
+                return None
+            cursor.execute(
+                f"""SELECT * FROM {self._schema}.run_steering_events
+                WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+                ORDER BY sequence FOR UPDATE""",
+                (tenant_id, run_id),
+            )
+            stale_rows = cursor.fetchall()
+            if not stale_rows:
+                return []
+            stale_ids = [row["id"] for row in stale_rows]
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                (tenant_id, stale_ids),
+            )
+            stored: list[RunEvent] = []
+            for row in stale_rows:
+                steering_event = RunSteeringEvent.model_validate(row)
+                self._ensure_steer_superseded_event_sync(
+                    cursor,
+                    tenant_id,
+                    run_id,
+                    steering_event,
+                    reason="late_boundary_race",
+                )
+                cursor.execute(
+                    f"""SELECT * FROM {self._schema}.run_events
+                    WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.superseded'
+                      AND data->>'steering_event_id'=%s""",
+                    (tenant_id, run_id, steering_event.id),
+                )
+                stored_row = cursor.fetchone()
+                if stored_row is not None:
+                    stored.append(RunEvent.model_validate(stored_row))
+            return stored
+
     async def list_pending_steering(self, tenant_id, run_id):
         rows = await asyncio.to_thread(
             self._fetch_all,
@@ -2393,6 +2644,19 @@ class PostgresRepository(InMemoryRepository):
                         run.id,
                         event,
                         transferred_from_run_id=old_run_id,
+                    )
+                    # Issue #16 PR #17 review round 8, point 3 (BLOCKER):
+                    # the old row's transition to ``superseded`` above must
+                    # be paired with a durable ``run.steer.superseded``
+                    # lifecycle event in this same migration transaction.
+                    self._ensure_steer_superseded_event_sync(
+                        cursor,
+                        tenant_id,
+                        old_run_id,
+                        RunSteeringEvent.model_validate(row),
+                        reason="resume_transfer",
+                        superseded_by_run_id=run.id,
+                        replacement_steering_event_id=event.id,
                     )
                     transferred.append(event)
             return run, transferred

@@ -199,7 +199,7 @@ steering 必须已经全部就位——不存在"新 Run 已可被执行，但�
 也不是事件流里的一个具名生命周期事件（事件流中并不存在 `run.steer.available` 这个
 事件），只是一个低延迟提示。即使这个通知丢失，worker 仍会通过 PostgreSQL 自身的周期性
 安全点检查最终发现并消费该事件。只有当某个安全点的图代码真正调用
-`runtime.drain_steering()` 读取到该事件，并且这次消费被 `commit_steering_consumptions()`
+`runtime.drain_steering()` 读取到该事件，并且这次消费被 `commit_steering_consumptions_if_owned()`
 durably 提交后，才会出现 `run.steer.consumed`。调用方不能仅凭 202 就假设图已经
 "看到"这条输入——目前没有可以直接轮询某个 steering 事件状态的接口；请观察该 run 的
 事件流（`GET /v1/runs/{run_id}/stream`）或事件列表中的 `run.steer.consumed` 来确认
