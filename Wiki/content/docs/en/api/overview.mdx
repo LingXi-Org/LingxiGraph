@@ -36,6 +36,7 @@ Agent Server defaults to `http://localhost:8124`. Business resources use the ver
 | GET | `/v1/runs/{run_id}/join` | Wait up to 300 seconds |
 | GET | `/v1/runs/{run_id}/stream` | SSE event stream |
 | POST | `/v1/runs/{run_id}/cancel` | Request cooperative cancellation |
+| POST | `/v1/runs/{run_id}/steer` | Durably inject mid-run input |
 | POST | `/v1/runs/{run_id}/resume` | Resume a paused run |
 | POST | `/v1/runs/{run_id}/redrive` | Redrive a failed/dead-letter run |
 | POST | `/v1/store/batch` | Batch Store operations |
@@ -63,8 +64,11 @@ stateDiagram-v2
   paused --> cancelled: cancel (no live worker)
   failed --> pending: redrive
   dead_letter --> pending: redrive
-  paused --> pending: resume creates new run
+  state "new run: pending" as resumed_pending
+  paused --> resumed_pending: resume creates descendant run
 ```
+
+`resume` does not mutate the old run from `paused` back to `pending`: the old run remains `paused` and is marked stale through the typed `superseded_by_run_id` field; the newly created descendant run is the one that starts in `pending`.
 
 Stable status values are `pending`, `running`, `paused`, `succeeded`, `failed`, `cancelling`, `cancelled`, `timed_out`, and `dead_letter`.
 
