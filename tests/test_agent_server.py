@@ -286,6 +286,115 @@ class AgentServerTests(unittest.TestCase):
                 204,
             )
 
+    def test_cancel_paused_run_terminates_immediately(self) -> None:
+        """Issue #16 PR #17 review round 12 (BLOCKER): cancelling a ``paused``
+        run must resolve to ``cancelled`` immediately instead of flipping to
+        a lease-less ``cancelling`` that no recovery mechanism (including
+        round 11's expired-lease recovery) can ever unstick, because a
+        paused run never held a lease in the first place.
+        """
+        app = create_app(
+            registry=make_registry(),
+            authenticator=Authenticator.insecure_dev(),
+            embedded_worker=True,
+        )
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants",
+                headers=headers,
+                json={"graph_id": "approval", "name": "approval"},
+            ).json()
+            thread = client.post("/v1/threads", headers=headers, json={}).json()
+            paused = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"value": 0}},
+            ).json()
+            paused = wait_for_status(client, paused["id"], headers, {"paused"}).json()
+            self.assertEqual(paused["status"], "paused")
+
+            # Requirement 4: a paused run with pending steering must keep
+            # that steering durable -- this fix must not implicitly
+            # consume/replay/supersede it.
+            steer = client.post(
+                f"/v1/runs/{paused['id']}/steer",
+                headers=headers,
+                json={"kind": "note", "payload": {"text": "still relevant"}},
+            )
+            self.assertEqual(steer.status_code, 202)
+
+            # Regression 1 (InMemory, direct repository call against a
+            # genuinely paused run produced by the Worker, not a
+            # hand-faked status).
+            repository = app.state.repository
+            self.assertIsNone(
+                asyncio.run(repository.get_run("acme", paused["id"])).lease_owner
+            )
+            cancel_result = asyncio.run(repository.request_cancel("acme", paused["id"]))
+            self.assertTrue(cancel_result)
+            after_cancel = asyncio.run(repository.get_run("acme", paused["id"]))
+            self.assertEqual(after_cancel.status, "cancelled")
+            self.assertIsNotNone(after_cancel.finished_at)
+            self.assertIsNone(after_cancel.lease_owner)
+            self.assertIsNone(after_cancel.lease_expires_at)
+            claimed = asyncio.run(repository.claim_run("worker", lease_seconds=30))
+            self.assertIsNone(claimed)
+
+            # Steering submitted while paused stays durable history -- not
+            # implicitly dropped by the cancel-while-paused fix.
+            events = asyncio.run(repository.list_events("acme", paused["id"]))
+            self.assertTrue(any(event.kind == "run.steer.accepted" for event in events))
+
+    def test_cancel_paused_run_http_e2e(self) -> None:
+        """Regression 2 (HTTP E2E): the full public control-API surface
+        must observe the paused-run cancel as an immediate terminal state,
+        with resume and a new-idempotency-key steer both rejected 409.
+        """
+        app = create_app(
+            registry=make_registry(),
+            authenticator=Authenticator.insecure_dev(),
+            embedded_worker=True,
+        )
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants",
+                headers=headers,
+                json={"graph_id": "approval", "name": "approval"},
+            ).json()
+            thread = client.post("/v1/threads", headers=headers, json={}).json()
+            paused = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"value": 0}},
+            ).json()
+            paused = wait_for_status(client, paused["id"], headers, {"paused"}).json()
+            self.assertEqual(paused["status"], "paused")
+
+            cancelled = client.post(f"/v1/runs/{paused['id']}/cancel", headers=headers)
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertEqual(cancelled.json()["status"], "cancelled")
+
+            joined = client.get(f"/v1/runs/{paused['id']}/join", headers=headers)
+            self.assertEqual(joined.status_code, 200, joined.text)
+            self.assertEqual(joined.json()["status"], "cancelled")
+
+            resume_after_cancel = client.post(
+                f"/v1/runs/{paused['id']}/resume",
+                headers=headers,
+                json={"resume": 7},
+            )
+            self.assertEqual(resume_after_cancel.status_code, 409)
+
+            steer_after_cancel = client.post(
+                f"/v1/runs/{paused['id']}/steer",
+                headers={**headers, "Idempotency-Key": "post-cancel-key"},
+                json={"kind": "note", "payload": {"text": "too late"}},
+            )
+            self.assertEqual(steer_after_cancel.status_code, 409)
+            self.assertEqual(steer_after_cancel.json()["code"], "run_terminal")
+
     def test_interrupt_resume_and_protocol_gateways(self) -> None:
         app = create_app(
             registry=make_registry(),

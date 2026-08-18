@@ -79,6 +79,7 @@ POST /v1/runs/{run_id}/redrive
 ```
 
 - Cancellation is cooperative and usually returns `cancelling` first; nodes and providers should honor the cancellation token.
+- Cancelling a `pending` (not yet claimed) or `paused` (parked on `interrupt`, no live worker holding it) run resolves to `cancelled` immediately, with `finished_at` set — there is no live delivery attempt for either status to cooperatively observe a token, so there is nothing to wait on.
 - Only a `paused` run can resume. The response is a new run whose `metadata.resumed_from_run_id` points to the original.
 - Concurrent resume calls against the same paused run have exactly one winner: it creates the new run as above, and every other concurrent caller gets `409 run_resume_conflict` instead of a duplicate run.
 - Only `failed` or `dead_letter` runs can redrive. Redrive preserves input/config/version and re-enqueues the run.
@@ -156,10 +157,10 @@ key is subject to those checks.
 ### Cancel always wins over steer
 
 Regardless of arrival order, a cancel request always takes effect: a run that receives a
-`/steer` and is then `/cancel`led still moves to `cancelling` and stops executing. The
-already-durably-written steering event is not rolled back — it simply is never consumed by
-any surviving execution. Steer can never undo or delay a cancel that has already been
-issued.
+`/steer` and is then `/cancel`led still moves to `cancelling` (or, for a `paused` run,
+straight to `cancelled` — see above) and stops executing. The already-durably-written
+steering event is not rolled back — it simply is never consumed by any surviving execution.
+Steer can never undo or delay a cancel that has already been issued.
 
 ### Paused steering transfers to the new run inside the atomic resume transaction
 

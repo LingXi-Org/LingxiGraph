@@ -751,7 +751,8 @@ class InMemoryRepository:
                 return False
             status = (
                 RunStatus.CANCELLED.value
-                if enum_value(run.status) == RunStatus.PENDING.value
+                if enum_value(run.status)
+                in {RunStatus.PENDING.value, RunStatus.PAUSED.value}
                 else RunStatus.CANCELLING.value
             )
             self._runs[key] = run.model_copy(
@@ -2228,8 +2229,8 @@ class PostgresRepository(InMemoryRepository):
             self._tenant(cursor, tenant_id)
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET
-                status=CASE WHEN status='pending' THEN 'cancelled' ELSE 'cancelling' END,
-                finished_at=CASE WHEN status='pending' THEN NOW() ELSE finished_at END
+                status=CASE WHEN status IN ('pending','paused') THEN 'cancelled' ELSE 'cancelling' END,
+                finished_at=CASE WHEN status IN ('pending','paused') THEN NOW() ELSE finished_at END
                 WHERE tenant_id=%s AND id=%s
                   AND status NOT IN ('succeeded','failed','cancelled','timed_out','dead_letter')""",
                 (tenant_id, run_id),

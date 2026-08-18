@@ -59,6 +59,8 @@ stateDiagram-v2
   running --> timed_out
   running --> cancelling
   cancelling --> cancelled
+  pending --> cancelled: cancel（无存活 worker）
+  paused --> cancelled: cancel（无存活 worker）
   failed --> pending: redrive
   dead_letter --> pending: redrive
   paused --> pending: resume creates new run

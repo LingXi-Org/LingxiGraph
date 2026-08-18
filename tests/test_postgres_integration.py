@@ -767,6 +767,104 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_cancel_paused_run_terminates_immediately_postgres_path(self) -> None:
+        """Issue #16 PR #17 review round 12 (BLOCKER), PostgreSQL path:
+        cancelling a genuinely ``paused`` run (produced by running a real
+        interrupt graph through the Worker against live Postgres, not a
+        hand-faked status) must resolve to ``cancelled`` immediately --
+        never a lease-less ``cancelling`` that no recovery mechanism can
+        ever unstick. Also confirms a same-thread queued run is not
+        permanently wedged by this fix."""
+
+        from typing import TypedDict
+
+        from fastapi.testclient import TestClient
+
+        from lingxigraph import END, START, StateGraph, interrupt
+        from lingxigraph.server import GraphRegistry, create_app
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.server.security import Authenticator
+
+        class State(TypedDict):
+            value: int
+
+        def make_registry() -> GraphRegistry:
+            paused = StateGraph(State, name="interrupt-test", version="1.0.0")
+
+            def approval(_state):
+                return {"value": int(interrupt({"question": "new value?"}))}
+
+            paused.add_node("approval", approval)
+            paused.add_edge(START, "approval")
+            paused.add_edge("approval", END)
+            return GraphRegistry({"approval": paused.compile()})
+
+        def wait_for_status(client, run_id, headers, expected):
+            value = None
+            for _ in range(200):
+                value = client.get(f"/v1/runs/{run_id}", headers=headers)
+                if value.json()["status"] in expected:
+                    return value
+                asyncio.run(asyncio.sleep(0.01))
+            return value
+
+        repository = PostgresRepository(POSTGRES_URL, schema=self.schema)
+        asyncio.run(repository.setup())
+        app = create_app(
+            registry=make_registry(),
+            repository=repository,
+            authenticator=Authenticator.insecure_dev(),
+            embedded_worker=True,
+        )
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants",
+                headers=headers,
+                json={"graph_id": "approval", "name": "approval"},
+            ).json()
+            thread = client.post("/v1/threads", headers=headers, json={}).json()
+            paused = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"value": 0}},
+            ).json()
+            paused = wait_for_status(client, paused["id"], headers, {"paused"}).json()
+            self.assertEqual(paused["status"], "paused")
+
+            # A second run queued on the same thread -- 'cancelling' counts
+            # as ACTIVE, so it must not stay permanently wedged by this fix.
+            queued = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"value": 1}},
+            ).json()
+
+            cancelled = client.post(f"/v1/runs/{paused['id']}/cancel", headers=headers)
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertEqual(cancelled.json()["status"], "cancelled")
+            self.assertIsNone(cancelled.json()["lease_owner"])
+
+            final = asyncio.run(repository.get_run("acme", paused["id"]))
+            self.assertEqual(final.status, "cancelled")
+            self.assertIsNotNone(final.finished_at)
+            self.assertIsNone(final.lease_owner)
+            self.assertIsNone(final.lease_expires_at)
+
+            resume_after_cancel = client.post(
+                f"/v1/runs/{paused['id']}/resume",
+                headers=headers,
+                json={"resume": 7},
+            )
+            self.assertEqual(resume_after_cancel.status_code, 409)
+
+            # The queued sibling run on the same thread eventually runs to
+            # completion -- it is not wedged by the now-terminal paused run.
+            queued_final = wait_for_status(
+                client, queued["id"], headers, {"paused", "succeeded", "failed"}
+            ).json()
+            self.assertIn(queued_final["status"], {"paused", "succeeded"})
+
     def test_idempotency_key_replay_safe_across_finalizing_and_terminal_gates(self) -> None:
         """Issue #16 PR #17 review round 7, point 3, PostgreSQL path: a
         same-Idempotency-Key replay must return the existing event, never
