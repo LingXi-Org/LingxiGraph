@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from lingxigraph import END, START, RetryPolicy, Runtime, Send, StateGraph
 from lingxigraph.errors import RunTerminalError
 from lingxigraph.server import GraphRegistry, create_app
+from lingxigraph.server.models import ThreadCreate
 from lingxigraph.server.repository import InMemoryRepository
 from lingxigraph.server.security import Authenticator
 from lingxigraph.steering import (
@@ -664,6 +665,256 @@ class DurableAckOrderingTests(unittest.TestCase):
                 if event.kind == "run.steer.consumed"
             ]
             self.assertEqual(len(consumed_events_after), 1)
+
+        asyncio.run(scenario())
+
+
+class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
+    """Direct unit coverage of ``InMemoryRepository`` steering branches that
+    the HTTP/worker end-to-end tests above don't happen to exercise: unknown
+    runs, empty batches, mixed-status transfers, and idempotency-keyed
+    transfers."""
+
+    def test_submit_steering_on_unknown_run_raises_key_error(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            with self.assertRaises(KeyError):
+                await repo.submit_steering(
+                    "acme", "no-such-run", kind="user_input", payload={}
+                )
+
+        asyncio.run(scenario())
+
+    def test_mark_steering_consumed_with_empty_ids_is_a_no_op(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.submit_steering("acme", run.id, kind="user_input", payload={})
+            # Should return without touching anything.
+            await repo.mark_steering_consumed("acme", run.id, [])
+            pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(len(pending), 1)
+
+        asyncio.run(scenario())
+
+    def test_commit_steering_consumptions_with_empty_list_returns_empty(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            result = await repo.commit_steering_consumptions("acme", run.id, [])
+            self.assertEqual(result, [])
+
+        asyncio.run(scenario())
+
+    def test_commit_steering_consumptions_skips_non_matching_ids(self) -> None:
+        """The per-event update loop must keep scanning past events that
+        don't match any id in the batch, not just check the first one."""
+
+        from lingxigraph.steering import SteeringEvent
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            e1, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"i": 1}
+            )
+            e2, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"i": 2}
+            )
+
+            consumption = SteeringConsumption(
+                event=SteeringEvent(
+                    id=e2.id,
+                    run_id=run.id,
+                    sequence=e2.sequence,
+                    kind=e2.kind,
+                    payload=e2.payload,
+                    metadata=e2.metadata,
+                    created_at=e2.created_at,
+                ),
+                consumed_at=e2.created_at,
+                node="the_node",
+            )
+            stored = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].data["steering_event_id"], e2.id)
+
+            statuses = {
+                event.id: event.status
+                for event in await repo.list_steering("acme", run.id)
+            }
+            self.assertEqual(statuses[e1.id], "pending")
+            self.assertEqual(statuses[e2.id], "consumed")
+
+        asyncio.run(scenario())
+
+    def test_transfer_when_old_run_has_already_been_removed(self) -> None:
+        """``_transfer_pending_steering_locked`` must tolerate an old run
+        that is no longer present in ``_runs`` (defensive branch: it only
+        marks the old run superseded when it can still find it)."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            # Simulate the old run row being gone by the time the resume
+            # migration runs -- the migration must not raise.
+            del repo._runs[("acme", run.id)]
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", None, assistant, _run_create(assistant.id), run.id
+            )
+            self.assertEqual(transferred, [])
+            self.assertNotEqual(new_run.id, run.id)
+
+        asyncio.run(scenario())
+
+    def test_transfer_preserves_idempotency_key_and_skips_already_consumed(
+        self,
+    ) -> None:
+        """Only ``pending``/``delivered`` events transfer; an already
+        ``consumed`` event is left behind untouched, and a transferred
+        event's idempotency key must still dedupe under the new run id."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id)
+            )
+            consumed_event, _ = await repo.submit_steering(
+                "acme", old_run.id, kind="user_input", payload={"i": "done"}
+            )
+            await repo.mark_steering_consumed("acme", old_run.id, [consumed_event.id])
+            pending_event, _ = await repo.submit_steering(
+                "acme",
+                old_run.id,
+                kind="user_input",
+                payload={"i": "pending"},
+                idempotency_key="key-1",
+            )
+
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", None, assistant, _run_create(assistant.id), old_run.id
+            )
+
+            self.assertEqual(len(transferred), 1)
+            self.assertEqual(transferred[0].source_event_id, pending_event.id)
+            self.assertEqual(transferred[0].idempotency_key, "key-1")
+
+            old_events = {
+                event.id: event.status
+                for event in await repo.list_steering("acme", old_run.id)
+            }
+            self.assertEqual(old_events[consumed_event.id], "consumed")
+            self.assertEqual(old_events[pending_event.id], "superseded")
+
+            # Resubmitting with the same idempotency key under the *new*
+            # run id must dedupe against the transferred row, proving the
+            # transfer registered it in ``_steering_keys`` for the new id.
+            dup_event, created = await repo.submit_steering(
+                "acme",
+                new_run.id,
+                kind="user_input",
+                payload={"different": True},
+                idempotency_key="key-1",
+            )
+            self.assertFalse(created)
+            self.assertEqual(dup_event.id, transferred[0].id)
+
+        asyncio.run(scenario())
+
+
+class InMemoryRepositoryRunLifecycleEdgeCaseTests(unittest.TestCase):
+    """Direct unit coverage of ``InMemoryRepository`` run-lifecycle branches
+    unrelated to steering payloads but exercised alongside them in the same
+    module (queue quotas, redrive, and claim blocking)."""
+
+    def test_redrive_run_returns_none_for_non_redrivable_status(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            # A freshly created run is "pending", not dead_letter/failed.
+            result = await repo.redrive_run("acme", run.id)
+            self.assertIsNone(result)
+
+        asyncio.run(scenario())
+
+    def test_create_run_respects_run_timeout_and_budget_config(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme",
+                None,
+                assistant,
+                _run_create(assistant.id).model_copy(
+                    update={"run_timeout": 42, "max_tool_calls": 3}
+                ),
+            )
+            self.assertEqual(run.config["run_timeout"], 42)
+            self.assertEqual(run.config["max_tool_calls"], 3)
+
+        asyncio.run(scenario())
+
+    def test_create_run_queued_quota_exceeded_raises(self) -> None:
+        async def scenario() -> None:
+            from lingxigraph.errors import ConcurrentRunError
+            from lingxigraph.server.repository import RepositoryLimits
+
+            repo = InMemoryRepository(
+                limits=RepositoryLimits(max_active_runs=10, max_queued_runs=1)
+            )
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            # First run stays "pending" (queued) since nothing claims it.
+            await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            with self.assertRaises(ConcurrentRunError):
+                await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+
+        asyncio.run(scenario())
+
+    def test_claim_run_skips_thread_blocked_pending_run(self) -> None:
+        """A pending run whose thread already has an active run must be
+        skipped by ``claim_run`` (blocked branch), leaving it unclaimed."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            first = await repo.create_run(
+                "acme", thread.id, assistant, _run_create(assistant.id)
+            )
+            claimed_first = await repo.claim_run("worker-1")
+            self.assertEqual(claimed_first.id, first.id)
+
+            await repo.create_run(
+                "acme", thread.id, assistant, _run_create(assistant.id)
+            )
+            # `second` is pending on the same thread as the still-running
+            # `first`, so claim_run must skip it and return None.
+            claimed_second = await repo.claim_run("worker-2")
+            self.assertIsNone(claimed_second)
 
         asyncio.run(scenario())
 
