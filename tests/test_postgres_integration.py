@@ -358,10 +358,10 @@ class PostgresIntegrationTests(unittest.TestCase):
                     metadata=event.metadata,
                     created_at=event.created_at,
                 ),
+                consumed_at=event.created_at,
                 node="n",
                 namespace=(),
                 task_id="t-0",
-                queue_latency_seconds=0.01,
             )
             await repo.commit_steering_consumptions("acme", run.id, [consumption])
             all_events = await repo.list_events("acme", run.id)
