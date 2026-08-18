@@ -39,10 +39,10 @@ jobs:
         working-directory: Wiki
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version-file: Wiki/.nvmrc
           cache: npm
@@ -55,7 +55,7 @@ jobs:
         run: npm run check
 
       - name: Upload static site
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lingxigraph-docs
           path: Wiki/out
@@ -72,18 +72,19 @@ jobs:
       deployments: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download static site
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: lingxigraph-docs
           path: Wiki/out
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
           command: pages deploy Wiki/out --project-name=lingxigraph-docs
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
