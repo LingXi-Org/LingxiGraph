@@ -198,7 +198,7 @@ events on whatever run eventually consumes it — no need to track every interme
 ### Payload size limits
 
 Serialized `payload` + `metadata` size is bounded (roughly 32KB by default, or the server's
-event byte cap, whichever is smaller); exceeding it returns `413`/`422` with error code
+event byte cap, whichever is smaller); exceeding it returns HTTP `413` with error code
 `payload_too_large` and creates no durable write. JSON values must be safely serializable
 plain types (string, number, boolean, null, array, object) — no binary data, cyclic
 references, or non-JSON-serializable custom types.
