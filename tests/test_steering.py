@@ -61,7 +61,8 @@ class SteeringChannelTests(unittest.TestCase):
             kind="user_input", payload={"message": "a"}, idempotency_key="msg-1"
         )
         second, created_second = channel.submit(
-            kind="user_input", payload={"message": "duplicate-should-be-ignored"},
+            kind="user_input",
+            payload={"message": "duplicate-should-be-ignored"},
             idempotency_key="msg-1",
         )
         self.assertTrue(created_first)
@@ -73,9 +74,7 @@ class SteeringChannelTests(unittest.TestCase):
         channel = SteeringChannel("run-1")
         channel.submit(kind="user_input", payload={}, idempotency_key="msg-1")
         channel.drain()
-        _, created = channel.submit(
-            kind="user_input", payload={}, idempotency_key="msg-1"
-        )
+        _, created = channel.submit(kind="user_input", payload={}, idempotency_key="msg-1")
         self.assertFalse(created)
 
     def test_payload_size_cap(self) -> None:
@@ -91,8 +90,13 @@ class SteeringChannelTests(unittest.TestCase):
 
         channel.ingest(
             SteeringEvent(
-                id="db-1", run_id="run-1", sequence=5, kind="user_input",
-                payload={}, metadata={}, created_at=datetime.now(UTC),
+                id="db-1",
+                run_id="run-1",
+                sequence=5,
+                kind="user_input",
+                payload={},
+                metadata={},
+                created_at=datetime.now(UTC),
             )
         )
         self.assertTrue(channel.has_pending)
@@ -416,11 +420,17 @@ class RepositorySteeringTests(unittest.TestCase):
                 "acme", run.id, kind="user_input", payload={"i": 2}
             )
             e3, c3 = await repo.submit_steering(
-                "acme", run.id, kind="user_input", payload={"i": 2},
+                "acme",
+                run.id,
+                kind="user_input",
+                payload={"i": 2},
                 idempotency_key="dup",
             )
             e3b, c3b = await repo.submit_steering(
-                "acme", run.id, kind="user_input", payload={"different": True},
+                "acme",
+                run.id,
+                kind="user_input",
+                payload={"different": True},
                 idempotency_key="dup",
             )
             self.assertTrue(c1 and c2 and c3)
@@ -450,9 +460,7 @@ class RepositorySteeringTests(unittest.TestCase):
             run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
             await repo.finish_run("acme", run.id, "succeeded", output={})
             with self.assertRaises(RunTerminalError):
-                await repo.submit_steering(
-                    "acme", run.id, kind="user_input", payload={}
-                )
+                await repo.submit_steering("acme", run.id, kind="user_input", payload={})
 
         asyncio.run(scenario())
 
@@ -679,9 +687,7 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
         async def scenario() -> None:
             repo = InMemoryRepository()
             with self.assertRaises(KeyError):
-                await repo.submit_steering(
-                    "acme", "no-such-run", kind="user_input", payload={}
-                )
+                await repo.submit_steering("acme", "no-such-run", kind="user_input", payload={})
 
         asyncio.run(scenario())
 
@@ -749,8 +755,7 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
             self.assertEqual(stored[0].data["steering_event_id"], e2.id)
 
             statuses = {
-                event.id: event.status
-                for event in await repo.list_steering("acme", run.id)
+                event.id: event.status for event in await repo.list_steering("acme", run.id)
             }
             self.assertEqual(statuses[e1.id], "pending")
             self.assertEqual(statuses[e2.id], "consumed")
@@ -791,9 +796,7 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
             assistant = await repo.create_assistant(
                 "acme", _assistant_create(), graph_version="1"
             )
-            old_run = await repo.create_run(
-                "acme", None, assistant, _run_create(assistant.id)
-            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
             consumed_event, _ = await repo.submit_steering(
                 "acme", old_run.id, kind="user_input", payload={"i": "done"}
             )
@@ -815,8 +818,7 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
             self.assertEqual(transferred[0].idempotency_key, "key-1")
 
             old_events = {
-                event.id: event.status
-                for event in await repo.list_steering("acme", old_run.id)
+                event.id: event.status for event in await repo.list_steering("acme", old_run.id)
             }
             self.assertEqual(old_events[consumed_event.id], "consumed")
             self.assertEqual(old_events[pending_event.id], "superseded")
@@ -908,9 +910,7 @@ class InMemoryRepositoryRunLifecycleEdgeCaseTests(unittest.TestCase):
             claimed_first = await repo.claim_run("worker-1")
             self.assertEqual(claimed_first.id, first.id)
 
-            await repo.create_run(
-                "acme", thread.id, assistant, _run_create(assistant.id)
-            )
+            await repo.create_run("acme", thread.id, assistant, _run_create(assistant.id))
             # `second` is pending on the same thread as the still-running
             # `first`, so claim_run must skip it and return None.
             claimed_second = await repo.claim_run("worker-2")
@@ -928,7 +928,9 @@ def _assistant_create():
 def _run_create(assistant_id: str, input: dict | None = None):
     from lingxigraph.server.models import RunCreate
 
-    return RunCreate(assistant_id=assistant_id, input=input if input is not None else {"value": 1})
+    return RunCreate(
+        assistant_id=assistant_id, input=input if input is not None else {"value": 1}
+    )
 
 
 MAX_STEERABLE_TICKS = 15
@@ -1017,12 +1019,12 @@ class ServerSteeringTests(unittest.TestCase):
             self.assertIn("run.steer.accepted", kinds)
             self.assertIn("run.steer.consumed", kinds)
             # accepted must precede consumed for the lifecycle to make sense.
-            self.assertLess(kinds.index("run.steer.accepted"), kinds.index("run.steer.consumed"))
+            self.assertLess(
+                kinds.index("run.steer.accepted"), kinds.index("run.steer.consumed")
+            )
 
     def test_duplicate_idempotency_key_does_not_duplicate(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             assistant = client.post(
@@ -1046,15 +1048,11 @@ class ServerSteeringTests(unittest.TestCase):
             ).json()
             self.assertEqual(first["id"], second["id"])
             self.assertEqual(first["sequence"], second["sequence"])
-            pending = asyncio.run(
-                app.state.repository.list_pending_steering("acme", run_id)
-            )
+            pending = asyncio.run(app.state.repository.list_pending_steering("acme", run_id))
             self.assertEqual(len(pending), 1)
 
     def test_terminal_run_returns_conflict_not_silent_event(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             assistant = client.post(
@@ -1077,9 +1075,7 @@ class ServerSteeringTests(unittest.TestCase):
             self.assertEqual(rejected.json()["code"], "run_terminal")
 
     def test_missing_run_returns_404(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             response = client.post(
@@ -1090,9 +1086,7 @@ class ServerSteeringTests(unittest.TestCase):
             self.assertEqual(response.status_code, 404)
 
     def test_payload_too_large_rejected(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             assistant = client.post(
@@ -1111,9 +1105,7 @@ class ServerSteeringTests(unittest.TestCase):
             self.assertEqual(response.status_code, 413)
 
     def test_queued_run_can_receive_steer_before_worker_claims_it(self) -> None:
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             assistant = client.post(
@@ -1124,7 +1116,9 @@ class ServerSteeringTests(unittest.TestCase):
                 headers=headers,
                 json={"assistant_id": assistant["id"], "input": {"ticks": 0, "drained": []}},
             ).json()
-            self.assertEqual(client.get(f"/v1/runs/{run['id']}", headers=headers).json()["status"], "pending")
+            self.assertEqual(
+                client.get(f"/v1/runs/{run['id']}", headers=headers).json()["status"], "pending"
+            )
             accepted = client.post(
                 f"/v1/runs/{run['id']}/steer",
                 headers=headers,
@@ -1162,7 +1156,10 @@ class ServerSteeringTests(unittest.TestCase):
             claimed = await crashed_worker.run_once()
             self.assertTrue(claimed)
             finished = await repository.get_run("acme", run.id)
-            self.assertEqual(finished.status.value if hasattr(finished.status, "value") else finished.status, "succeeded")
+            self.assertEqual(
+                finished.status.value if hasattr(finished.status, "value") else finished.status,
+                "succeeded",
+            )
             self.assertIn("stop", finished.output["drained"])
 
         asyncio.run(scenario())
@@ -1199,7 +1196,9 @@ class ServerSteeringTests(unittest.TestCase):
             )
             await task
             finished = await repository.get_run("acme", run.id)
-            status = finished.status.value if hasattr(finished.status, "value") else finished.status
+            status = (
+                finished.status.value if hasattr(finished.status, "value") else finished.status
+            )
             self.assertEqual(status, "succeeded")
             self.assertIn("stop", finished.output["drained"])
 
@@ -1213,9 +1212,7 @@ class ServerSteeringTests(unittest.TestCase):
         immediately and unconditionally -- a prior steer never blocks it.
         """
 
-        app = create_app(
-            registry=make_registry(), authenticator=Authenticator.insecure_dev()
-        )
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
         headers = {"x-tenant-id": "acme"}
         with TestClient(app) as client:
             assistant = client.post(
@@ -1238,9 +1235,7 @@ class ServerSteeringTests(unittest.TestCase):
             self.assertEqual(cancel.json()["status"], "cancelled")
             # The steer stays durably recorded (never rewound by cancel) but
             # will simply never be delivered since the run never executes.
-            pending = asyncio.run(
-                app.state.repository.list_pending_steering("acme", run_id)
-            )
+            pending = asyncio.run(app.state.repository.list_pending_steering("acme", run_id))
             self.assertEqual(len(pending), 1)
 
     def test_paused_run_steer_is_transferred_and_consumed_after_resume(self) -> None:
@@ -1297,9 +1292,7 @@ class ServerSteeringTests(unittest.TestCase):
                 json={"kind": "user_input", "payload": {"message": "while-paused"}},
             )
             self.assertEqual(accepted.status_code, 202)
-            pending = asyncio.run(
-                app.state.repository.list_pending_steering("acme", run_id)
-            )
+            pending = asyncio.run(app.state.repository.list_pending_steering("acme", run_id))
             self.assertEqual(len(pending), 1)
 
             resumed = client.post(
@@ -1319,9 +1312,7 @@ class ServerSteeringTests(unittest.TestCase):
             # went pending -> consumed there.
             old_events = asyncio.run(app.state.repository.list_steering("acme", run_id))
             self.assertEqual([event.status for event in old_events], ["superseded"])
-            new_events = asyncio.run(
-                app.state.repository.list_steering("acme", new_run_id)
-            )
+            new_events = asyncio.run(app.state.repository.list_steering("acme", new_run_id))
             self.assertEqual(len(new_events), 1)
             self.assertEqual(new_events[0].status, "consumed")
             self.assertEqual(new_events[0].payload, {"message": "while-paused"})
@@ -1482,6 +1473,122 @@ class ServerSteeringTests(unittest.TestCase):
 
             steering_rows = asyncio.run(app.state.repository.list_steering("acme", new_run_id))
             self.assertEqual(steering_rows[0].source_event_id, accepted_id)
+
+    def test_double_pause_resume_preserves_root_source_event_id(self) -> None:
+        """Issue #16 PR #17 review round 3, point 2: a *second* pause and
+        resume (A -> B -> C) must not overwrite the root ``source_event_id``
+        with the intermediate hop's id -- C's migrated event must still
+        correlate back to A, not B."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            from lingxigraph.server.models import RunCreate
+
+            run_a = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            event_a, _ = await repo.submit_steering(
+                "acme", run_a.id, kind="user_input", payload={"m": 1}
+            )
+            self.assertIsNone(event_a.source_event_id)
+            await repo.finish_run("acme", run_a.id, "paused", output={})
+
+            run_b, transferred_b = await repo.resume_run_with_pending_steering(
+                "acme",
+                run_a.thread_id,
+                assistant,
+                RunCreate(assistant_id=assistant.id, resume=1),
+                run_a.id,
+            )
+            self.assertEqual(len(transferred_b), 1)
+            event_b = transferred_b[0]
+            self.assertEqual(event_b.source_event_id, event_a.id)
+            self.assertEqual(event_b.created_at, event_a.created_at)
+            await repo.finish_run("acme", run_b.id, "paused", output={})
+
+            run_c, transferred_c = await repo.resume_run_with_pending_steering(
+                "acme",
+                run_b.thread_id,
+                assistant,
+                RunCreate(assistant_id=assistant.id, resume=1),
+                run_b.id,
+            )
+            self.assertEqual(len(transferred_c), 1)
+            event_c = transferred_c[0]
+            # Root identity A must survive, never be replaced by B's id.
+            self.assertEqual(event_c.source_event_id, event_a.id)
+            self.assertEqual(event_c.created_at, event_a.created_at)
+
+            from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+            steering_event = SteeringEvent(
+                id=event_c.id,
+                run_id=run_c.id,
+                sequence=event_c.sequence,
+                kind=event_c.kind,
+                payload=event_c.payload,
+                metadata=event_c.metadata,
+                created_at=event_c.created_at,
+                source_event_id=event_c.source_event_id,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+            stored = await repo.commit_steering_consumptions("acme", run_c.id, [consumption])
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].data["source_event_id"], event_a.id)
+
+        asyncio.run(scenario())
+
+    def test_commit_steering_consumptions_idempotent_on_retry(self) -> None:
+        """Issue #16 PR #17 review round 3, point 3: calling
+        ``commit_steering_consumptions`` twice with the same batch (a
+        worker retrying after an ack it never observed) must produce only
+        one ``run.steer.consumed`` lifecycle event, not two."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+
+            from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+            steering_event = SteeringEvent(
+                id=event.id,
+                run_id=run.id,
+                sequence=event.sequence,
+                kind=event.kind,
+                payload=event.payload,
+                metadata=event.metadata,
+                created_at=event.created_at,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+            first = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(len(first), 1)
+            second = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(second, [])
+
+            all_events = await repo.list_events("acme", run.id)
+            consumed = [e for e in all_events if e.kind == "run.steer.consumed"]
+            self.assertEqual(len(consumed), 1)
+
+        asyncio.run(scenario())
 
 
 def _assistant_create_named(graph_id: str):

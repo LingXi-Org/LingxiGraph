@@ -108,7 +108,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             )
             conn.execute(f'GRANT USAGE ON SCHEMA "{self.schema}" TO "{role}"')
             conn.execute(
-                f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA '
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "
                 f'"{self.schema}" TO "{role}"'
             )
             conn.execute(
@@ -263,6 +263,190 @@ class PostgresIntegrationTests(unittest.TestCase):
                 [e.kind for e in all_events if e.kind == "run.steer.consumed"],
                 ["run.steer.consumed"],
             )
+
+        asyncio.run(scenario())
+
+    def test_alembic_upgrade_head_applies_source_event_id(self) -> None:
+        """Issue #16 PR #17 review round 3, point 1.
+
+        ``PostgresRepository._setup_sync()`` applies the SQL migration
+        files directly and is *not* a substitute for driving the real
+        Alembic revision chain that a production deployment uses
+        (``alembic upgrade head``). This regresses that ``0002_steering``
+        -> ``0003_steering_source_event`` is reachable through Alembic
+        itself and actually creates the ``source_event_id`` column and its
+        partial index.
+        """
+
+        import psycopg
+        from alembic import command
+        from alembic.config import Config
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg = Config(os.path.join(repo_root, "alembic.ini"))
+        cfg.set_main_option("script_location", os.path.join(repo_root, "migrations"))
+        cfg.set_main_option("sqlalchemy.url", POSTGRES_URL)
+        os.environ["LINGXIGRAPH_POSTGRES_SCHEMA"] = self.schema
+
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
+            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+        try:
+            command.upgrade(cfg, "0002_steering")
+            with psycopg.connect(POSTGRES_URL) as conn:
+                exists = conn.execute(
+                    """SELECT 1 FROM information_schema.columns
+                    WHERE table_schema=%s AND table_name='run_steering_events'
+                    AND column_name='source_event_id'""",
+                    (self.schema,),
+                ).fetchone()
+                self.assertIsNone(exists, "source_event_id should not exist before head")
+
+            command.upgrade(cfg, "head")
+            with psycopg.connect(POSTGRES_URL) as conn:
+                column = conn.execute(
+                    """SELECT 1 FROM information_schema.columns
+                    WHERE table_schema=%s AND table_name='run_steering_events'
+                    AND column_name='source_event_id'""",
+                    (self.schema,),
+                ).fetchone()
+                self.assertIsNotNone(column, "alembic head must create source_event_id")
+                index = conn.execute(
+                    """SELECT 1 FROM pg_indexes
+                    WHERE schemaname=%s AND indexname='run_steering_events_source'""",
+                    (self.schema,),
+                ).fetchone()
+                self.assertIsNotNone(
+                    index, "alembic head must create the source_event_id index"
+                )
+        finally:
+            os.environ.pop("LINGXIGRAPH_POSTGRES_SCHEMA", None)
+
+    def test_pause_resume_pause_resume_preserves_root_source_event_id(self) -> None:
+        """Issue #16 PR #17 review round 3, point 2.
+
+        A -> B (resume) -> C (resume): ``source_event_id`` on C's migrated
+        steering event must still point at A, not B, and the eventual
+        ``run.steer.consumed`` event's ``queue_latency_seconds`` must be
+        computed from A's original acceptance ``created_at``.
+        """
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+
+            run_a = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event_a, _ = await repo.submit_steering(
+                "acme", run_a.id, kind="user_input", payload={"m": 1}
+            )
+            self.assertIsNone(event_a.source_event_id)
+            await repo.finish_run("acme", run_a.id, "paused", output={})
+
+            run_b, transferred_b = await repo.resume_run_with_pending_steering(
+                "acme",
+                thread.id,
+                assistant,
+                RunCreate(assistant_id=assistant.id, resume=1),
+                run_a.id,
+            )
+            self.assertEqual(len(transferred_b), 1)
+            event_b = transferred_b[0]
+            self.assertEqual(event_b.source_event_id, event_a.id)
+            self.assertEqual(event_b.created_at, event_a.created_at)
+            await repo.finish_run("acme", run_b.id, "paused", output={})
+
+            run_c, transferred_c = await repo.resume_run_with_pending_steering(
+                "acme",
+                thread.id,
+                assistant,
+                RunCreate(assistant_id=assistant.id, resume=1),
+                run_b.id,
+            )
+            self.assertEqual(len(transferred_c), 1)
+            event_c = transferred_c[0]
+            # Root identity A survives, not the intermediate hop B.
+            self.assertEqual(event_c.source_event_id, event_a.id)
+            self.assertEqual(event_c.created_at, event_a.created_at)
+
+            steering_event = SteeringEvent(
+                id=event_c.id,
+                run_id=run_c.id,
+                sequence=event_c.sequence,
+                kind=event_c.kind,
+                payload=event_c.payload,
+                metadata=event_c.metadata,
+                created_at=event_c.created_at,
+                source_event_id=event_c.source_event_id,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+            stored = await repo.commit_steering_consumptions("acme", run_c.id, [consumption])
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].data["source_event_id"], event_a.id)
+
+        asyncio.run(scenario())
+
+    def test_commit_steering_consumptions_is_idempotent_on_retry(self) -> None:
+        """Issue #16 PR #17 review round 3, point 3: a retried commit of
+        the same consumption batch (simulating a worker that resends after
+        an ack it never observed) must not produce a second
+        ``run.steer.consumed`` lifecycle event."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+            steering_event = SteeringEvent(
+                id=event.id,
+                run_id=run.id,
+                sequence=event.sequence,
+                kind=event.kind,
+                payload=event.payload,
+                metadata=event.metadata,
+                created_at=event.created_at,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+            first = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(len(first), 1)
+            second = await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            self.assertEqual(second, [])
+
+            all_events = await repo.list_events("acme", run.id)
+            consumed = [e for e in all_events if e.kind == "run.steer.consumed"]
+            self.assertEqual(len(consumed), 1)
 
         asyncio.run(scenario())
 

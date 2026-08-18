@@ -218,8 +218,7 @@ class InMemoryRepository:
                 (
                     run
                     for run in self._runs.values()
-                    if run.tenant_id == tenant_id
-                    and run.idempotency_key == idempotency_key
+                    if run.tenant_id == tenant_id and run.idempotency_key == idempotency_key
                 ),
                 None,
             )
@@ -232,18 +231,14 @@ class InMemoryRepository:
         tenant_runs = [run for run in self._runs.values() if run.tenant_id == tenant_id]
         active = [run for run in tenant_runs if enum_value(run.status) in ACTIVE]
         queued = [
-            run
-            for run in tenant_runs
-            if enum_value(run.status) == RunStatus.PENDING.value
+            run for run in tenant_runs if enum_value(run.status) == RunStatus.PENDING.value
         ]
         if len(active) >= self.limits.max_active_runs:
             raise ConcurrentRunError("tenant active-run quota exceeded")
         if len(queued) >= self.limits.max_queued_runs:
             raise ConcurrentRunError("tenant queued-run quota exceeded")
         same_thread = [
-            run
-            for run in active
-            if thread_id is not None and run.thread_id == thread_id
+            run for run in active if thread_id is not None and run.thread_id == thread_id
         ]
         strategy = MultitaskStrategy(request.multitask_strategy)
         if same_thread and strategy is MultitaskStrategy.REJECT:
@@ -286,9 +281,7 @@ class InMemoryRepository:
             value = self._runs.get((tenant_id, run_id))
             return value.model_copy(deep=True) if value else None
 
-    async def list_runs(
-        self, tenant_id: str, *, thread_id: str | None = None
-    ) -> list[Run]:
+    async def list_runs(self, tenant_id: str, *, thread_id: str | None = None) -> list[Run]:
         async with self._lock:
             values = [
                 run.model_copy(deep=True)
@@ -298,9 +291,7 @@ class InMemoryRepository:
             ]
         return sorted(values, key=lambda run: run.created_at, reverse=True)
 
-    async def claim_run(
-        self, worker_id: str, *, lease_seconds: int = 30
-    ) -> Run | None:
+    async def claim_run(self, worker_id: str, *, lease_seconds: int = 30) -> Run | None:
         now = utcnow()
         async with self._lock:
             for key, run in list(self._runs.items()):
@@ -603,15 +594,25 @@ class InMemoryRepository:
         async with self._lock:
             ids = {consumption.event.id for consumption in consumptions}
             events = self._steering.get((tenant_id, run_id), [])
+            transitioned: set[str] = set()
             for index, event in enumerate(events):
                 if event.id in ids and event.status != "consumed":
                     events[index] = event.model_copy(
                         update={"status": "consumed", "consumed_at": utcnow()}
                     )
+                    transitioned.add(event.id)
             run_events = self._events.setdefault((tenant_id, run_id), [])
             stored: list[RunEvent] = []
             for consumption in consumptions:
                 steering_event = consumption.event
+                if steering_event.id not in transitioned:
+                    # Already consumed by a previous call (idempotent
+                    # retry, e.g. a worker that re-sends the same batch
+                    # after an ack it never observed) -- do not emit a
+                    # second, semantically duplicate ``run.steer.consumed``
+                    # lifecycle event for it (issue #16 PR #17 review
+                    # point 3).
+                    continue
                 data: dict[str, Any] = {
                     "steering_event_id": steering_event.id,
                     "sequence": steering_event.sequence,
@@ -699,14 +700,14 @@ class InMemoryRepository:
                 metadata=dict(event.metadata),
                 idempotency_key=event.idempotency_key,
                 status="pending",
-                source_event_id=event.id,
+                source_event_id=event.source_event_id or event.id,
                 created_at=event.created_at,
             )
             new_events.append(new_event)
             if event.idempotency_key is not None:
-                self._steering_keys[
-                    (tenant_id, new_run_id, event.idempotency_key)
-                ] = new_event.id
+                self._steering_keys[(tenant_id, new_run_id, event.idempotency_key)] = (
+                    new_event.id
+                )
             transferred.append(new_event.model_copy(deep=True))
         return transferred
 
@@ -734,15 +735,11 @@ class InMemoryRepository:
 
         async with self._lock:
             run = self._create_run_locked(tenant_id, thread_id, assistant, request)
-            transferred = self._transfer_pending_steering_locked(
-                tenant_id, old_run_id, run.id
-            )
+            transferred = self._transfer_pending_steering_locked(tenant_id, old_run_id, run.id)
         await self._notify()
         return run.model_copy(deep=True), transferred
 
-    async def create_schedule(
-        self, tenant_id: str, request: ScheduleCreate
-    ) -> Schedule:
+    async def create_schedule(self, tenant_id: str, request: ScheduleCreate) -> Schedule:
         schedule = Schedule(tenant_id=tenant_id, **request.model_dump())
         async with self._lock:
             self._schedules[(tenant_id, schedule.id)] = schedule
@@ -792,12 +789,8 @@ class InMemoryRepository:
                     if tenant == tenant_id
                 ),
                 "threads": sum(tenant == tenant_id for tenant, _ in self._threads),
-                "assistants": sum(
-                    tenant == tenant_id for tenant, _ in self._assistants
-                ),
-                "schedules": sum(
-                    tenant == tenant_id for tenant, _ in self._schedules
-                ),
+                "assistants": sum(tenant == tenant_id for tenant, _ in self._assistants),
+                "schedules": sum(tenant == tenant_id for tenant, _ in self._schedules),
             }
 
     async def wait_for_change(self, timeout: float = 1.0) -> None:
@@ -837,7 +830,9 @@ class PostgresRepository(InMemoryRepository):
             from psycopg.rows import dict_row
             from psycopg.types.json import Jsonb
         except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("install lingxigraph[postgres] to use PostgresRepository") from exc
+            raise RuntimeError(
+                "install lingxigraph[postgres] to use PostgresRepository"
+            ) from exc
         self._psycopg = psycopg
         self._dict_row = dict_row
         self._jsonb = Jsonb
@@ -866,9 +861,7 @@ class PostgresRepository(InMemoryRepository):
 
         migrations_dir = files("lingxigraph.server").joinpath("migrations")
         names = sorted(
-            entry.name
-            for entry in migrations_dir.iterdir()
-            if entry.name.endswith(".sql")
+            entry.name for entry in migrations_dir.iterdir() if entry.name.endswith(".sql")
         )
         with self._connect() as conn, conn.cursor() as cursor:
             for name in names:
@@ -1203,9 +1196,7 @@ class PostgresRepository(InMemoryRepository):
             return cursor.rowcount > 0
 
     async def finish_run(self, tenant_id, run_id, status, *, output=None, error=None):
-        await asyncio.to_thread(
-            self._finish_run_sync, tenant_id, run_id, status, output, error
-        )
+        await asyncio.to_thread(self._finish_run_sync, tenant_id, run_id, status, output, error)
         value = await self.get_run(tenant_id, run_id)
         assert value is not None
         return value
@@ -1273,9 +1264,7 @@ class PostgresRepository(InMemoryRepository):
         }
 
     async def append_event(self, tenant_id, run_id, kind, data):
-        return await asyncio.to_thread(
-            self._append_event_sync, tenant_id, run_id, kind, data
-        )
+        return await asyncio.to_thread(self._append_event_sync, tenant_id, run_id, kind, data)
 
     def _append_event_sync(self, tenant_id, run_id, kind, data):
         event = RunEvent(tenant_id=tenant_id, run_id=run_id, sequence=0, kind=kind, data=data)
@@ -1475,9 +1464,18 @@ class PostgresRepository(InMemoryRepository):
             cursor.execute(
                 f"""UPDATE {self._schema}.run_steering_events
                 SET status='consumed', consumed_at=NOW()
-                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'""",
+                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'
+                RETURNING id""",
                 (tenant_id, run_id, ids),
             )
+            # Only ids that *actually* transitioned pending/delivered ->
+            # consumed in this call. A retried batch (e.g. a worker that
+            # re-sends consumptions after a commit whose ack it never saw)
+            # must not emit a second, semantically duplicate
+            # ``run.steer.consumed`` lifecycle event for a row some
+            # earlier call already consumed (issue #16 PR #17 review
+            # point 3).
+            transitioned = {row["id"] for row in cursor.fetchall()}
             # Same locking discipline as ``_append_event_sync``: lock the
             # run row first so concurrent event appenders for this run
             # serialize their sequence assignment instead of racing.
@@ -1493,8 +1491,10 @@ class PostgresRepository(InMemoryRepository):
             next_sequence = int(cursor.fetchone()["next"])
             stored: list[RunEvent] = []
             for consumption in consumptions:
-                next_sequence += 1
                 event = consumption.event
+                if event.id not in transitioned:
+                    continue
+                next_sequence += 1
                 data: dict[str, Any] = {
                     "steering_event_id": event.id,
                     "sequence": event.sequence,
@@ -1709,7 +1709,7 @@ class PostgresRepository(InMemoryRepository):
                         metadata=dict(row["metadata"] or {}),
                         idempotency_key=row["idempotency_key"],
                         status="pending",
-                        source_event_id=row["id"],
+                        source_event_id=row["source_event_id"] or row["id"],
                         created_at=row["created_at"],
                     )
                     cursor.execute(
@@ -1874,8 +1874,7 @@ class PostgresRepository(InMemoryRepository):
             counts: dict[str, int] = {}
             for name in ("run_events", "threads", "assistants", "schedules"):
                 cursor.execute(
-                    f"SELECT COUNT(*) AS count FROM {self._schema}.{name} "
-                    "WHERE tenant_id=%s",
+                    f"SELECT COUNT(*) AS count FROM {self._schema}.{name} WHERE tenant_id=%s",
                     (tenant_id,),
                 )
                 counts[name] = int(cursor.fetchone()["count"])
@@ -1929,7 +1928,9 @@ class PostgresRepository(InMemoryRepository):
         value = dict(row)
         value["goto"] = value.pop("goto_node", None)
         for name in ("input", "context", "config", "metadata", "error", "output"):
-            value[name] = value.get(name) or ({} if name in {"context", "config", "metadata"} else None)
+            value[name] = value.get(name) or (
+                {} if name in {"context", "config", "metadata"} else None
+            )
         return Run.model_validate(value)
 
 
