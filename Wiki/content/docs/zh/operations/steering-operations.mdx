@@ -74,14 +74,17 @@ lease/attempt-fenced 事务中一起提交——不再是两次分别提交、�
 彼此脱节的写入。随后该 run 会以之前已经算出的结果正常终结——**不会**仅仅因为存在一条
 steering 事件就走 retry/dead-letter 循环，因为那样会给一个本就合法地从不调用
 `drain_steering()` 的图强加一次不必要的重跑。**一个终态 run 自身的终结决策绝不能让一条
-未被消费的 steering 事件被静默搁置、没有任何 durable、可观测的归宿**——但这并不意味着
-任何终态 run 都不可能携带 `pending` 的 steering 行：一个耗尽投递尝试次数而被 dead-letter
-（或直接 failed）的 run，完全可能合法地留下图根本没来得及消费的、仍是 `pending` 的
-steering，作为刻意保留的 durable 历史记录，之后由 `/redrive` 像任何其他排队中的 steering
-一样重新拾起。但 `/redrive` 只接受 `failed`/`dead_letter` 状态的 run——一次普通的、由
-客户端发起的 **cancel** 不在这条恢复路径之内，因此留在 `cancelled` run 上的 `pending`
-steering 目前没有任何自动的未来投递机会。完整策略见 steering 概念页"终结流程与 steering
-准入边界"一节。
+未被消费的 steering 事件被静默搁置、没有任何 durable、可观测的归宿**——一次由图自身计算出的
+普通 `failed`/`dead_letter` 结果，会像 `succeeded`/`cancelled` 一样封闭准入并 supersede
+遗留行。唯一更窄的例外是：某次 run 的**最终 steering flush 本身就无法持久提交**
+（`_retry_or_dead_letter()`），这条路径根本不会走到
+`finalize_run_with_steering_disposition_if_owned()`，而是转而让这次投递尝试走普通的
+retry/dead-letter 流程——只有在这种情况下，一个 `dead_letter` 的 run 才可能合法地仍然携带
+`pending` 的 steering 行，作为刻意保留的 durable 历史记录，之后由 `/redrive` 像任何其他排队
+中的 steering 一样重新拾起。但 `/redrive` 只接受 `failed`/`dead_letter` 状态的 run——一次
+普通的、由客户端发起的 **cancel** 不在这条恢复路径之内，因此留在 `cancelled` run 上的
+`pending` steering 目前没有任何自动的未来投递机会。完整策略见 steering 概念页"终结流程与
+steering 准入边界"一节。
 
 ## 幂等重放在所有准入闸门前都是安全的
 

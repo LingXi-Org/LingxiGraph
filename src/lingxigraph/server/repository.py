@@ -510,6 +510,99 @@ class InMemoryRepository:
         await self._notify()
         return updated.model_copy(deep=True)
 
+    async def retry_run_with_event_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        error: dict[str, Any] | None = None,
+        max_attempts: int | None = None,
+    ) -> tuple[Run, RunEvent | None] | None:
+        """Merge the retry-to-pending transition and its ``worker_retrying``
+        lifecycle event into one atomic operation.
+
+        Issue #16 PR #17 review round 10, point 1 (BLOCKER):
+        ``retry_run_if_owned()`` (the status write) and the caller's
+        subsequent ``append_event("worker_retrying")`` used to be two
+        separate durable decisions/transactions. That reopened a TOCTOU
+        window: (race A) a concurrent cancel landing in the gap between the
+        status write committing and the event append could see this worker
+        append a now-stale ``worker_retrying`` event for a run that had
+        already, durably, moved on to ``cancelled``; (race B) a *new*
+        worker could claim the run (``pending -> running``, attempt N+1)
+        in that same gap and log its own attempt-N+1 events *before* the
+        stale attempt-N ``worker_retrying`` event finally landed, inverting
+        the durable event stream's causal order. Folding both writes into
+        one lock critical section (no ``await`` between the status
+        transition and the event append) makes both races impossible: the
+        instant ``pending``/``cancelled`` becomes visible, the matching
+        event (or lack of one, for ``cancelled``) is already durable too.
+
+        Returns ``(updated_run, event)`` where ``event`` is the appended
+        ``worker_retrying`` :class:`RunEvent` when the run actually
+        transitioned to ``pending``, or ``(cancelled_run, None)`` when
+        cancellation won the race instead (mirroring
+        ``retry_run_if_owned``'s existing cancel-wins coercion -- no
+        ``worker_retrying`` event is ever appended for a run that is really
+        ``cancelled``). Returns ``None`` if the lease was no longer owned,
+        identically to ``retry_run_if_owned``.
+        """
+
+        async with self._lock:
+            key = (tenant_id, run_id)
+            run = self._runs.get(key)
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            if enum_value(run.status) == RunStatus.CANCELLING.value:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.CANCELLED.value,
+                        "error": {
+                            "code": "run_cancelled",
+                            "message": "run was cancelled during finalization",
+                        },
+                        "finished_at": utcnow(),
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }
+                )
+                self._runs[key] = updated
+                event = None
+            else:
+                updated = run.model_copy(
+                    update={
+                        "status": RunStatus.PENDING.value,
+                        "error": error,
+                        "finished_at": None,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                        "steering_closed": False,
+                    }
+                )
+                self._runs[key] = updated
+                run_events = self._events.setdefault(key, [])
+                event = RunEvent(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    sequence=len(run_events) + 1,
+                    kind="worker_retrying",
+                    data={
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": error,
+                    },
+                )
+                run_events.append(event)
+        await self._notify()
+        return updated.model_copy(deep=True), (event.model_copy(deep=True) if event else None)
+
     async def close_steering(
         self, tenant_id: str, run_id: str, worker_id: str, attempt: int
     ) -> bool:
@@ -523,19 +616,26 @@ class InMemoryRepository:
         execution ends (before the final flush starts) so a concurrent
         ``/steer`` either lands before this gate closes (and gets synced
         in as usual, or -- round 7, point 1 -- durably lands but is
-        detected as still-pending by the caller's post-flush check, see
-        below) or after it closes (and is rejected with a stable error) --
-        never durably accepted into a channel nobody will ever drain
-        again. Fenced the same way as ``finish_run_if_owned``: a stale
-        worker that has already lost its lease cannot close the gate on
-        the new owner's behalf.
+        detected as still-pending by the caller's post-flush disposition
+        call, see below) or after it closes (and is rejected with a
+        stable error) -- never durably accepted into a channel nobody
+        will ever drain again. Fenced the same way as
+        ``finish_run_if_owned``: a stale worker that has already lost its
+        lease cannot close the gate on the new owner's behalf.
 
-        Issue #16 PR #17 review round 7, point 1 (BLOCKER): this alone is
-        *not* sufficient to prevent a permanently-pending steering row --
-        see ``Worker._execute``'s post-flush ``list_pending_steering``
-        check, which is what actually catches a row that was durably
-        accepted a moment before this call locked the run (and therefore
-        was never, and can never be, ingested by this attempt's channel).
+        Issue #16 PR #17 review round 7, point 1 (BLOCKER), updated per
+        round 9, point 2: this alone is *not* sufficient to prevent a
+        permanently-pending steering row -- see
+        ``finalize_run_with_steering_disposition_if_owned()``, which the
+        Worker's post-flush finalization calls -- it is what actually
+        catches a row that was durably accepted a moment before this call
+        locked the run (and therefore was never, and can never be,
+        ingested by this attempt's channel), transitioning it to
+        ``superseded`` in the same transaction as the terminal status
+        write. (Round 7 originally described this check as a separate
+        ``Worker._execute`` post-flush ``list_pending_steering`` call;
+        round 9 merged that disposition into
+        ``finalize_run_with_steering_disposition_if_owned()`` itself.)
         Deliberately *not* checked here: at the instant this call runs,
         the graph may have already drained events into the channel's local
         consumption log without those rows having been committed
@@ -1793,7 +1893,7 @@ class PostgresRepository(InMemoryRepository):
     async def finish_run_if_owned(
         self, tenant_id, run_id, worker_id, attempt, status, *, output=None, error=None
     ) -> Run | None:
-        changed = await asyncio.to_thread(
+        row = await asyncio.to_thread(
             self._finish_run_if_owned_sync,
             tenant_id,
             run_id,
@@ -1803,15 +1903,13 @@ class PostgresRepository(InMemoryRepository):
             output,
             error,
         )
-        if not changed:
+        if row is None:
             return None
-        value = await self.get_run(tenant_id, run_id)
-        assert value is not None
-        return value
+        return self._run_from_row(row)
 
     def _finish_run_if_owned_sync(
         self, tenant_id, run_id, worker_id, attempt, status, output, error
-    ) -> bool:  # pragma: no cover -- exercised only against a live Postgres in the `postgres` CI job, not `quality`'s coverage gate
+    ):  # pragma: no cover -- exercised only against a live Postgres in the `postgres` CI job, not `quality`'s coverage gate
         # Fenced/CAS'd terminal-status write (issue #16 PR #17 review round
         # 6, point 1, BLOCKER). Selecting the row ``FOR UPDATE`` first --
         # filtered on lease_owner/attempt/status, mirroring the pattern
@@ -1845,10 +1943,16 @@ class PostgresRepository(InMemoryRepository):
                     "code": "run_cancelled",
                     "message": "run was cancelled during finalization",
                 }
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): use
+            # ``RETURNING *`` so the row this async wrapper hands back to
+            # the caller is the *same transaction's own* resulting
+            # snapshot, not a separate, later ``get_run()`` read that a
+            # concurrent write (e.g. a racing ``/redrive`` or unfenced
+            # ``retry_run()``) could observe a different value through.
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET status=%s, output=%s, error=%s,
                 finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
-                WHERE tenant_id=%s AND id=%s""",
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
                 (
                     final_status,
                     self._jsonb(final_output) if final_output is not None else None,
@@ -1857,21 +1961,19 @@ class PostgresRepository(InMemoryRepository):
                     run_id,
                 ),
             )
-            return True
+            return cursor.fetchone()
 
     async def retry_run_if_owned(
         self, tenant_id, run_id, worker_id, attempt, *, error=None
     ) -> Run | None:
-        changed = await asyncio.to_thread(
+        row = await asyncio.to_thread(
             self._retry_run_if_owned_sync, tenant_id, run_id, worker_id, attempt, error
         )
-        if not changed:
+        if row is None:
             return None
-        value = await self.get_run(tenant_id, run_id)
-        assert value is not None
-        return value
+        return self._run_from_row(row)
 
-    def _retry_run_if_owned_sync(self, tenant_id, run_id, worker_id, attempt, error) -> bool:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    def _retry_run_if_owned_sync(self, tenant_id, run_id, worker_id, attempt, error):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
@@ -1882,14 +1984,18 @@ class PostgresRepository(InMemoryRepository):
             )
             row = cursor.fetchone()
             if row is None:
-                return False
+                return None
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): return
+            # the transaction's own ``RETURNING *`` snapshot, not a
+            # separate later ``get_run()`` read (see the matching comment
+            # on ``_finish_run_if_owned_sync``).
             if row["status"] == "cancelling":
                 # Cancellation wins: never send a cancelling run back to
                 # pending because of a stale worker's retry decision.
                 cursor.execute(
                     f"""UPDATE {self._schema}.runs SET status='cancelled', error=%s,
                     finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
-                    WHERE tenant_id=%s AND id=%s""",
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
                     (
                         self._jsonb(
                             {
@@ -1906,10 +2012,131 @@ class PostgresRepository(InMemoryRepository):
                     f"""UPDATE {self._schema}.runs SET status='pending',
                     error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
                     steering_closed=FALSE
-                    WHERE tenant_id=%s AND id=%s""",
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
                     (self._jsonb(error) if error is not None else None, tenant_id, run_id),
                 )
-            return True
+            return cursor.fetchone()
+
+    async def retry_run_with_event_if_owned(
+        self,
+        tenant_id,
+        run_id,
+        worker_id,
+        attempt,
+        *,
+        error=None,
+        max_attempts=None,
+    ) -> tuple[Run, RunEvent | None] | None:
+        """SQL counterpart of
+        :meth:`InMemoryRepository.retry_run_with_event_if_owned` (issue
+        #16 PR #17 review round 10, point 1, BLOCKER). One real PostgreSQL
+        transaction covers: locking the run row, re-checking the fence and
+        control state (cancel-wins), writing the retry-to-pending (or
+        cancel-wins) status transition, and -- only when the transition
+        actually lands on ``pending`` -- inserting the matching
+        ``worker_retrying`` :class:`RunEvent` in the *same* transaction, so
+        both the status write and the event become externally visible
+        together or not at all. This closes the race a separate
+        ``retry_run_if_owned()`` + ``append_event()`` pair left open: a
+        concurrent cancel or a new worker's claim landing in the gap
+        between two independently-committed writes could previously
+        observe (or produce) a stale/out-of-order ``worker_retrying``
+        event.
+        """
+
+        result = await asyncio.to_thread(
+            self._retry_run_with_event_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            error,
+            max_attempts,
+        )
+        if result is None:
+            return None
+        row, event = result
+        return self._run_from_row(row), event
+
+    def _retry_run_with_event_if_owned_sync(  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+        self, tenant_id, run_id, worker_id, attempt, error, max_attempts
+    ):
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            if row["status"] == "cancelling":
+                # Cancellation wins: never send a cancelling run back to
+                # pending, and never emit a ``worker_retrying`` event for a
+                # run that is really cancelled.
+                cursor.execute(
+                    f"""UPDATE {self._schema}.runs SET status='cancelled', error=%s,
+                    finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+                    WHERE tenant_id=%s AND id=%s RETURNING *""",
+                    (
+                        self._jsonb(
+                            {
+                                "code": "run_cancelled",
+                                "message": "run was cancelled during finalization",
+                            }
+                        ),
+                        tenant_id,
+                        run_id,
+                    ),
+                )
+                updated_row = cursor.fetchone()
+                return updated_row, None
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET status='pending',
+                error=%s, finished_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                steering_closed=FALSE
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
+                (self._jsonb(error) if error is not None else None, tenant_id, run_id),
+            )
+            updated_row = cursor.fetchone()
+            # Same transaction, same lock: allocate the next RunEvent
+            # sequence and insert ``worker_retrying`` here, not via a
+            # later, separately-committed ``append_event()`` call.
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+                FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, run_id),
+            )
+            sequence = int(cursor.fetchone()["next"])
+            data: dict[str, Any] = {
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "error": error,
+            }
+            event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=sequence,
+                kind="worker_retrying",
+                data=data,
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_events
+                (id,tenant_id,run_id,sequence,kind,data,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    event.id,
+                    tenant_id,
+                    run_id,
+                    sequence,
+                    "worker_retrying",
+                    self._jsonb(data),
+                    event.created_at,
+                ),
+            )
+            return updated_row, event
 
     async def close_steering(self, tenant_id, run_id, worker_id, attempt) -> bool:
         return await asyncio.to_thread(
@@ -1920,8 +2147,9 @@ class PostgresRepository(InMemoryRepository):
         """SQL counterpart of
         :meth:`InMemoryRepository.close_steering` -- see its docstring for
         why no "undrained" check happens here (issue #16 PR #17 review
-        round 7, point 1, BLOCKER; the real check is the caller's
-        post-flush ``list_pending_steering`` in ``Worker._execute``).
+        round 7, point 1, BLOCKER; the real check, as of round 9, point 2,
+        is ``finalize_run_with_steering_disposition_if_owned()``, which the
+        Worker's post-flush finalization calls).
         """
 
         with self._connect() as conn, conn.cursor() as cursor:
@@ -2310,10 +2538,8 @@ class PostgresRepository(InMemoryRepository):
         )
         if result is None:
             return None
-        stored_events = result
-        value = await self.get_run(tenant_id, run_id)
-        assert value is not None
-        return value, stored_events
+        row, stored_events = result
+        return self._run_from_row(row), stored_events
 
     def _finalize_run_with_steering_disposition_if_owned_sync(
         self,
@@ -2326,7 +2552,7 @@ class PostgresRepository(InMemoryRepository):
         error,
         supersede_pending: bool,
         supersede_reason: str,
-    ) -> list[RunEvent] | None:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         """SQL counterpart of
         :meth:`InMemoryRepository.finalize_run_with_steering_disposition_if_owned`
         (issue #16 PR #17 review round 9, point 2, BLOCKER). One real
@@ -2396,10 +2622,15 @@ class PostgresRepository(InMemoryRepository):
                     "code": "run_cancelled",
                     "message": "run was cancelled during finalization",
                 }
+            # Issue #16 PR #17 review round 10, point 2 (REQUIRED): return
+            # this transaction's own ``RETURNING *`` snapshot alongside the
+            # superseded events, instead of a separate later ``get_run()``
+            # a concurrent write (e.g. ``/redrive`` or the unfenced
+            # ``retry_run()``) could race ahead of.
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET status=%s, output=%s, error=%s,
                 finished_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
-                WHERE tenant_id=%s AND id=%s""",
+                WHERE tenant_id=%s AND id=%s RETURNING *""",
                 (
                     final_status,
                     self._jsonb(final_output) if final_output is not None else None,
@@ -2408,7 +2639,7 @@ class PostgresRepository(InMemoryRepository):
                     run_id,
                 ),
             )
-            return stored
+            return cursor.fetchone(), stored
 
     async def supersede_pending_steering_if_owned(
         self, tenant_id, run_id, worker_id, attempt

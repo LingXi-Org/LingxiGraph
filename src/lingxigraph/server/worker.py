@@ -28,7 +28,7 @@ from ..steering import SteeringEvent
 from ..store import BaseStore, InMemoryStore
 from ..types import Command, RunStatus
 from .eventbus import EventBus, InMemoryEventBus
-from .models import Run
+from .models import Run, RunEvent
 from .registry import GraphRegistry
 from .repository import InMemoryRepository
 
@@ -271,7 +271,7 @@ class Worker:
         # line. Closing/superseding steering on retry meant any steering
         # durably accepted but not yet drained by this attempt was marked
         # ``superseded`` here and then, moments later, the Run was sent
-        # back to ``pending`` by ``retry_run_if_owned`` -- so the next
+        # back to ``pending`` by ``retry_run_with_event_if_owned`` -- so the next
         # attempt's ``_sync_steering_in`` (which only re-ingests
         # ``pending``/``delivered`` rows) could never see it again,
         # permanently losing steering on the very next delivery attempt.
@@ -385,7 +385,7 @@ class Worker:
             # ordinary delivery failure uses, so a later delivery attempt
             # resyncs and retries the commit from the still-``pending`` DB
             # row. Every write below is fenced on (lease_owner, attempt) --
-            # see ``finish_run_if_owned``/``retry_run_if_owned`` -- so a
+            # see ``finish_run_if_owned``/``retry_run_with_event_if_owned`` -- so a
             # worker that has lost its lease mid-flush can never revert a
             # new owner's run back to pending or overwrite its status
             # (review round 6, point 1, BLOCKER).
@@ -433,7 +433,7 @@ class Worker:
 
         Issue #16 PR #17 review round 6, points 1 and 2 (BLOCKER): this
         write is fenced on our own ``(lease_owner, attempt)`` via
-        ``finish_run_if_owned``/``retry_run_if_owned`` -- if we no longer
+        ``finish_run_if_owned``/``retry_run_with_event_if_owned`` -- if we no longer
         hold the lease (a new worker claimed the run while our flush was
         still in flight), the write is refused entirely and this returns
         ``False`` so the caller does not call ``forget_steering()`` on a
@@ -444,16 +444,22 @@ class Worker:
         """
 
         if intent.kind == "retry":
-            updated = await self.repository.retry_run_if_owned(
-                run.tenant_id, run.id, self.worker_id, run.attempt, error=intent.error
+            result = await self.repository.retry_run_with_event_if_owned(
+                run.tenant_id,
+                run.id,
+                self.worker_id,
+                run.attempt,
+                error=intent.error,
+                max_attempts=self.max_delivery_attempts,
             )
-            if updated is None:
+            if result is None:
                 logger.warning(
                     "run retry commit abandoned: lease no longer owned",
                     extra={"run_id": run.id, "tenant_id": run.tenant_id},
                 )
                 return False
-            await self._emit_retry_outcome_event(run, updated, intent.error)
+            retried_run, event = result
+            await self._log_retry_outcome_event(run, retried_run, event)
             return True
 
         updated = await self.repository.finish_run_if_owned(
@@ -505,49 +511,31 @@ class Worker:
                 },
             )
 
-    async def _emit_retry_outcome_event(
-        self, run: Run, updated: Run, error: dict[str, Any] | None
+    async def _log_retry_outcome_event(
+        self, run: Run, updated: Run, event: RunEvent | None
     ) -> None:
-        """Emit the correct lifecycle event for a fenced retry write's
-        *actual* resulting status.
+        """Publish/log the outcome of a merged retry-with-event write.
 
-        Issue #16 PR #17 review round 8, point 2 (BLOCKER):
-        ``retry_run_if_owned`` already correctly coerces the transition to
-        ``cancelled`` when the same fenced transaction observes the run is
-        ``cancelling`` -- it does not send it back to ``pending``. But the
-        caller used to only check ``updated is not None`` and then
-        unconditionally append a ``worker_retrying`` event and log
-        "pending", regardless of what the write actually did. That made the
-        SSE/audit/operator-facing event stream self-contradictory: a
-        "retrying" event could be durably appended even though the run's
-        real, already-committed status was ``cancelled``. This branches on
-        ``updated.status`` -- the actual resulting status -- instead: only
-        an actual ``pending`` result emits ``worker_retrying``; an actual
-        ``cancelled`` result emits nothing here (the cancellation path's
-        own event/logging already covers it) since no durable status
-        change happened as a result of "retry" beyond what cancellation
-        itself dictated.
+        Issue #16 PR #17 review round 10, point 1 (BLOCKER): the status
+        transition and the ``worker_retrying`` event are now written
+        together, atomically, by
+        ``repository.retry_run_with_event_if_owned`` -- so unlike the old
+        ``_emit_retry_outcome_event`` this method never decides *whether*
+        to append an event; it only publishes the event the repository
+        already durably created (when the transition actually landed on
+        ``pending``) or logs the cancel-wins outcome (when it didn't,
+        ``event`` is ``None``).
         """
 
         final_status = updated.status if isinstance(updated.status, str) else updated.status.value
-        if final_status != RunStatus.PENDING.value:
+        if event is None:
             if final_status == RunStatus.CANCELLED.value:
                 logger.info(
                     "run cancelled during finalization, retry request superseded by cancel",
                     extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "cancelled"},
                 )
             return
-        stored = await self.repository.append_event(
-            run.tenant_id,
-            run.id,
-            "worker_retrying",
-            {
-                "attempt": run.attempt,
-                "max_attempts": self.max_delivery_attempts,
-                "error": error,
-            },
-        )
-        await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+        await self.event_bus.publish(run.tenant_id, run.id, event.sequence)
         logger.warning(
             "run delivery scheduled for retry",
             extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
@@ -582,16 +570,22 @@ class Worker:
         """
 
         if run.attempt < self.max_delivery_attempts:
-            updated = await self.repository.retry_run_if_owned(
-                run.tenant_id, run.id, self.worker_id, run.attempt, error=error
+            result = await self.repository.retry_run_with_event_if_owned(
+                run.tenant_id,
+                run.id,
+                self.worker_id,
+                run.attempt,
+                error=error,
+                max_attempts=self.max_delivery_attempts,
             )
-            if updated is None:
+            if result is None:
                 logger.warning(
                     "run finalization abandoned: lease lost during retry",
                     extra={"run_id": run.id, "tenant_id": run.tenant_id},
                 )
                 return
-            await self._emit_retry_outcome_event(run, updated, error)
+            retried_run, event = result
+            await self._log_retry_outcome_event(run, retried_run, event)
         else:
             updated = await self.repository.finish_run_if_owned(
                 run.tenant_id,

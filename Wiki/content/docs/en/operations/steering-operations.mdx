@@ -84,14 +84,17 @@ loss between them. The run then finalizes normally with its already-computed out
 **not** routed through a retry/dead-letter loop just because a steering event happened to
 exist, since doing so would force a rerun onto a graph that may be correctly, deliberately
 never calling `drain_steering()` at all. **A terminal run's own finalization decision can never
-silently strand an unconsumed steering event without a durable, observable disposition** — but
-this does not mean no terminal run can ever carry a `pending` steering row for any reason: a
-run that exhausts delivery attempts and is dead-lettered (or fails outright) can legitimately
-leave steering the graph never got around to draining still `pending` as deliberate durable
-history, picked back up by a later `/redrive` like any other queued steering. `/redrive` only
-accepts `failed`/`dead_letter` runs, though — an ordinary client-initiated **cancel** is not
-covered by that recovery path, so steering left `pending` on a `cancelled` run has no automatic
-future delivery attempt today. See the steering concept page's "Finalization and the steering
+silently strand an unconsumed steering event without a durable, observable disposition** — an
+ordinary `failed`/`dead_letter` outcome computed by the graph closes admission and supersedes
+leftovers exactly like `succeeded`/`cancelled` do. The one narrower exception is a run whose
+*final steering flush itself* could never durably commit (`_retry_or_dead_letter()`), which never
+reaches `finalize_run_with_steering_disposition_if_owned()` at all and instead routes the attempt
+through the ordinary retry/dead-letter machinery — only there can a `dead_letter` run legitimately
+still carry a `pending` steering row, as deliberate durable history, picked back up by a later
+`/redrive` like any other queued steering. `/redrive` only accepts `failed`/`dead_letter` runs,
+though — an ordinary client-initiated **cancel** is not covered by that recovery path, so steering
+left `pending` on a `cancelled` run has no automatic future delivery attempt today. See the
+steering concept page's "Finalization and the steering
 admission boundary" section for the full policy.
 
 ## Idempotent replay is safe across every admission gate

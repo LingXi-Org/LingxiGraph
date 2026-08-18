@@ -137,8 +137,9 @@ run 行锁**之前**先抢到锁并完成 durable 提交——即便此时图早
 `unconsumed_at_final_boundary`），并伴随一条 `run.steer.superseded` 生命周期事件，二者与该
 run 的终结状态写入在**同一个** lease/attempt-fenced 事务中一起提交——不再是两次分别提交、
 可能在崩溃或 lease 丢失之间彼此脱节的写入（见 `finalize_run_with_steering_disposition_if_owned`）。
-随后该 run 会以之前已经算出的结果（`succeeded`、`paused`、`failed` 等）正常终结——**不会**
-仅仅因为存在一条 steering 事件就被强制进入重试循环。
+随后该 run 会以之前已经算出的结果（`succeeded`、`failed`、`dead_letter` 等——除 `paused`
+以外的任何终态，见下文）正常终结——**不会**仅仅因为存在一条 steering 事件就被强制进入重试
+循环。
 
 `unconsumed_at_final_boundary` 是一个刻意保持笼统的原因标签，**并不**声称发生了竞争。它
 涵盖两种 Runtime 目前无法从现有数据中区分的情况：上面描述的锁竞争，以及更常见的情况——
@@ -148,18 +149,24 @@ run 的终结状态写入在**同一个** lease/attempt-fenced 事务中一起�
 被记录为 `superseded`，绝不会被静默丢弃。
 
 **最终归宿策略，精确表述如下：** 一个 terminal run **自身**的终结决策绝不能让一条未被消费
-的 steering 事件被静默搁置、没有任何 durable、可观测的归宿——这正是上面机制所保证的。但这
-**并不**意味着任何 terminal run 在任何情况下都不可能留有 `pending` 的 steering 行：一个耗尽
-投递尝试次数而被 dead-letter（或直接 failed）的 run 完全可能合法地留下图根本没来得及消费
-的、仍是 `pending` 的 steering——这是刻意保留的 durable 历史记录，而不是 bug；之后如果该
-run 被 `/redrive`，这条仍 pending 的行会像任何其他排队中的 steering 一样被重新拾起。但
-`/redrive` 只接受 `failed`/`dead_letter` 状态的 run——一次普通的、由客户端发起的
-**cancel** 不在这条恢复路径之内：`/redrive` 不接受 `cancelled` 的 run，因此留在
-`cancelled` run 上的 `pending` steering 目前没有任何自动的未来投递机会。上面两种归宿情况
-与 cancel 不同：边界/未消费归宿之所以存在，是因为那条具体的 steering 事件确实**再也不会
-有任何投递机会**去消费它；而 `failed`/`dead_letter` run 未被消费的 steering 仍然拥有一条
-合法的未来投递路径（`/redrive`），如果给它打上 `superseded` 反而会错误地堵死这条路径，
-这正是为什么它被刻意留作 `pending`。
+的 steering 事件被静默搁置、没有任何 durable、可观测的归宿——这正是上面机制所保证的。任何
+真正终结的 `finish` 意图——由图自身的结果计算产生的 `succeeded`、`failed`、`cancelled` 或
+`dead_letter`——都会封闭 steering 准入并 supersede 遗留行，与上文描述完全一致；唯一被排除
+在外的是 `paused`（见下一段）。也就是说，一次普通的 `failed`/`dead_letter` 结果本身**不会**
+让 steering 停留在 `pending`。
+
+唯一仍可能出现这种情况的场景比"被 dead-letter 的 run 就会留下 pending steering"要窄得多：
+特指**最终 steering flush 本身就无法持久提交**的那次 run（`_retry_or_dead_letter()`——见
+`Worker._execute` 里 final flush 之后的处理）。这条路径根本不会走到
+`finalize_run_with_steering_disposition_if_owned()`——它会转而让这次投递尝试走普通的
+retry/dead-letter 流程，因为此时写下任何归宿（无论是否 superseded）都会要么报告一个虚假
+状态，要么静默丢失已经 drain 但尚未提交的消费记录。只有在这种特定情况下，一个 `dead_letter`
+的 run 才可能仍然留有 `pending` 的 steering——这是刻意保留的 durable 历史记录，而不是 bug：
+之后如果该 run 被 `/redrive`，这条仍 pending 的行会像任何其他排队中的 steering 一样被重新
+拾起。一次普通的、由客户端发起的 **cancel** 不在这条恢复路径之内：`/redrive` 不接受
+`cancelled` 的 run，因此留在 `cancelled` run 上的 `pending` steering 目前没有任何自动的
+未来投递机会——如果确实需要恢复，那是这套机制之外的运维/API 任务，而不是由 Runtime 自动
+解决的。
 
 ## 并行 superstep、`Send` 与 subgraph 共享同一个 channel
 

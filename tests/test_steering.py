@@ -1682,6 +1682,108 @@ class RetryCommitCancelWinsEventTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class RetryWithEventAtomicityTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 10, point 1 (BLOCKER).
+
+    ``retry_run_if_owned()`` and the durable ``worker_retrying`` event used
+    to be two separate transactions, reopening a TOCTOU window between
+    "the run is truly pending" and "the event says it's retrying". These
+    tests prove the merged ``retry_run_with_event_if_owned`` closes both
+    races described in the review.
+    """
+
+    def test_race_a_cancel_in_the_gap_leaves_no_late_worker_retrying_event(self) -> None:
+        """A cancel that would have landed *between* the old two writes
+        must never let a stale worker append ``worker_retrying`` for a run
+        that is durably ``cancelled`` -- because there is no longer a gap
+        for it to land in: the status write and the event are the same
+        atomic operation."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            # Cancel arrives before the merged retry transaction runs --
+            # the run is already ``cancelling`` when the fenced write
+            # executes, so cancel-wins coercion applies inside the same
+            # critical section.
+            self.assertTrue(await repo.request_cancel("acme", run.id))
+
+            result = await repo.retry_run_with_event_if_owned(
+                "acme",
+                run.id,
+                "worker-a",
+                claimed.attempt,
+                error={"code": "delivery_retry", "message": "transient"},
+                max_attempts=5,
+            )
+            assert result is not None
+            updated, event = result
+            self.assertEqual(updated.status, "cancelled")
+            self.assertIsNone(event)
+
+            final = await repo.get_run("acme", run.id)
+            self.assertEqual(final.status, "cancelled")
+            events = await repo.list_events("acme", run.id)
+            self.assertEqual([e for e in events if e.kind == "worker_retrying"], [])
+
+        asyncio.run(scenario())
+
+    def test_race_b_worker_retrying_event_precedes_next_attempts_events(self) -> None:
+        """Worker A's ``worker_retrying(attempt N)`` event must always be
+        durable *before* the run becomes externally visible as
+        ``pending`` -- so a worker B that then claims it (attempt N+1) and
+        appends its own execution events can never produce an event with a
+        lower sequence than ``worker_retrying``. Because the merged method
+        makes both writes atomic, this is true by construction; this test
+        proves the observable sequencing."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            result = await repo.retry_run_with_event_if_owned(
+                "acme",
+                run.id,
+                "worker-a",
+                claimed.attempt,
+                error={"code": "delivery_retry", "message": "transient"},
+                max_attempts=5,
+            )
+            assert result is not None
+            updated, event = result
+            self.assertEqual(updated.status, "pending")
+            assert event is not None
+            self.assertEqual(event.kind, "worker_retrying")
+
+            # Worker B now claims the retried run (attempt N+1) and logs
+            # its own execution event.
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertGreater(claimed_b.attempt, claimed.attempt)
+            next_event = await repo.append_event(
+                "acme", run.id, "node_started", {"attempt": claimed_b.attempt}
+            )
+
+            self.assertLess(event.sequence, next_event.sequence)
+
+        asyncio.run(scenario())
+
+
 class AtomicSteerAcceptedEventTests(unittest.TestCase):
     """Issue #16 PR #17 review round 4, point 2: accepting a steering row
     and recording its ``run.steer.accepted`` lifecycle event must be a
@@ -2871,7 +2973,7 @@ class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
             async def lost_lease(*args: Any, **kwargs: Any) -> None:
                 return None
 
-            repo.retry_run_if_owned = lost_lease  # type: ignore[method-assign]
+            repo.retry_run_with_event_if_owned = lost_lease  # type: ignore[method-assign]
             await worker._retry_or_dead_letter(
                 claimed, {"code": "delivery_retry", "message": "transient"}
             )

@@ -157,8 +157,9 @@ disposition and the run's terminal status commit together or not at all (see
 `finalize_run_with_steering_disposition_if_owned`; a crash or lease loss between two separately
 committed writes used to be able to leave steering permanently `superseded` while the run
 itself never actually finished). The run then finalizes normally with its already-computed
-outcome (`succeeded`, `paused`, `failed`, etc.) — it is **not** forced through a retry loop just
-because a steering event happened to exist.
+outcome (`succeeded`, `failed`, `dead_letter`, etc. — any terminal outcome other than `paused`,
+see below) — it is **not** forced through a retry loop just because a steering event happened to
+exist.
 
 The `unconsumed_at_final_boundary` reason is deliberately generic and does **not** claim a
 race occurred. It covers two different situations the Runtime cannot currently tell apart from
@@ -171,21 +172,26 @@ disposition is recorded as `superseded`, not silently dropped.
 
 **Final disposition policy, stated precisely:** a terminal run's *own* finalization decision
 can never silently strand an unconsumed steering event without a durable, observable
-disposition — that is what the mechanism above guarantees. It does **not** mean no terminal run
-can ever have a `pending` steering row for any reason at all: a run that exhausts delivery
-attempts and is dead-lettered (or fails outright) can legitimately leave steering that the
-graph simply never got around to draining still `pending` — that is deliberate, retained
-durable history, not a bug, and a later `/redrive` of that run (allowed only from `failed` or
-`dead_letter`) picks the still-pending row back up like any other queued steering. An ordinary
-client-initiated **cancel** is different, and not currently covered by that same recovery path:
-`/redrive` does not accept a `cancelled` run, so steering left `pending` on a cancelled run has
-no automatic future delivery attempt today — recovering it, if ever needed, is an operator/API
-task outside this mechanism, not something the Runtime resolves on its own. The two disposition
-cases above are different from cancel: the boundary-race/non-consumption disposition exists
-because that specific steering event durably has *no delivery attempt left, ever* that could
-consume it; a `failed`/`dead_letter` run's unconsumed steering has a legitimate future delivery
-path (`/redrive`) that a `superseded` disposition would incorrectly foreclose, which is why it
-is intentionally left `pending` instead.
+disposition — that is what the mechanism above guarantees. Any genuinely terminal `finish`
+intent — `succeeded`, `failed`, `cancelled`, or `dead_letter` produced by the graph's own
+outcome computation — closes steering admission and supersedes leftovers exactly as described
+above; `paused` is the only status excluded (see the next paragraph). This means an ordinary
+`failed`/`dead_letter` outcome does **not**, by itself, leave steering `pending`.
+
+The one case that still can is narrower than a blanket "dead-lettered runs leave steering
+pending": it is specifically a run whose *final steering flush itself* could never durably
+commit (`_retry_or_dead_letter()` — see `Worker._execute`'s post-flush handling). That path
+never reaches `finalize_run_with_steering_disposition_if_owned()` at all — it routes the attempt
+through the ordinary retry/dead-letter machinery instead, precisely because writing any
+disposition (superseded or otherwise) would either report a false status or silently strand the
+already-drained-but-uncommitted consumption. Only in that specific situation can a `dead_letter`
+run still have steering sitting `pending` — and it is deliberate, retained durable history, not
+a bug: a later `/redrive` of that run (allowed only from `failed` or `dead_letter`) picks the
+still-pending row back up like any other queued steering. An ordinary client-initiated **cancel**
+is different, and not currently covered by that same recovery path: `/redrive` does not accept a
+`cancelled` run, so steering left `pending` on a cancelled run has no automatic future delivery
+attempt today — recovering it, if ever needed, is an operator/API task outside this mechanism,
+not something the Runtime resolves on its own.
 
 ## Parallel supersteps, `Send`, and subgraphs share one channel
 

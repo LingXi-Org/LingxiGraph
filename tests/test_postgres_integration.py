@@ -1005,6 +1005,91 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_retry_with_event_if_owned_postgres_path(self) -> None:
+        """Issue #16 PR #17 review round 10, point 1 (BLOCKER), PostgreSQL
+        path: the merged ``retry_run_with_event_if_owned`` must return the
+        transaction's own resulting snapshot directly (no separate later
+        ``get_run()`` read), reject a stale attempt outright, and -- the
+        review's race B -- durably guarantee that ``worker_retrying``'s
+        RunEvent sequence is strictly earlier than any event a subsequent
+        owner's next attempt appends, because both writes are the same
+        real SQL transaction."""
+
+        from lingxigraph.server.models import (
+            AssistantCreate,
+            RunCreate,
+            ThreadCreate,
+        )
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            claimed_a = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed_a is not None
+
+            # A's lease expires; B claims the same run at a new attempt.
+            await asyncio.sleep(1.2)
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertEqual(claimed_b.attempt, claimed_a.attempt + 1)
+
+            # A's now-stale attempt must be rejected outright.
+            stale_result = await repo.retry_run_with_event_if_owned(
+                "acme",
+                run.id,
+                "worker-a",
+                claimed_a.attempt,
+                error={"code": "delivery_retry", "message": "transient"},
+                max_attempts=5,
+            )
+            self.assertIsNone(stale_result)
+            still_running = await repo.get_run("acme", run.id)
+            assert still_running is not None
+            self.assertEqual(still_running.status, "running")
+
+            # B retries normally: status transition and worker_retrying
+            # event commit together, and the returned Run is the
+            # transaction's own snapshot.
+            result = await repo.retry_run_with_event_if_owned(
+                "acme",
+                run.id,
+                "worker-b",
+                claimed_b.attempt,
+                error={"code": "delivery_retry", "message": "transient"},
+                max_attempts=5,
+            )
+            assert result is not None
+            updated, event = result
+            self.assertEqual(updated.status, "pending")
+            assert event is not None
+            self.assertEqual(event.kind, "worker_retrying")
+
+            final = await repo.get_run("acme", run.id)
+            assert final is not None
+            self.assertEqual(final.status, "pending")
+
+            # A third worker claims the retried run (attempt N+1 relative
+            # to B's retry) and appends its own execution event -- proving
+            # the earlier worker_retrying event's sequence is strictly
+            # earlier, i.e. the durable event stream's causal order is
+            # preserved even across a real Postgres transaction boundary.
+            claimed_c = await repo.claim_run("worker-c", lease_seconds=30)
+            assert claimed_c is not None
+            next_event = await repo.append_event(
+                "acme", run.id, "node_started", {"attempt": claimed_c.attempt}
+            )
+            self.assertLess(event.sequence, next_event.sequence)
+
+        asyncio.run(scenario())
+
     def test_resume_transfer_emits_superseded_event_idempotently_postgres_path(self) -> None:
         """Issue #16 PR #17 review round 8, point 3 (BLOCKER), PostgreSQL
         path: the paused-run resume-transfer migration must record exactly
