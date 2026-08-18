@@ -276,12 +276,124 @@ class Worker:
             await asyncio.gather(heartbeat, return_exceptions=True)
             # Final flush: anything drained between the last heartbeat tick
             # and run completion must still be recorded as consumed.
-            await self._sync_steering_out(run, graph)
-            graph.forget_steering(run.id)
+            #
+            # Issue #16 PR #17 review round 4, point 3: at this point
+            # ``finish_run``/``retry_run`` above has *already* reported the
+            # run as terminal (or pending-for-retry) -- there is no "next
+            # safe point" left for a swallowed transient failure here the
+            # way there is at a heartbeat tick. A bounded-retry durable
+            # flush that still fails after all attempts must not be
+            # followed by ``forget_steering`` (which would permanently
+            # destroy the only remaining record of what was consumed) or by
+            # leaving the run's already-written terminal status standing --
+            # instead, override it and route the run into the same
+            # retry/dead-letter path an ordinary delivery failure uses, so
+            # a later attempt resyncs and retries the commit.
+            flushed = await self._final_steering_flush(run, graph)
+            if not flushed:
+                flush_error = {
+                    "code": "steering_flush_failed",
+                    "message": (
+                        "durable steering consumption commit failed on final flush; "
+                        "run finalization was overridden to avoid losing it"
+                    ),
+                }
+                if run.attempt < self.max_delivery_attempts:
+                    await self.repository.retry_run(run.tenant_id, run.id, error=flush_error)
+                    stored = await self.repository.append_event(
+                        run.tenant_id,
+                        run.id,
+                        "worker_retrying",
+                        {
+                            "attempt": run.attempt,
+                            "max_attempts": self.max_delivery_attempts,
+                            "error": flush_error,
+                        },
+                    )
+                    await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+                    logger.warning(
+                        "run finalization retried: final steering flush failed",
+                        extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+                    )
+                else:
+                    await self.repository.finish_run(
+                        run.tenant_id, run.id, RunStatus.DEAD_LETTER, error=flush_error
+                    )
+                    logger.error(
+                        "run dead-lettered: final steering flush failed after max attempts",
+                        extra={
+                            "run_id": run.id,
+                            "tenant_id": run.tenant_id,
+                            "status": RunStatus.DEAD_LETTER.value,
+                        },
+                    )
+                # Do NOT forget_steering here: the channel's local
+                # consumption log is the only surviving record of what was
+                # drained, and must stay intact for the redelivery above to
+                # resync and retry the commit instead of silently losing it.
+            else:
+                graph.forget_steering(run.id)
+
+    async def _final_steering_flush(
+        self, run: Run, graph: Any, *, attempts: int = 3, base_delay: float = 0.5
+    ) -> bool:
+        """Bounded-retry durable flush of drained steering before finalizing.
+
+        Unlike :meth:`_sync_steering_out` (used at heartbeat ticks, where a
+        transient failure can simply be retried at the next tick), this is
+        called once, after the run has already reached a terminal or
+        paused outcome and the heartbeat has been cancelled -- there is no
+        later safe point. Returns ``True`` once nothing remains pending (or
+        the commit succeeded); returns ``False`` only after every retry has
+        been exhausted, in which case the caller MUST NOT report the run as
+        successfully finished/paused, and MUST NOT call
+        ``graph.forget_steering`` (see ``_execute``'s ``finally`` block).
+        """
+
+        channel = graph.get_steering_channel(run.id)
+        for attempt in range(1, attempts + 1):
+            consumed = channel.peek_consumed()
+            if not consumed:
+                return True
+            try:
+                stored_events = await self.repository.commit_steering_consumptions(
+                    run.tenant_id, run.id, consumed
+                )
+            except Exception:
+                logger.warning(
+                    "final steering flush attempt %d/%d failed",
+                    attempt,
+                    attempts,
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                    exc_info=True,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(base_delay * attempt)
+                    continue
+                return False
+            channel.ack_consumed(consumption.event.id for consumption in consumed)
+            for stored in stored_events:
+                await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+        return True
 
     async def _heartbeat(self, run: Run, token: CancellationToken, graph: Any) -> None:
         while True:
-            await asyncio.sleep(self.heartbeat_seconds)
+            # Issue #16 PR #17 review round 4, point 5: wait on the
+            # EventBus (Redis, when configured) instead of a plain
+            # ``asyncio.sleep`` so a ``/steer`` call's ``publish()`` can
+            # wake this loop early -- low-latency steering discovery --
+            # while ``timeout=self.heartbeat_seconds`` still bounds the
+            # wait, so this remains a correctness-preserving fallback to
+            # the unconditional PostgreSQL poll below even if the publish
+            # is dropped, Redis is unavailable, or no EventBus wake ever
+            # arrives at all (``InMemoryEventBus``/``RedisEventBus.wait``
+            # both return on timeout rather than raising).
+            await self.event_bus.wait(run.tenant_id, run.id, timeout=self.heartbeat_seconds)
+            # Guarantee a real scheduler yield every iteration regardless of
+            # how quickly a particular ``EventBus.wait`` implementation
+            # returns (a degenerate/no-op bus could otherwise return without
+            # ever suspending, starving the run's own coroutine).
+            await asyncio.sleep(0)
             if await self.repository.is_cancel_requested(run.tenant_id, run.id):
                 # Cancellation always takes priority; steering must never
                 # undo or delay it. We still sync steering below so an

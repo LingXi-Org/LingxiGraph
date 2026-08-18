@@ -24,6 +24,7 @@ from ..errors import (
     ConcurrentRunError,
     EmptyInputError,
     IdempotencyConflictError,
+    RunResumeConflictError,
     RunSupersededError,
     RunTerminalError,
 )
@@ -200,6 +201,10 @@ def create_app(
     @app.exception_handler(RunSupersededError)
     async def run_superseded_error(request: Request, exc: RunSupersededError):
         return _problem(request, 409, "run_superseded", str(exc))
+
+    @app.exception_handler(RunResumeConflictError)
+    async def run_resume_conflict_error(request: Request, exc: RunResumeConflictError):
+        return _problem(request, 409, "run_resume_conflict", str(exc))
 
     @app.exception_handler(SteeringPayloadTooLarge)
     async def steering_payload_error(request: Request, exc: SteeringPayloadTooLarge):
@@ -589,17 +594,12 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(404, "run not found") from exc
+        # ``repository.submit_steering`` durably records the steering row
+        # *and* its ``run.steer.accepted`` lifecycle event atomically (issue
+        # #16 PR #17 review round 4, point 2) -- nothing further to persist
+        # here even on an idempotent retry that repairs a previously-missing
+        # accepted event.
         if created:
-            await repository.append_event(
-                user.tenant_id,
-                run_id,
-                "run.steer.accepted",
-                {
-                    "steering_event_id": event.id,
-                    "sequence": event.sequence,
-                    "kind": event.kind,
-                },
-            )
             await event_bus.publish(user.tenant_id, run_id, 0)
             await audit(user, "runs.steer", "run", run_id)
         return SteerAccepted(
@@ -651,27 +651,15 @@ def create_app(
         # This also marks `previous` so any *later* steer attempt against
         # the stale run_id is rejected instead of silently pending again
         # (see RunSupersededError).
+        # ``resume_run_with_pending_steering`` re-validates under its own
+        # lock that ``previous`` is still paused and not already resumed by
+        # a concurrent request (issue #16 PR #17 review round 4, point 1),
+        # and durably records each transferred event's ``run.steer.accepted``
+        # lifecycle event in the same migration transaction (review round 4,
+        # point 2) -- nothing further to persist for that here.
         value, transferred = await repository.resume_run_with_pending_steering(
             user.tenant_id, previous.thread_id, assistant, request, previous.id
         )
-        for event in transferred:
-            await repository.append_event(
-                user.tenant_id,
-                value.id,
-                "run.steer.accepted",
-                {
-                    "steering_event_id": event.id,
-                    "sequence": event.sequence,
-                    "kind": event.kind,
-                    "transferred_from_run_id": previous.id,
-                    # Stable identity (review point 3): the id this
-                    # transferred event's original ``/steer`` call actually
-                    # returned to the caller, so it can correlate that
-                    # response to the eventual ``run.steer.consumed`` event
-                    # here even though the event's own ``id`` changed.
-                    "source_event_id": event.source_event_id,
-                },
-            )
         if transferred:
             await event_bus.publish(user.tenant_id, value.id, 0)
         await audit(user, "runs.resume", "run", value.id)

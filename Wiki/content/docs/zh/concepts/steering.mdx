@@ -12,9 +12,10 @@ API key"——而不需要停止它、不需要等它自己走到某个天然的
 
 Steering 就是 LingxiGraph 对这个问题的回答：`POST /v1/runs/{run_id}/steer` durably地
 接受一小段结构化 JSON，并在图代码下一次主动查看时把它交给图代码。LingxiGraph 保证的是
-**投递**本身——durable、有序、去重、恰好一次的 drain——但从不替业务决定"这条新输入意味着
-什么"。一条消息应该触发重新规划、只是追加到上下文，还是应该被忽略（因为已经跑过那一步了），
-完全是业务图的逻辑。
+**投递**本身——durable、有序、去重、在单个存活的 `SteeringChannel` 内原子 drain-once——
+但从不替业务决定"这条新输入意味着什么"。一条消息应该触发重新规划、只是追加到上下文，
+还是应该被忽略（因为已经跑过那一步了），完全是业务图的逻辑。具体"drain-once"在跨 worker
+崩溃时保证到什么程度、不保证什么，见下方"顺序、幂等与 drain-once"一节。
 
 ## 与 cancel、interrupt、resume 的区别
 
@@ -84,12 +85,25 @@ superstep 前、重试前、resume 之后——每一次这样的调度切换都
 ## 顺序、幂等与 drain-once
 
 - 同一个 run 的 steering 事件按内部 `sequence` 严格排序，序号在 durably accepted 时分配；
-- `drain_steering()` 按该顺序返回事件，且永远不会返回同一事件两次——即使经历重试或
-  worker 重启，drain-once 也是原子的；
+- 在**单个存活的 `SteeringChannel`** 内——同一个 worker、同一个进程内实例，跨节点的任意
+  次内部重试——`drain_steering()` 永远不会返回同一事件两次：原子 drain-once；
+- **这不是系统级的恰好一次保证。** 如果 worker 在 `drain_steering()` 已经把某条事件交给
+  节点、但 `commit_steering_consumptions()` 尚未把这次消费 durably 记录下来之前崩溃（或
+  它的 lease 被重新分配），PostgreSQL 里那一行仍然是 `pending`/`delivered`——接管该 run、
+  从 PostgreSQL 重建 channel 的新 worker 会合理地重新投递同一条事件。跨越一次崩溃，
+  steering 的投递语义是**至少一次（at-least-once）**，不是恰好一次。如果业务要对 drain
+  到的事件执行不可逆的副作用（扣费、有副作用的外部 API 调用），应该用 `event.id`（或者
+  经过暂停/恢复迁移后的根 `source_event_id`，见下文）自行做幂等控制，而不能假设
+  drain-once 就等于"只处理一次"；
 - 通过 `idempotency_key` 去重：对同一个 `(tenant_id, run_id, idempotency_key)` 提交两次
   会返回**原**事件而不是创建第二条；这个去重在 `drain_steering()` 之后依然有效——原事件被
   drain 之后再次重放同一提交，返回的仍然是那条（现已 consumed 的）原事件，而不是一条新的
-  pending 事件。
+  pending 事件。这只对 accept 一侧（重复的 `/steer` 调用）去重，本身并不能让跨崩溃的
+  drain 一侧变成恰好一次——见上一条；
+- consumed-commit（`commit_steering_consumptions()`）与图自身为消费它的那个 superstep
+  所做的 checkpoint commit 是两个独立的 durable 操作，不是同一个分布式事务（见下方
+  "consumption 与 checkpoint commit 的当前关系"）——因此不存在覆盖"steering 投递 + 图
+  状态"两者的系统级恰好一次处理保证。
 
 ## 重试、worker 崩溃与 Redis 丢失
 

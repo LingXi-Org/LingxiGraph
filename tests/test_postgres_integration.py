@@ -215,6 +215,165 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_concurrent_resume_of_the_same_paused_run_creates_exactly_one_descendant(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 4, point 1, PostgreSQL path.
+
+        Two real concurrent transactions both calling
+        ``resume_run_with_pending_steering`` against the same paused run
+        must not both succeed: PostgreSQL's ``FOR UPDATE`` on the old run
+        row serializes them, but the loser must be rejected by the locked
+        revalidation (still ``paused``, no ``superseded_by_run_id`` yet)
+        rather than silently creating a second descendant Run and
+        overwriting the winner's ``superseded_by_run_id``.
+        """
+
+        from lingxigraph.errors import RunResumeConflictError
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            old_run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            results = await asyncio.gather(
+                repo.resume_run_with_pending_steering(
+                    "acme", thread.id, assistant, request, old_run.id
+                ),
+                repo.resume_run_with_pending_steering(
+                    "acme", thread.id, assistant, request, old_run.id
+                ),
+                return_exceptions=True,
+            )
+            successes = [r for r in results if not isinstance(r, BaseException)]
+            failures = [r for r in results if isinstance(r, BaseException)]
+            self.assertEqual(len(successes), 1, results)
+            self.assertEqual(len(failures), 1, results)
+            self.assertIsInstance(failures[0], RunResumeConflictError)
+
+            winner_run, _ = successes[0]
+            all_runs = await repo.list_runs("acme", thread_id=thread.id)
+            descendants = [r for r in all_runs if r.id != old_run.id]
+            self.assertEqual(len(descendants), 1)
+            self.assertEqual(descendants[0].id, winner_run.id)
+
+            final_old = await repo.get_run("acme", old_run.id)
+            self.assertEqual(final_old.metadata.get("superseded_by_run_id"), winner_run.id)
+
+        asyncio.run(scenario())
+
+    def test_steer_accept_and_accepted_event_commit_atomically(self) -> None:
+        """Issue #16 PR #17 review round 4, point 2, PostgreSQL path.
+
+        Injects a failure between the steering row commit and its
+        ``run.steer.accepted`` append by directly deleting the accepted
+        event row after a normal ``submit_steering`` call (simulating the
+        pre-fix failure window where the row committed but the event append
+        transiently failed), then verifies an idempotency-key retry repairs
+        it -- exactly once, never duplicated -- and that consumption still
+        produces a complete accepted -> consumed pair.
+        """
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+
+            event, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertTrue(created)
+            accepted = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(accepted), 1)
+
+            # Simulate the pre-fix failure window: the steering row
+            # committed, but its ``run.steer.accepted`` event never made it
+            # (e.g. a transient failure right after the row's commit).
+            import psycopg
+
+            with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
+                conn.execute(
+                    f'DELETE FROM "{self.schema}".run_events '
+                    "WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.accepted'",
+                    ("acme", run.id),
+                )
+            gap = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(gap, [])
+
+            # Retry with the same Idempotency-Key: the row already exists
+            # (``created`` is False) but the gap must be repaired.
+            retried_event, retried_created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertFalse(retried_created)
+            self.assertEqual(retried_event.id, event.id)
+            repaired = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(repaired), 1)
+            self.assertEqual(repaired[0].data["steering_event_id"], event.id)
+
+            # A further retry must not duplicate it.
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            final_accepted = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(final_accepted), 1)
+
+            # After consumption, a complete accepted -> consumed pair
+            # exists (never duplicated by the repair above).
+            consumption = SteeringConsumption(
+                event=SteeringEvent(
+                    id=event.id,
+                    run_id=run.id,
+                    sequence=event.sequence,
+                    kind=event.kind,
+                    payload=event.payload,
+                    metadata=event.metadata,
+                    created_at=event.created_at,
+                ),
+                node="n",
+                namespace=(),
+                task_id="t-0",
+                queue_latency_seconds=0.01,
+            )
+            await repo.commit_steering_consumptions("acme", run.id, [consumption])
+            all_events = await repo.list_events("acme", run.id)
+            self.assertEqual(
+                sum(1 for e in all_events if e.kind == "run.steer.accepted"), 1
+            )
+            self.assertEqual(
+                sum(1 for e in all_events if e.kind == "run.steer.consumed"), 1
+            )
+
+        asyncio.run(scenario())
+
     def test_commit_steering_consumptions_is_atomic(self) -> None:
         """Issue #16 PR #17 review point 2, PostgreSQL path: status update
         and the ``run.steer.consumed`` lifecycle event must land in the

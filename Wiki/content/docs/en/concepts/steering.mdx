@@ -13,9 +13,11 @@ input if a worker crashes right after accepting it.
 
 Steering is LingxiGraph's answer: `POST /v1/runs/{run_id}/steer` durably accepts a small piece
 of structured JSON and hands it to graph code the next time that code chooses to look for it.
-LingxiGraph guarantees the delivery — durable, ordered, deduplicated, exactly-once drain — but
-it never decides *what the new input means*. Whether a message means "replan," "just append
-to context," or "ignore, we're already past that step" is entirely up to the graph.
+LingxiGraph guarantees the delivery — durable, ordered, deduplicated, atomic-drain-once within
+a single live `SteeringChannel` — but it never decides *what the new input means*. Whether a
+message means "replan," "just append to context," or "ignore, we're already past that step" is
+entirely up to the graph. See [Ordering, idempotency, and drain-once](#ordering-idempotency-and-drain-once)
+below for exactly what "drain-once" does and does not guarantee across a worker crash.
 
 ## How it differs from cancel, interrupt, and resume
 
@@ -91,12 +93,28 @@ break the deterministic replay guarantees the rest of the runtime depends on.
 
 - Steering events for a given run are strictly ordered by an internal `sequence`, assigned at
   durable-accept time.
-- `drain_steering()` returns events in that order and never returns the same event twice —
-  atomic drain-once, even under retries or worker restarts.
+- Within a single live `SteeringChannel` — one worker, one in-process instance, spanning any
+  number of internal retries of a node — `drain_steering()` never returns the same event twice:
+  atomic drain-once.
+- **This is not a system-wide exactly-once guarantee.** If a worker crashes (or its lease is
+  reassigned) after `drain_steering()` has handed an event to a node but *before*
+  `commit_steering_consumptions()` durably records that consumption, the PostgreSQL row is
+  still `pending`/`delivered` — a new worker rebuilding the channel from PostgreSQL for that run
+  will legitimately redeliver the same event. Across a crash, steering delivery is
+  **at-least-once**, not exactly-once. Applications performing an irreversible side effect from
+  a drained event (a charge, an external API call with side effects) should key their own
+  idempotency off `event.id` (or the root `source_event_id` after a pause/resume transfer,
+  see below) rather than assume drain-once implies process-once.
 - Deduplication by `idempotency_key`: submitting the same `(tenant_id, run_id,
   idempotency_key)` twice returns the original event instead of creating a second one, and
   that dedup survives a `drain_steering()` call — a retried submission after the original was
-  already drained still returns the original (now-consumed) event, not a new pending one.
+  already drained still returns the original (now-consumed) event, not a new pending one. This
+  dedupes the *accept* side (repeated `/steer` calls); it does not by itself make the *drain*
+  side exactly-once across a crash — see above.
+- The consumed-commit (`commit_steering_consumptions()`) and the graph's own checkpoint commit
+  for the superstep that drained the event are two separate durable operations, not one
+  distributed transaction (see "Consumption vs. checkpoint commit" below) — so there is no
+  system-wide exactly-once processing guarantee spanning steering delivery *and* graph state.
 
 ## Retry, worker crash, and Redis loss
 

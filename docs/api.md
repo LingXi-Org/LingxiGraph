@@ -65,8 +65,10 @@ JWT claim 派生，绝不信任调用方自报 header。
 
 语义：
 
-- 202 只代表已durably写入 PostgreSQL 的 steering inbox，不代表图已经处理；Redis 只用于
-  可选的低延迟 `run.steer.available` 通知，从不作为唯一来源。
+- 202 只代表已durably写入 PostgreSQL 的 steering inbox，不代表图已经处理；配置了
+  `EventBus`（进程内或 Redis）时会发布一个可选的低延迟唤醒通知供 worker 心跳循环等待，
+  但它不是事件流中的具名事件（不存在 `run.steer.available` 事件），也从不作为唯一来源——
+  worker 自身的周期性 PostgreSQL 安全点检查始终是最终保证。
 - `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受durable写入。
 - 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）返回 HTTP 409
   `run_terminal`，不会静默生成一条永远不会被消费的事件。

@@ -11,7 +11,7 @@ from typing import Annotated, Any, TypedDict
 from fastapi.testclient import TestClient
 
 from lingxigraph import END, START, RetryPolicy, Runtime, Send, StateGraph
-from lingxigraph.errors import RunTerminalError
+from lingxigraph.errors import RunResumeConflictError, RunTerminalError
 from lingxigraph.server import GraphRegistry, create_app
 from lingxigraph.server.models import ThreadCreate
 from lingxigraph.server.repository import InMemoryRepository
@@ -541,6 +541,52 @@ class AtomicResumeMigrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_concurrent_resume_of_the_same_paused_run_only_succeeds_once(self) -> None:
+        """Issue #16 PR #17 review round 4, point 1: two concurrent
+        ``resume_run_with_pending_steering`` calls against the same paused
+        run must not both create a descendant Run -- exactly one must
+        succeed and ``superseded_by_run_id`` must be stable (never
+        overwritten by the loser)."""
+
+        from lingxigraph.server.models import RunCreate
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            results = await asyncio.gather(
+                repo.resume_run_with_pending_steering(
+                    "acme", old_run.thread_id, assistant, request, old_run.id
+                ),
+                repo.resume_run_with_pending_steering(
+                    "acme", old_run.thread_id, assistant, request, old_run.id
+                ),
+                return_exceptions=True,
+            )
+            successes = [r for r in results if not isinstance(r, BaseException)]
+            failures = [r for r in results if isinstance(r, BaseException)]
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], RunResumeConflictError)
+
+            winner_run, _ = successes[0]
+            final_old = await repo.get_run("acme", old_run.id)
+            self.assertEqual(final_old.metadata.get("superseded_by_run_id"), winner_run.id)
+
+            # The losing attempt must not have been silently allowed to
+            # retry and create a second Run either.
+            with self.assertRaises(RunResumeConflictError):
+                await repo.resume_run_with_pending_steering(
+                    "acme", old_run.thread_id, assistant, request, old_run.id
+                )
+
+        asyncio.run(scenario())
+
     def test_transferred_and_new_steering_sequences_never_collide(self) -> None:
         async def scenario() -> None:
             repo = InMemoryRepository()
@@ -676,6 +722,202 @@ class DurableAckOrderingTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_final_flush_failure_never_reports_success_with_steering_lost(self) -> None:
+        """Issue #16 PR #17 review round 4, point 3: a transient failure on
+        the *final* flush (after ``finish_run``, heartbeat cancelled, no
+        further safe point) must not leave the run reported
+        succeeded/paused while the DB steering row is silently stranded
+        ``pending`` forever. This goes through the real
+        ``Worker._execute()`` finalization path (not an isolated call to
+        ``_sync_steering_out``)."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            worker = Worker(make_registry(), repo)
+            # Keep the bounded final-flush retry window short for the test.
+            worker._final_steering_flush = (
+                lambda run, graph, attempts=3, base_delay=0.01: Worker._final_steering_flush(
+                    worker, run, graph, attempts=attempts, base_delay=0.01
+                )
+            )
+
+            real_commit = repo.commit_steering_consumptions
+
+            async def always_fails(tenant_id, run_id, consumptions):
+                raise ConnectionError("transient database hiccup on final flush")
+
+            repo.commit_steering_consumptions = always_fails  # type: ignore[method-assign]
+
+            claimed = await worker.run_once()
+            self.assertTrue(claimed)
+
+            after_failed_flush = await repo.get_run("acme", run.id)
+            status = (
+                after_failed_flush.status.value
+                if hasattr(after_failed_flush.status, "value")
+                else after_failed_flush.status
+            )
+            # Must never be reported succeeded/paused while the durable
+            # steering commit never actually happened.
+            self.assertEqual(status, "pending")
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual(len(still_pending), 1)
+            consumed_events = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(consumed_events, [])
+
+            # Recovery: restore the durable commit and let the run be
+            # redelivered. It must eventually succeed with exactly one
+            # ``run.steer.consumed`` event -- not lost, not duplicated.
+            repo.commit_steering_consumptions = real_commit  # type: ignore[method-assign]
+            claimed_again = await worker.run_once()
+            self.assertTrue(claimed_again)
+
+            finished = await repo.get_run("acme", run.id)
+            finished_status = (
+                finished.status.value if hasattr(finished.status, "value") else finished.status
+            )
+            self.assertEqual(finished_status, "succeeded")
+            self.assertIn("stop", finished.output["drained"])
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+            consumed_events_after = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(len(consumed_events_after), 1)
+
+        asyncio.run(scenario())
+
+
+class AtomicSteerAcceptedEventTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 4, point 2: accepting a steering row
+    and recording its ``run.steer.accepted`` lifecycle event must be a
+    single atomic, idempotent unit -- a retried request (same
+    Idempotency-Key) that finds the steering row already durably created
+    must still repair a missing ``run.steer.accepted`` event rather than
+    permanently skip it."""
+
+    def test_idempotency_key_retry_repairs_a_missing_accepted_event(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+
+            event, created = await repo.submit_steering(
+                "acme",
+                run.id,
+                kind="user_input",
+                payload={"m": 1},
+                idempotency_key="key-1",
+            )
+            self.assertTrue(created)
+            accepted = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(accepted), 1)
+
+            # Simulate the pre-fix failure window: the steering row
+            # committed, but the ``run.steer.accepted`` append never
+            # happened (e.g. the process crashed / the DB call transiently
+            # failed right after the row committed).
+            repo._events[("acme", run.id)] = [
+                e for e in repo._events[("acme", run.id)] if e.kind != "run.steer.accepted"
+            ]
+            self.assertEqual(
+                [
+                    e
+                    for e in await repo.list_events("acme", run.id)
+                    if e.kind == "run.steer.accepted"
+                ],
+                [],
+            )
+
+            # The client retries with the same Idempotency-Key: the
+            # steering row already exists (``created`` is False) but the
+            # gap must still be repaired, not permanently skipped.
+            retried_event, retried_created = await repo.submit_steering(
+                "acme",
+                run.id,
+                kind="user_input",
+                payload={"m": 1},
+                idempotency_key="key-1",
+            )
+            self.assertFalse(retried_created)
+            self.assertEqual(retried_event.id, event.id)
+            accepted_after = [
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(accepted_after), 1)
+            self.assertEqual(accepted_after[0].data["steering_event_id"], event.id)
+
+            # A further retry must not duplicate it either.
+            await repo.submit_steering(
+                "acme",
+                run.id,
+                kind="user_input",
+                payload={"m": 1},
+                idempotency_key="key-1",
+            )
+            accepted_final = [
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
+            ]
+            self.assertEqual(len(accepted_final), 1)
+
+        asyncio.run(scenario())
+
+    def test_transfer_records_accepted_event_for_the_new_run_atomically(self) -> None:
+        """The paused-transfer path's ``run.steer.accepted`` must land on
+        the new run inside the same migration, correlated back to the
+        original event via ``source_event_id``/``transferred_from_run_id``."""
+
+        from lingxigraph.server.models import RunCreate
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            original, _ = await repo.submit_steering(
+                "acme", old_run.id, kind="user_input", payload={"m": 1}
+            )
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            new_run, transferred = await repo.resume_run_with_pending_steering(
+                "acme", old_run.thread_id, assistant, RunCreate(assistant_id=assistant.id), old_run.id
+            )
+            self.assertEqual(len(transferred), 1)
+            new_events = await repo.list_events("acme", new_run.id)
+            accepted = [e for e in new_events if e.kind == "run.steer.accepted"]
+            self.assertEqual(len(accepted), 1)
+            self.assertEqual(accepted[0].data["steering_event_id"], transferred[0].id)
+            self.assertEqual(accepted[0].data["transferred_from_run_id"], old_run.id)
+            self.assertEqual(accepted[0].data["source_event_id"], original.id)
+
+        asyncio.run(scenario())
+
 
 class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
     """Direct unit coverage of ``InMemoryRepository`` steering branches that
@@ -762,10 +1004,11 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_transfer_when_old_run_has_already_been_removed(self) -> None:
-        """``_transfer_pending_steering_locked`` must tolerate an old run
-        that is no longer present in ``_runs`` (defensive branch: it only
-        marks the old run superseded when it can still find it)."""
+    def test_resume_rejects_a_missing_old_run(self) -> None:
+        """Issue #16 PR #17 review round 4, point 1: the locked
+        revalidation inside ``resume_run_with_pending_steering`` must
+        reject (rather than silently proceed for) an old run that is no
+        longer present -- it can no longer prove the run was ``paused``."""
 
         async def scenario() -> None:
             repo = InMemoryRepository()
@@ -774,13 +1017,12 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
             )
             run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
             # Simulate the old run row being gone by the time the resume
-            # migration runs -- the migration must not raise.
+            # migration runs.
             del repo._runs[("acme", run.id)]
-            new_run, transferred = await repo.resume_run_with_pending_steering(
-                "acme", None, assistant, _run_create(assistant.id), run.id
-            )
-            self.assertEqual(transferred, [])
-            self.assertNotEqual(new_run.id, run.id)
+            with self.assertRaises(RunResumeConflictError):
+                await repo.resume_run_with_pending_steering(
+                    "acme", None, assistant, _run_create(assistant.id), run.id
+                )
 
         asyncio.run(scenario())
 
@@ -808,6 +1050,7 @@ class InMemoryRepositorySteeringEdgeCaseTests(unittest.TestCase):
                 payload={"i": "pending"},
                 idempotency_key="key-1",
             )
+            await repo.finish_run("acme", old_run.id, "paused", output={})
 
             new_run, transferred = await repo.resume_run_with_pending_steering(
                 "acme", None, assistant, _run_create(assistant.id), old_run.id

@@ -61,6 +61,21 @@ class RunSupersededError(LingxiGraphError):
     """
 
 
+class RunResumeConflictError(LingxiGraphError):
+    """Raised when a resume attempt loses a race against a concurrent resume.
+
+    ``POST /runs/{id}/resume`` pre-checks that the target Run is
+    ``paused`` before calling
+    ``repository.resume_run_with_pending_steering``, but that pre-check is
+    not itself atomic with the resume -- two concurrent resume requests can
+    both pass it. The repository re-validates, *inside* the same locked
+    critical section that creates the new Run, that the old Run is still
+    ``paused`` and has no ``superseded_by_run_id`` set yet; the request
+    that loses that race gets this error instead of silently creating a
+    second descendant Run (issue #16 PR #17 review round 4, point 1).
+    """
+
+
 class GraphInterrupt(BaseException):
     """Internal control-flow signal used by :func:`interrupt`."""
 
@@ -82,6 +97,7 @@ __all__ = [
     "IdempotencyConflictError",
     "LingxiGraphError",
     "PersistenceError",
+    "RunResumeConflictError",
     "RunSupersededError",
     "RunTerminalError",
 ]

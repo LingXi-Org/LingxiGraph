@@ -12,6 +12,7 @@ from typing import Any
 from ..errors import (
     ConcurrentRunError,
     IdempotencyConflictError,
+    RunResumeConflictError,
     RunSupersededError,
     RunTerminalError,
 )
@@ -520,6 +521,12 @@ class InMemoryRepository:
                         for event in self._steering[(tenant_id, run_id)]
                         if event.id == existing_id
                     )
+                    # A prior attempt with this idempotency key may have
+                    # committed the steering row but then failed before its
+                    # ``run.steer.accepted`` event was recorded (review
+                    # round 4, point 2) -- repair that gap on the retry
+                    # instead of permanently skipping it.
+                    self._ensure_steer_accepted_event_locked(tenant_id, run_id, existing)
                     return existing.model_copy(deep=True), False
             events = self._steering.setdefault((tenant_id, run_id), [])
             event = RunSteeringEvent(
@@ -535,8 +542,59 @@ class InMemoryRepository:
             events.append(event)
             if idempotency_key is not None:
                 self._steering_keys[(tenant_id, run_id, idempotency_key)] = event.id
+            self._ensure_steer_accepted_event_locked(tenant_id, run_id, event)
         await self._notify()
         return event.model_copy(deep=True), True
+
+    def _ensure_steer_accepted_event_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        transferred_from_run_id: str | None = None,
+    ) -> RunEvent:
+        """Idempotently ensure ``run.steer.accepted`` exists for one event.
+
+        Issue #16 PR #17 review round 4, point 2: appending the
+        ``run.steer.accepted`` lifecycle event used to be a second,
+        separately-committed step after ``submit_steering`` (or the
+        paused-resume steering migration) -- a transient failure on that
+        second step, followed by an idempotent-key retry that finds the
+        steering row already created, permanently skipped the event
+        forever. Doing both under the caller's already-held ``self._lock``
+        and keying this on the steering event's id (never appending twice
+        for the same id) makes "accept the steering row" and "record the
+        accepted lifecycle event" a single atomic, idempotent unit -- a
+        retry (of the request, or of this call) always converges on
+        exactly one ``run.steer.accepted`` event per steering event id.
+        Assumes ``self._lock`` is already held.
+        """
+
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        for existing in run_events:
+            if (
+                existing.kind == "run.steer.accepted"
+                and existing.data.get("steering_event_id") == steering_event.id
+            ):
+                return existing
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+        }
+        if transferred_from_run_id is not None:
+            data["transferred_from_run_id"] = transferred_from_run_id
+            data["source_event_id"] = steering_event.source_event_id
+        event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=len(run_events) + 1,
+            kind="run.steer.accepted",
+            data=data,
+        )
+        run_events.append(event)
+        return event
 
     async def list_pending_steering(
         self, tenant_id: str, run_id: str
@@ -708,6 +766,15 @@ class InMemoryRepository:
                 self._steering_keys[(tenant_id, new_run_id, event.idempotency_key)] = (
                     new_event.id
                 )
+            # Record the transferred event's ``run.steer.accepted`` inside
+            # this same locked migration (review round 4, point 2) instead
+            # of leaving it to a second, separately-committed
+            # ``append_event`` call after the endpoint returns from this
+            # method -- otherwise a transient failure of that later call
+            # permanently loses the accepted record for the transferred run.
+            self._ensure_steer_accepted_event_locked(
+                tenant_id, new_run_id, new_event, transferred_from_run_id=old_run_id
+            )
             transferred.append(new_event.model_copy(deep=True))
         return transferred
 
@@ -731,9 +798,29 @@ class InMemoryRepository:
         ``await`` in between) means no other coroutine, including
         ``claim_run``, can observe the new Run row before its steering
         migration has also completed.
+
+        Issue #16 PR #17 review round 4, point 1: the endpoint's own
+        ``GET old run -> status == paused`` pre-check happens *before*
+        this call and is therefore not atomic with it -- two concurrent
+        resume requests can both pass it. Re-validate, inside this same
+        lock acquisition, that the old Run is still ``paused`` and has no
+        ``superseded_by_run_id`` set yet; the loser of the race gets
+        :class:`RunResumeConflictError` instead of silently creating a
+        second descendant Run and overwriting the winner's
+        ``superseded_by_run_id``.
         """
 
         async with self._lock:
+            old_run = self._runs.get((tenant_id, old_run_id))
+            if (
+                old_run is None
+                or enum_value(old_run.status) != RunStatus.PAUSED.value
+                or old_run.metadata.get("superseded_by_run_id") is not None
+            ):
+                raise RunResumeConflictError(
+                    f"run {old_run_id!r} is no longer resumable "
+                    "(it is not paused, or has already been resumed by a concurrent request)"
+                )
             run = self._create_run_locked(tenant_id, thread_id, assistant, request)
             transferred = self._transfer_pending_steering_locked(tenant_id, old_run_id, run.id)
         await self._notify()
@@ -1365,7 +1452,16 @@ class PostgresRepository(InMemoryRepository):
                 )
                 existing = cursor.fetchone()
                 if existing is not None:
-                    return RunSteeringEvent.model_validate(existing), False
+                    existing_event = RunSteeringEvent.model_validate(existing)
+                    # A prior attempt with this idempotency key may have
+                    # committed the steering row but then failed before its
+                    # ``run.steer.accepted`` event was recorded (issue #16
+                    # PR #17 review round 4, point 2) -- repair that gap on
+                    # the retry instead of permanently skipping it.
+                    self._ensure_steer_accepted_event_sync(
+                        cursor, tenant_id, run_id, existing_event
+                    )
+                    return existing_event, False
             cursor.execute(
                 f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
                 FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
@@ -1400,7 +1496,75 @@ class PostgresRepository(InMemoryRepository):
                     event.created_at,
                 ),
             )
+            # Accept the steering row and record its ``run.steer.accepted``
+            # lifecycle event in the same transaction (issue #16 PR #17
+            # review round 4, point 2) -- both commit together, or neither
+            # does, so a retry can never observe the row without its
+            # accepted event.
+            self._ensure_steer_accepted_event_sync(cursor, tenant_id, run_id, event)
             return event, True
+
+    def _ensure_steer_accepted_event_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        steering_event: RunSteeringEvent,
+        *,
+        transferred_from_run_id: str | None = None,
+    ) -> None:
+        """Idempotently ensure ``run.steer.accepted`` exists for one event.
+
+        Must be called with the target run's row already locked (``FOR
+        UPDATE`` / an implicit lock from an ``INSERT`` earlier in this same
+        transaction) so concurrent sequence-number assignment for
+        ``run_events`` serializes -- same discipline as
+        ``_append_event_sync`` / ``_commit_steering_consumptions_sync``.
+        """
+
+        cursor.execute(
+            f"""SELECT 1 FROM {self._schema}.run_events
+            WHERE tenant_id=%s AND run_id=%s AND kind='run.steer.accepted'
+              AND data->>'steering_event_id'=%s""",
+            (tenant_id, run_id, steering_event.id),
+        )
+        if cursor.fetchone() is not None:
+            return
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        sequence = int(cursor.fetchone()["next"])
+        data: dict[str, Any] = {
+            "steering_event_id": steering_event.id,
+            "sequence": steering_event.sequence,
+            "kind": steering_event.kind,
+        }
+        if transferred_from_run_id is not None:
+            data["transferred_from_run_id"] = transferred_from_run_id
+            data["source_event_id"] = steering_event.source_event_id
+        run_event = RunEvent(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=sequence,
+            kind="run.steer.accepted",
+            data=data,
+        )
+        cursor.execute(
+            f"""INSERT INTO {self._schema}.run_events
+            (id,tenant_id,run_id,sequence,kind,data,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                run_event.id,
+                tenant_id,
+                run_id,
+                sequence,
+                "run.steer.accepted",
+                self._jsonb(data),
+                run_event.created_at,
+            ),
+        )
 
     async def list_pending_steering(self, tenant_id, run_id):
         rows = await asyncio.to_thread(
@@ -1577,11 +1741,28 @@ class PostgresRepository(InMemoryRepository):
             # against the same paused run_id serialize instead of both
             # migrating (and superseding) the same steering rows.
             cursor.execute(
-                f"""SELECT metadata FROM {self._schema}.runs
+                f"""SELECT status, metadata FROM {self._schema}.runs
                 WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, old_run_id),
             )
             old_run_row = cursor.fetchone()
+            # Issue #16 PR #17 review round 4, point 1: the endpoint's own
+            # pre-check (``GET old run -> status == paused``) races with
+            # concurrent resumes and is not itself atomic with this call.
+            # Re-validate under the lock just acquired above -- still
+            # ``paused``, and not already superseded by a resume that won
+            # the race -- before creating a second descendant Run.
+            if old_run_row is None:
+                raise RunResumeConflictError(f"run {old_run_id!r} no longer exists")
+            old_run_metadata = dict(old_run_row.get("metadata") or {})
+            if (
+                old_run_row.get("status") != "paused"
+                or old_run_metadata.get("superseded_by_run_id") is not None
+            ):
+                raise RunResumeConflictError(
+                    f"run {old_run_id!r} is no longer resumable "
+                    "(it is not paused, or has already been resumed by a concurrent request)"
+                )
 
             cursor.execute(
                 f"""SELECT
@@ -1663,14 +1844,12 @@ class PostgresRepository(InMemoryRepository):
                 ),
             )
 
-            if old_run_row is not None:
-                metadata = dict(old_run_row.get("metadata") or {})
-                metadata["superseded_by_run_id"] = run.id
-                cursor.execute(
-                    f"""UPDATE {self._schema}.runs SET metadata=%s
-                    WHERE tenant_id=%s AND id=%s""",
-                    (self._jsonb(metadata), tenant_id, old_run_id),
-                )
+            old_run_metadata["superseded_by_run_id"] = run.id
+            cursor.execute(
+                f"""UPDATE {self._schema}.runs SET metadata=%s
+                WHERE tenant_id=%s AND id=%s""",
+                (self._jsonb(old_run_metadata), tenant_id, old_run_id),
+            )
 
             cursor.execute(
                 f"""SELECT * FROM {self._schema}.run_steering_events
@@ -1730,6 +1909,17 @@ class PostgresRepository(InMemoryRepository):
                             event.created_at,
                             event.source_event_id,
                         ),
+                    )
+                    # Record the transferred event's ``run.steer.accepted``
+                    # inside this same migration transaction (review round
+                    # 4, point 2) instead of a separate ``append_event``
+                    # call after this method returns.
+                    self._ensure_steer_accepted_event_sync(
+                        cursor,
+                        tenant_id,
+                        run.id,
+                        event,
+                        transferred_from_run_id=old_run_id,
                     )
                     transferred.append(event)
             return run, transferred
