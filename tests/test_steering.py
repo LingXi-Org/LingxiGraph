@@ -957,13 +957,19 @@ class DurableAckOrderingTests(unittest.TestCase):
             )
 
             registry = make_registry()
-            seen_graph_ids: list[int] = []
+            # Keep every bound graph alive for the rest of the test, not
+            # just its id(): CPython is free to reuse a freed object's
+            # memory address for the next allocation, so comparing ids of
+            # objects that were allowed to go out of scope is not a
+            # reliable "is this a genuinely distinct instance" check (this
+            # aliased in practice on 3.13's GC timing, id()s collided).
+            seen_graphs: list[object] = []
             compiled = registry.get("steerable")
             real_with_runtime = compiled.with_runtime
 
             def tracking_with_runtime(*args: Any, **kwargs: Any):
                 bound = real_with_runtime(*args, **kwargs)
-                seen_graph_ids.append(id(bound))
+                seen_graphs.append(bound)
                 return bound
 
             compiled.with_runtime = tracking_with_runtime  # type: ignore[method-assign]
@@ -996,7 +1002,7 @@ class DurableAckOrderingTests(unittest.TestCase):
                 else after_first_attempt.status
             )
             self.assertEqual(status, "pending")
-            self.assertEqual(len(seen_graph_ids), 1)
+            self.assertEqual(len(seen_graphs), 1)
 
             worker._stop = asyncio.Event()
             claimed_again = await worker.run_once()
@@ -1009,8 +1015,8 @@ class DurableAckOrderingTests(unittest.TestCase):
             # because the recovery source of truth is the ``pending`` DB
             # row, never anything held on the first attempt's discarded
             # graph/channel.
-            self.assertEqual(len(seen_graph_ids), 2)
-            self.assertNotEqual(seen_graph_ids[0], seen_graph_ids[1])
+            self.assertEqual(len(seen_graphs), 2)
+            self.assertIsNot(seen_graphs[0], seen_graphs[1])
 
             finished = await repo.get_run("acme", run.id)
             finished_status = (

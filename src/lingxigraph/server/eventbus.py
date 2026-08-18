@@ -140,14 +140,36 @@ class RedisEventBus:
         pubsub = self._redis.pubsub()
         try:
             await pubsub.subscribe(self._channel(tenant_id, run_id))
+            # ``get_message``'s own ``timeout`` defaults to 0.0 -- "return
+            # immediately, blocking for nothing" -- not "block until a
+            # message arrives". Without passing it explicitly here this
+            # call resolved near-instantly on every tick regardless of
+            # whether a message was published, so ``wait()`` was never
+            # actually blocking in production at all. Pass the real
+            # timeout through so redis-py performs the blocking read;
+            # ``_wait_cancellation_safe``'s own timer is then a secondary,
+            # cancellation-safe upper bound around it.
             await _wait_cancellation_safe(
-                pubsub.get_message(ignore_subscribe_messages=True), timeout
+                pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout),
+                timeout,
             )
+        except asyncio.CancelledError:
+            # A bare ``except Exception`` below would not normally catch
+            # this (CancelledError is a BaseException on 3.8+), but some
+            # libraries' internal read/retry loops (e.g. redis-py's
+            # connection handling) can translate an in-flight
+            # cancellation into a different exception type while
+            # unwinding. Re-raise explicitly and unconditionally so a
+            # heartbeat cancellation can never be silently absorbed here
+            # regardless of what the client library does internally.
+            raise
         except Exception:
             return
         finally:
             try:
                 await pubsub.aclose()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
 
