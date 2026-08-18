@@ -633,6 +633,44 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    @unittest.skipUnless(REDIS_URL, "Redis integration URL not configured")
+    def test_redis_event_bus_wait_returns_promptly_when_heartbeat_is_cancelled(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 6, point 4 (REQUIRED consistency
+        fix): round 5 rewrote ``InMemoryEventBus.wait()`` away from
+        ``asyncio.wait_for(...)`` because cancelling the *caller* while it
+        is in-flight can hang forever on Python 3.11 -- but the production
+        ``RedisEventBus.wait()`` still used that exact pattern, and
+        ``Worker._heartbeat`` cancels a Redis-backed heartbeat exactly the
+        same way as an in-memory one. Reproduce that cancellation directly
+        against ``RedisEventBus.wait()`` (mirroring how ``Worker._execute``
+        does ``heartbeat.cancel(); await asyncio.gather(heartbeat, ...)``)
+        and assert it unblocks promptly instead of hanging.
+        """
+
+        from lingxigraph.server.eventbus import RedisEventBus
+
+        async def scenario() -> None:
+            prefix = "lingxigraph-test-" + uuid4().hex
+            bus = RedisEventBus(REDIS_URL, prefix=prefix)
+            try:
+                # A long timeout: if cancellation does not propagate
+                # promptly, this task hangs for (approximately) this long
+                # instead of returning almost immediately below.
+                waiter = asyncio.create_task(bus.wait("tenant", "run", timeout=30))
+                await asyncio.sleep(0.1)
+                waiter.cancel()
+                start = asyncio.get_event_loop().time()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(waiter, timeout=2)
+                elapsed = asyncio.get_event_loop().time() - start
+                self.assertLess(elapsed, 2.0)
+            finally:
+                await bus.close()
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

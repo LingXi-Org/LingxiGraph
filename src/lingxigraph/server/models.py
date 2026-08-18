@@ -121,6 +121,12 @@ class Run(ApiModel):
     attempt: int = 0
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
+    #: Set atomically by the owning worker once graph execution has ended
+    #: and before it starts the final steering flush + finalization commit
+    #: (issue #16 PR #17 review round 6, point 3). Once set, ``/steer``
+    #: must refuse new admission -- there is no safe point left for the
+    #: graph to ever consume a newly-accepted event.
+    steering_closed: bool = False
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None

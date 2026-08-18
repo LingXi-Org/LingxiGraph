@@ -5,7 +5,53 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
-from typing import Protocol
+from collections.abc import Awaitable
+from typing import Protocol, TypeVar
+
+_T = TypeVar("_T")
+
+
+async def _wait_cancellation_safe(awaitable: Awaitable[_T], timeout: float) -> _T | None:
+    """Await ``awaitable`` with a timeout, safely under external cancellation.
+
+    Issue #16 PR #17 review round 5, point 4 / round 6, point 4: this is
+    deliberately *not* ``asyncio.wait_for(awaitable, timeout)``. On
+    Python's asyncio (still true on the 3.11 runtime this project
+    targets), ``wait_for`` wraps the awaitable in its own inner Task and,
+    if the *outer* coroutine awaiting ``wait_for`` is itself cancelled --
+    exactly what happens when ``Worker._heartbeat`` is cancelled by
+    ``Worker._execute`` right as an ``EventBus.wait()`` call is in-flight
+    -- there is a real, reproducible race where that inner Task's
+    cancellation is never actually awaited to completion, hanging forever
+    (https://github.com/python/cpython/issues/86296, fixed by
+    ``asyncio.timeout()`` in 3.12). Racing an explicit sibling timer task
+    with ``asyncio.wait`` does not share that failure mode: an external
+    cancellation of *this* coroutine while it is suspended inside
+    ``asyncio.wait`` propagates immediately and unconditionally, the same
+    as any other plain ``await``.
+
+    Both :class:`InMemoryEventBus` and :class:`RedisEventBus` share this
+    helper so the fix applies to the production Redis path too, not just
+    the in-memory/test bus -- a heartbeat cancelled while blocked in
+    ``RedisEventBus.wait()`` must return just as promptly as one blocked
+    in ``InMemoryEventBus.wait()``.
+
+    Returns the awaitable's result, or ``None`` on timeout or if it
+    raised (callers here treat both as "nothing arrived in time").
+    """
+
+    waiter = asyncio.ensure_future(awaitable)
+    timer = asyncio.ensure_future(asyncio.sleep(timeout))
+    try:
+        await asyncio.wait({waiter, timer}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for pending in (waiter, timer):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(waiter, timer, return_exceptions=True)
+    if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+        return waiter.result()
+    return None
 
 
 class EventBus(Protocol):
@@ -45,29 +91,9 @@ class InMemoryEventBus:
 
     async def wait(self, tenant_id: str, run_id: str, *, timeout: float = 15.0) -> None:
         event = self._events[(tenant_id, run_id)]
-        # Deliberately *not* ``asyncio.wait_for(event.wait(), timeout)``:
-        # on Python's asyncio (still true on the 3.11 runtime this project
-        # targets), ``wait_for`` wraps the awaitable in its own inner Task
-        # and, if the *outer* coroutine awaiting ``wait_for`` is itself
-        # cancelled (exactly what happens here -- ``Worker._heartbeat`` is
-        # cancelled by ``Worker._execute`` right as this call is
-        # in-flight), there is a real, reproducible race where that inner
-        # Task's cancellation is never actually awaited to completion,
-        # hanging forever (https://github.com/python/cpython/issue/86296,
-        # fixed by ``asyncio.timeout()`` in 3.12). ``asyncio.wait`` with an
-        # explicit sibling timeout task does not share that failure mode:
-        # an external cancellation of *this* coroutine while it is
-        # suspended inside ``asyncio.wait`` propagates immediately and
-        # unconditionally, the same as any other plain ``await``.
-        waiter = asyncio.ensure_future(event.wait())
-        timer = asyncio.ensure_future(asyncio.sleep(timeout))
         try:
-            await asyncio.wait({waiter, timer}, return_when=asyncio.FIRST_COMPLETED)
+            await _wait_cancellation_safe(event.wait(), timeout)
         finally:
-            for pending in (waiter, timer):
-                if not pending.done():
-                    pending.cancel()
-            await asyncio.gather(waiter, timer, return_exceptions=True)
             # Reset for the next waiter. A publish() landing in the
             # instant between this waiter waking and the clear() below is
             # simply an extra, harmless early wake for whoever waits next
@@ -102,10 +128,21 @@ class RedisEventBus:
             return
 
     async def wait(self, tenant_id: str, run_id: str, *, timeout: float = 15.0) -> None:
+        # Issue #16 PR #17 review round 6, point 4 (REQUIRED): this used to
+        # be ``asyncio.wait_for(pubsub.get_message(...), timeout)`` -- the
+        # exact pattern this same round's ``InMemoryEventBus.wait()`` fix
+        # rewrote away from because it can hang forever when the *caller*
+        # (``Worker._heartbeat``) is cancelled mid-wait. The Worker
+        # cancels a Redis-backed heartbeat exactly the same way as an
+        # in-memory one, so the production Redis path needs the same
+        # cancellation-safe explicit task/timer pattern, via the bus-
+        # agnostic ``_wait_cancellation_safe`` helper both classes share.
         pubsub = self._redis.pubsub()
         try:
             await pubsub.subscribe(self._channel(tenant_id, run_id))
-            await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True), timeout)
+            await _wait_cancellation_safe(
+                pubsub.get_message(ignore_subscribe_messages=True), timeout
+            )
         except Exception:
             return
         finally:

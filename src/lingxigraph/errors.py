@@ -61,6 +61,21 @@ class RunSupersededError(LingxiGraphError):
     """
 
 
+class RunFinalizingError(LingxiGraphError):
+    """Raised when steering targets a Run whose graph has already ended.
+
+    Issue #16 PR #17 review round 6, point 3: once a worker's graph
+    execution reaches its terminal outcome, the normal heartbeat/steering
+    loop stops and there is no safe point left for the graph to ever
+    consume a newly-accepted steering event -- even though the Run row
+    may still read ``running``/``cancelling`` while the final flush and
+    finalization commit are in flight. ``Repository.close_steering`` sets
+    an atomic, lease-fenced gate the instant execution ends so a late
+    ``/steer`` call during this window fails loudly with a stable error
+    instead of being durably accepted into an inbox nobody will ever read.
+    """
+
+
 class RunResumeConflictError(LingxiGraphError):
     """Raised when a resume attempt loses a race against a concurrent resume.
 
@@ -97,6 +112,7 @@ __all__ = [
     "IdempotencyConflictError",
     "LingxiGraphError",
     "PersistenceError",
+    "RunFinalizingError",
     "RunResumeConflictError",
     "RunSupersededError",
     "RunTerminalError",

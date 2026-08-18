@@ -247,67 +247,142 @@ class Worker:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
-        # Final flush: anything drained between the last heartbeat tick and
-        # run completion must still be recorded as consumed, durably,
-        # before the run's outcome above is committed. See
-        # ``_final_steering_flush`` for why this retries for as long as it
-        # holds the lease rather than giving up after a handful of
-        # attempts (issue #16 PR #17 review round 5, point 2).
-        flushed = await self._final_steering_flush(run, graph)
-        if flushed:
-            await self._commit_intent(run, intent)
-            graph.forget_steering(run.id)
-            return
+        # Issue #16 PR #17 review round 6, point 3 (BLOCKER): close new
+        # steering admission the instant graph execution ends and *before*
+        # the final flush/commit start -- there is no safe point left for
+        # the graph to ever consume a steering event accepted after this.
+        # This is fenced on our own (lease_owner, attempt): if we no
+        # longer hold the lease (e.g. it already expired and a new worker
+        # claimed the run), this fails and we must abandon the attempt
+        # without touching the run's status at all -- the new owner is now
+        # solely responsible for it (review round 6, point 1, BLOCKER).
+        #
+        # A ``paused`` outcome is deliberately excluded: pausing does not
+        # mean "no safe point left" the way a terminal outcome does --
+        # ``/steer`` against a paused run is an intentional, documented
+        # part of issue #16's design (the pending steering is transferred
+        # to the resumed run at ``/resume`` time), so it must keep
+        # accepting new steering input, not be permanently gated shut by
+        # a worker that is merely yielding control, not finishing.
+        closing_steering = not (
+            intent.kind == "finish" and intent.status is RunStatus.PAUSED
+        )
+        if closing_steering:
+            gate_closed = await self.repository.close_steering(
+                run.tenant_id, run.id, self.worker_id, run.attempt
+            )
+            if not gate_closed:
+                logger.warning(
+                    "run finalization abandoned: lease no longer owned before steering close",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                )
+                return
 
-        # The flush never durably succeeded (the worker is draining, or
-        # this run's lease was lost to another worker) -- the intended
-        # outcome computed above must NEVER be written; doing so would
-        # either expose a false terminal/paused status or silently strand
-        # the drained-but-uncommitted steering consumptions. Route the run
-        # into the same retry/dead-letter path an ordinary delivery
-        # failure uses, so a later delivery attempt resyncs and retries
-        # the commit from the still-``pending`` DB row.
-        flush_error = {
-            "code": "steering_flush_failed",
-            "message": (
-                "durable steering consumption commit could not complete before this "
-                "worker gave up its lease; run finalization was withheld to avoid "
-                "reporting a false status or losing the consumption"
-            ),
-        }
-        if run.attempt < self.max_delivery_attempts:
-            await self.repository.retry_run(run.tenant_id, run.id, error=flush_error)
-            stored = await self.repository.append_event(
-                run.tenant_id,
-                run.id,
-                "worker_retrying",
-                {
-                    "attempt": run.attempt,
-                    "max_attempts": self.max_delivery_attempts,
-                    "error": flush_error,
-                },
-            )
-            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-            logger.warning(
-                "run finalization retried: final steering flush failed",
-                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
-            )
-        else:
-            await self.repository.finish_run(
-                run.tenant_id, run.id, RunStatus.DEAD_LETTER, error=flush_error
-            )
-            logger.error(
-                "run dead-lettered: final steering flush failed after max attempts",
-                extra={
-                    "run_id": run.id,
-                    "tenant_id": run.tenant_id,
-                    "status": RunStatus.DEAD_LETTER.value,
-                },
-            )
-        # Do NOT forget_steering here: the channel's local consumption log
-        # is the only surviving record of what was drained, and must stay
-        # intact for the redelivery above to resync and retry the commit
-        # instead of silently losing it.
+        # Issue #16 PR #17 review round 6, point 1 (BLOCKER): the lease
+        # lifecycle must stay alive through the *entire* finalization
+        # window, independent of the now-cancelled steering/event
+        # heartbeat -- the final flush can legitimately retry for a long
+        # time, and without this the lease can simply expire mid-flush,
+        # letting a new worker claim and even finish the run while we are
+        # still blocked, unaware our writes are no longer safe.
+        renewal = asyncio.create_task(self._lease_renewal_loop(run))
+        try:
+            # Final flush: anything drained between the last heartbeat tick
+            # and run completion must still be recorded as consumed,
+            # durably, before the run's outcome above is committed. See
+            # ``_final_steering_flush`` for why this retries for as long as
+            # it holds the lease rather than giving up after a handful of
+            # attempts (issue #16 PR #17 review round 5, point 2).
+            flushed = await self._final_steering_flush(run, graph)
+            if flushed:
+                committed = await self._commit_intent(run, intent)
+                if committed:
+                    graph.forget_steering(run.id)
+                return
+
+            # The flush never durably succeeded (the worker is draining, or
+            # this run's lease was lost to another worker) -- the intended
+            # outcome computed above must NEVER be written; doing so would
+            # either expose a false terminal/paused status or silently
+            # strand the drained-but-uncommitted steering consumptions.
+            # Route the run into the same retry/dead-letter path an
+            # ordinary delivery failure uses, so a later delivery attempt
+            # resyncs and retries the commit from the still-``pending`` DB
+            # row. Every write below is fenced on (lease_owner, attempt) --
+            # see ``finish_run_if_owned``/``retry_run_if_owned`` -- so a
+            # worker that has lost its lease mid-flush can never revert a
+            # new owner's run back to pending or overwrite its status
+            # (review round 6, point 1, BLOCKER).
+            flush_error = {
+                "code": "steering_flush_failed",
+                "message": (
+                    "durable steering consumption commit could not complete before this "
+                    "worker gave up its lease; run finalization was withheld to avoid "
+                    "reporting a false status or losing the consumption"
+                ),
+            }
+            if run.attempt < self.max_delivery_attempts:
+                updated = await self.repository.retry_run_if_owned(
+                    run.tenant_id, run.id, self.worker_id, run.attempt, error=flush_error
+                )
+                if updated is None:
+                    logger.warning(
+                        "run finalization abandoned: lease lost during flush-failed retry",
+                        extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                    )
+                    return
+                stored = await self.repository.append_event(
+                    run.tenant_id,
+                    run.id,
+                    "worker_retrying",
+                    {
+                        "attempt": run.attempt,
+                        "max_attempts": self.max_delivery_attempts,
+                        "error": flush_error,
+                    },
+                )
+                await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+                logger.warning(
+                    "run finalization retried: final steering flush failed",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+                )
+            else:
+                updated = await self.repository.finish_run_if_owned(
+                    run.tenant_id,
+                    run.id,
+                    self.worker_id,
+                    run.attempt,
+                    RunStatus.DEAD_LETTER,
+                    error=flush_error,
+                )
+                if updated is None:
+                    logger.warning(
+                        "run finalization abandoned: lease lost before dead-lettering",
+                        extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                    )
+                    return
+                logger.error(
+                    "run dead-lettered: final steering flush failed after max attempts",
+                    extra={
+                        "run_id": run.id,
+                        "tenant_id": run.tenant_id,
+                        "status": updated.status
+                        if isinstance(updated.status, str)
+                        else updated.status.value,
+                    },
+                )
+            # Do NOT forget_steering here. Not because this channel's local
+            # consumption log will be reused later -- ``with_runtime()``
+            # builds a brand new graph/channel on every delivery attempt
+            # (issue #16 PR #17 review round 5, point 2), so this exact
+            # object is discarded regardless. Recovery is driven entirely
+            # by the still-``pending`` DB row a future attempt re-reads via
+            # ``list_pending_steering``, not by anything held in this
+            # channel across the attempt boundary -- forgetting here is
+            # simply unnecessary, not unsafe.
+        finally:
+            renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
 
     @dataclasses.dataclass
     class _Intent:
@@ -322,16 +397,35 @@ class Worker:
         output: dict[str, Any] | None = None
         error: dict[str, Any] | None = None
 
-    async def _commit_intent(self, run: Run, intent: "Worker._Intent") -> None:
+    async def _commit_intent(self, run: Run, intent: "Worker._Intent") -> bool:
         """Write the previously-computed intended outcome, exactly once.
 
         Only ever called after the final steering flush has durably
         succeeded, so this is the single point where a terminal/paused
         status first becomes externally observable.
+
+        Issue #16 PR #17 review round 6, points 1 and 2 (BLOCKER): this
+        write is fenced on our own ``(lease_owner, attempt)`` via
+        ``finish_run_if_owned``/``retry_run_if_owned`` -- if we no longer
+        hold the lease (a new worker claimed the run while our flush was
+        still in flight), the write is refused entirely and this returns
+        ``False`` so the caller does not call ``forget_steering()`` on a
+        channel whose consumption record may still matter. The fenced
+        write also re-checks the run's current control state atomically:
+        if it is ``cancelling``, cancellation wins over a stale
+        ``succeeded``/``failed`` intent regardless of arrival order.
         """
 
         if intent.kind == "retry":
-            await self.repository.retry_run(run.tenant_id, run.id, error=intent.error)
+            updated = await self.repository.retry_run_if_owned(
+                run.tenant_id, run.id, self.worker_id, run.attempt, error=intent.error
+            )
+            if updated is None:
+                logger.warning(
+                    "run retry commit abandoned: lease no longer owned",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                )
+                return False
             stored = await self.repository.append_event(
                 run.tenant_id,
                 run.id,
@@ -347,25 +441,69 @@ class Worker:
                 "run delivery scheduled for retry",
                 extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
             )
-            return
+            return True
 
-        await self.repository.finish_run(
-            run.tenant_id, run.id, intent.status, output=intent.output, error=intent.error
+        updated = await self.repository.finish_run_if_owned(
+            run.tenant_id,
+            run.id,
+            self.worker_id,
+            run.attempt,
+            intent.status,
+            output=intent.output,
+            error=intent.error,
         )
-        if intent.status is RunStatus.SUCCEEDED:
+        if updated is None:
+            logger.warning(
+                "run finalize commit abandoned: lease no longer owned",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id},
+            )
+            return False
+        final_status = updated.status if isinstance(updated.status, str) else updated.status.value
+        if final_status == RunStatus.SUCCEEDED.value:
             logger.info(
                 "run succeeded",
                 extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "succeeded"},
             )
-        elif intent.status in (RunStatus.DEAD_LETTER, RunStatus.FAILED) and intent.error:
+        elif final_status == RunStatus.CANCELLED.value and intent.status != RunStatus.CANCELLED:
+            logger.info(
+                "run cancelled during finalization, overriding stale %s intent",
+                intent.status.value if hasattr(intent.status, "value") else intent.status,
+                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "cancelled"},
+            )
+        elif final_status in (RunStatus.DEAD_LETTER.value, RunStatus.FAILED.value) and intent.error:
             logger.error(
                 "run delivery failed",
                 extra={
                     "run_id": run.id,
                     "tenant_id": run.tenant_id,
-                    "status": intent.status.value,
+                    "status": final_status,
                 },
             )
+        return True
+
+    async def _lease_renewal_loop(self, run: Run) -> None:
+        """Keep the run's lease alive through the whole finalization window.
+
+        Issue #16 PR #17 review round 6, point 1 (BLOCKER): coupling lease
+        renewal solely to the ordinary steering/event heartbeat -- which
+        ``_execute`` cancels the moment the graph finishes -- lets the
+        lease simply expire while the final flush is still retrying,
+        letting a new worker claim (and even finish) the run out from
+        under us. This loop renews the lease on its own schedule for as
+        long as it runs; ``_execute`` cancels it once finalization (flush
+        + fenced commit) is fully done, one way or another.
+        """
+
+        try:
+            while True:
+                await asyncio.sleep(self.heartbeat_seconds)
+                alive = await self.repository.heartbeat(
+                    run.tenant_id, run.id, self.worker_id, lease_seconds=self.lease_seconds
+                )
+                if not alive:
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _final_steering_flush(
         self, run: Run, graph: Any, *, base_delay: float = 0.5, max_delay: float = 10.0
@@ -401,6 +539,14 @@ class Worker:
 
         channel = graph.get_steering_channel(run.id)
         attempt = 0
+        # Iterative capped growth rather than ``base_delay * 2 ** (attempt
+        # - 1)``: the latter computes a potentially enormous exponent
+        # before ``min()`` ever clamps it, which is wasted (and, given an
+        # unbounded retry count against a very long DB outage,
+        # eventually pathological) work. Doubling and clamping in place
+        # reaches the same steady-state ``max_delay`` without ever
+        # computing an intermediate value larger than that cap.
+        delay = base_delay
         while True:
             consumed = channel.peek_consumed()
             if not consumed:
@@ -419,8 +565,8 @@ class Worker:
                 )
                 if self._stop.is_set():
                     return False
-                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
                 await asyncio.sleep(delay)
+                delay = min(max_delay, delay * 2)
                 # Keep the lease alive while we keep retrying so another
                 # worker does not reclaim this run mid-flush and construct
                 # a competing graph/channel of its own.

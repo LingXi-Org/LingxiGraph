@@ -24,6 +24,7 @@ from ..errors import (
     ConcurrentRunError,
     EmptyInputError,
     IdempotencyConflictError,
+    RunFinalizingError,
     RunResumeConflictError,
     RunSupersededError,
     RunTerminalError,
@@ -205,6 +206,10 @@ def create_app(
     @app.exception_handler(RunResumeConflictError)
     async def run_resume_conflict_error(request: Request, exc: RunResumeConflictError):
         return _problem(request, 409, "run_resume_conflict", str(exc))
+
+    @app.exception_handler(RunFinalizingError)
+    async def run_finalizing_error(request: Request, exc: RunFinalizingError):
+        return _problem(request, 409, "run_finalizing", str(exc))
 
     @app.exception_handler(SteeringPayloadTooLarge)
     async def steering_payload_error(request: Request, exc: SteeringPayloadTooLarge):

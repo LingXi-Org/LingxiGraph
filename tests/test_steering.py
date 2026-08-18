@@ -1029,6 +1029,318 @@ class DurableAckOrderingTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class FinalizationFencingTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 6 (BLOCKERs 1-3): all writes a worker
+    makes during finalization must be fenced on its own
+    ``(lease_owner, attempt)``, cancellation must win over a stale
+    non-cancel intent inside that same fenced decision, and new steering
+    admission must close before the final flush starts."""
+
+    def test_stale_worker_cannot_revert_a_new_owners_lease_or_status(self) -> None:
+        """Round 6, point 1 (BLOCKER): worker A claims with a very short
+        lease and blocks inside the final flush; once the lease expires,
+        worker B claims the same run; releasing A's block must not let A's
+        now-stale finalization commit touch B's run at all."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            worker_a = Worker(
+                make_registry(), repo, worker_id="worker-a", lease_seconds=1, heartbeat_seconds=10
+            )
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker_a._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            gate = asyncio.Event()
+            flush_entered = asyncio.Event()
+            real_commit = repo.commit_steering_consumptions
+
+            async def gated_commit(tenant_id, run_id, consumptions):
+                flush_entered.set()
+                await gate.wait()
+                return await real_commit(tenant_id, run_id, consumptions)
+
+            repo.commit_steering_consumptions = gated_commit  # type: ignore[method-assign]
+
+            execute_task = asyncio.ensure_future(worker_a.run_once())
+            await asyncio.wait_for(flush_entered.wait(), timeout=5)
+
+            # Let A's 1-second lease actually expire without being renewed
+            # (its heartbeat_seconds=10 means the independent finalization
+            # renewal loop will not have ticked yet).
+            await asyncio.sleep(1.3)
+
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            self.assertIsNotNone(claimed_b)
+            self.assertEqual(claimed_b.id, run.id)
+            self.assertEqual(claimed_b.lease_owner, "worker-b")
+            self.assertEqual(claimed_b.attempt, 2)
+
+            # Now release A's blocked flush -- its commit succeeds, but its
+            # subsequent fenced finalize write must be refused because it
+            # no longer owns the lease/attempt.
+            gate.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+
+            after = await repo.get_run("acme", run.id)
+            self.assertEqual(after.lease_owner, "worker-b")
+            self.assertEqual(after.attempt, 2)
+            status = after.status.value if hasattr(after.status, "value") else after.status
+            self.assertIn(status, ("running", "cancelling"))
+            self.assertNotEqual(status, "pending")
+            self.assertNotEqual(status, "succeeded")
+
+        asyncio.run(scenario())
+
+    def test_stale_worker_cannot_revert_new_owner_via_flush_failure_retry_path(self) -> None:
+        """Round 6, point 1 (BLOCKER), the mirror case: A's final flush
+        never succeeds at all (durable commit keeps failing) and A falls
+        back to its retry/dead-letter path -- that path's writes must also
+        be fenced, so A cannot reset B's actively-running attempt back to
+        ``pending``."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            worker_a = Worker(
+                make_registry(), repo, worker_id="worker-a", lease_seconds=1, heartbeat_seconds=10
+            )
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker_a._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def always_fails(tenant_id, run_id, consumptions):
+                entered.set()
+                await release.wait()
+                raise ConnectionError("simulated persistent database outage")
+
+            repo.commit_steering_consumptions = always_fails  # type: ignore[method-assign]
+
+            execute_task = asyncio.ensure_future(worker_a.run_once())
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            await asyncio.sleep(1.3)
+
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            self.assertIsNotNone(claimed_b)
+            self.assertEqual(claimed_b.attempt, 2)
+
+            release.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+
+            after = await repo.get_run("acme", run.id)
+            self.assertEqual(after.lease_owner, "worker-b")
+            self.assertEqual(after.attempt, 2)
+            status = after.status.value if hasattr(after.status, "value") else after.status
+            self.assertIn(status, ("running", "cancelling"))
+
+        asyncio.run(scenario())
+
+    def test_cancel_always_wins_over_a_stale_success_intent_during_finalization(
+        self,
+    ) -> None:
+        """Round 6, point 2 (BLOCKER): the graph has already computed a
+        SUCCEEDED intent and the heartbeat is cancelled before a client's
+        cancel request lands; the fenced finalize write must observe the
+        run is ``cancelling`` and coerce the outcome to ``cancelled``,
+        never letting the stale ``succeeded`` intent win."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            # The graph here has no steering to drain, so the final flush
+            # itself is a no-op -- gate the fenced finalize write instead,
+            # which is exactly where round 6 point 2 requires the
+            # cancelling re-check to happen.
+            gate = asyncio.Event()
+            commit_entered = asyncio.Event()
+            real_finish = repo.finish_run_if_owned
+
+            async def gated_finish(*args: Any, **kwargs: Any):
+                commit_entered.set()
+                await gate.wait()
+                return await real_finish(*args, **kwargs)
+
+            repo.finish_run_if_owned = gated_finish  # type: ignore[method-assign]
+
+            execute_task = asyncio.ensure_future(worker.run_once())
+            await asyncio.wait_for(commit_entered.wait(), timeout=5)
+
+            # Cancellation arrives while the run still reads
+            # running/cancelling (finalization has not committed yet).
+            cancelled = await repo.request_cancel("acme", run.id)
+            self.assertTrue(cancelled)
+            mid_status = await repo.get_run("acme", run.id)
+            self.assertEqual(
+                mid_status.status.value
+                if hasattr(mid_status.status, "value")
+                else mid_status.status,
+                "cancelling",
+            )
+
+            gate.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+
+            final = await repo.get_run("acme", run.id)
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
+            self.assertEqual(final_status, "cancelled")
+            self.assertNotEqual(final_status, "succeeded")
+
+        asyncio.run(scenario())
+
+
+class SteeringClosedGateTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 6, point 3 (BLOCKER): once graph
+    execution ends there is no safe point left for a newly accepted
+    steering event to ever be consumed, even though the Run row may still
+    read ``running``/``cancelling`` while the final flush is in flight."""
+
+    def test_steer_during_finalization_window_gets_a_stable_error_not_a_stuck_pending_row(
+        self,
+    ) -> None:
+        from lingxigraph.errors import RunFinalizingError
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            gate = asyncio.Event()
+            commit_entered = asyncio.Event()
+            real_finish = repo.finish_run_if_owned
+
+            async def gated_finish(*args: Any, **kwargs: Any):
+                commit_entered.set()
+                await gate.wait()
+                return await real_finish(*args, **kwargs)
+
+            repo.finish_run_if_owned = gated_finish  # type: ignore[method-assign]
+
+            execute_task = asyncio.ensure_future(worker.run_once())
+            await asyncio.wait_for(commit_entered.wait(), timeout=5)
+
+            # The graph has already reached END (no safe point left) but
+            # the run row still reads running/cancelling -- this is
+            # exactly the window round 6 point 3 is about.
+            still_active = await repo.get_run("acme", run.id)
+            status = (
+                still_active.status.value
+                if hasattr(still_active.status, "value")
+                else still_active.status
+            )
+            self.assertIn(status, ("running", "cancelling"))
+            self.assertTrue(still_active.steering_closed)
+
+            with self.assertRaises(RunFinalizingError):
+                await repo.submit_steering(
+                    "acme", run.id, kind="user_input", payload={"message": "too late"}
+                )
+
+            gate.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+
+            # Never a terminal run with a pending steering inbox nobody
+            # will ever consume.
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+            final = await repo.get_run("acme", run.id)
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
+            self.assertEqual(final_status, "succeeded")
+
+        asyncio.run(scenario())
+
+    def test_steering_closed_gate_resets_on_a_fresh_delivery_attempt(self) -> None:
+        """A gate closed by an earlier, now-abandoned attempt must not
+        leak into the next delivery attempt's fresh claim -- otherwise a
+        perfectly ordinary retried run would spuriously reject all
+        ``/steer`` calls forever."""
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed is not None
+            closed = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(closed)
+
+            await asyncio.sleep(1.2)
+            reclaimed = await repo.claim_run("worker-b", lease_seconds=30)
+            assert reclaimed is not None
+            self.assertEqual(reclaimed.attempt, 2)
+            self.assertFalse(reclaimed.steering_closed)
+
+            # Steering must be accepted normally under the new attempt.
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "hello"}
+            )
+            self.assertTrue(created)
+            self.assertEqual(accepted.status, "pending")
+
+        asyncio.run(scenario())
+
+
 class AtomicSteerAcceptedEventTests(unittest.TestCase):
     """Issue #16 PR #17 review round 4, point 2: accepting a steering row
     and recording its ``run.steer.accepted`` lifecycle event must be a
@@ -1431,6 +1743,26 @@ def make_registry() -> GraphRegistry:
     builder.add_edge(START, "wait_for_stop")
     builder.add_conditional_edges("wait_for_stop", should_continue)
     return GraphRegistry({"steerable": builder.compile()})
+
+
+def make_registry_double() -> GraphRegistry:
+    """A trivial, near-instant single-node graph registered as ``double``.
+
+    Used by the round 6 finalization-fencing/gate tests, which need the
+    graph to reach its terminal outcome (and the worker to enter its
+    finalization window) almost immediately, without any steering to
+    drain along the way.
+    """
+
+    builder = StateGraph(State)
+
+    async def double(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+        return {"ticks": state.get("ticks", 0) + 1}
+
+    builder.add_node("double", double)
+    builder.add_edge(START, "double")
+    builder.add_edge("double", END)
+    return GraphRegistry({"double": builder.compile()})
 
 
 class ServerSteeringTests(unittest.TestCase):
