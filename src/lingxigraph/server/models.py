@@ -127,6 +127,16 @@ class Run(ApiModel):
     #: must refuse new admission -- there is no safe point left for the
     #: graph to ever consume a newly-accepted event.
     steering_closed: bool = False
+    #: Set atomically by the resume transaction that creates a descendant
+    #: run from this (paused) run (issue #16 PR #17 review round 14,
+    #: BLOCKER). This is authoritative control-plane lineage state -- it
+    #: MUST NOT live in user-writable ``metadata``, since a caller could
+    #: otherwise forge it at run-creation time to falsely trigger
+    #: ``409 run_superseded`` / ``409 run_resume_conflict`` on a run that
+    #: was never actually resumed. ``/steer``, ``/cancel``, and the
+    #: concurrent-resume conflict gate all read this field, never
+    #: ``metadata.get("superseded_by_run_id")``.
+    superseded_by_run_id: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None

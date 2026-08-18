@@ -268,7 +268,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             self.assertEqual(descendants[0].id, winner_run.id)
 
             final_old = await repo.get_run("acme", old_run.id)
-            self.assertEqual(final_old.metadata.get("superseded_by_run_id"), winner_run.id)
+            self.assertEqual(final_old.superseded_by_run_id, winner_run.id)
 
         asyncio.run(scenario())
 
@@ -335,11 +335,92 @@ class PostgresIntegrationTests(unittest.TestCase):
                 new_run, _transferred = resume_result
                 self.assertEqual(descendants[0].id, new_run.id)
                 self.assertEqual(final_old.status, "paused")
-                self.assertEqual(final_old.metadata.get("superseded_by_run_id"), new_run.id)
+                self.assertEqual(final_old.superseded_by_run_id, new_run.id)
 
                 # The real descendant remains genuinely cancellable.
                 really_cancelled = await repo.request_cancel("acme", new_run.id)
                 self.assertTrue(really_cancelled)
+
+        asyncio.run(scenario())
+
+    def test_superseded_by_run_id_typed_column_against_live_postgres(self) -> None:
+        """Issue #16 PR #17 review round 14 (BLOCKER), PostgreSQL path.
+
+        Exercises the real ``runs.superseded_by_run_id`` column (added by
+        the ``0005_superseded_by_run_id`` migration) end to end against a
+        live database: forged ``metadata.superseded_by_run_id`` must be
+        inert for /steer, /cancel, and /resume, and a real resume must
+        write the typed column atomically in the same transaction that
+        creates the descendant run and migrates its steering.
+        """
+
+        from lingxigraph.errors import RunSupersededError
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+
+            # A run created with a forged ``metadata.superseded_by_run_id``
+            # must never have that reflected in the typed column, and must
+            # never be spuriously superseded on /steer or /cancel.
+            forged = RunCreate(
+                assistant_id=assistant.id,
+                input={},
+                metadata={"superseded_by_run_id": "some-other-run-that-never-existed"},
+            )
+            forged_run = await repo.create_run("acme", thread.id, assistant, forged)
+            self.assertIsNone(forged_run.superseded_by_run_id)
+            self.assertEqual(
+                forged_run.metadata.get("superseded_by_run_id"),
+                "some-other-run-that-never-existed",
+            )
+            event, created = await repo.submit_steering(
+                "acme", forged_run.id, kind="user_input", payload={"m": 1}
+            )
+            self.assertTrue(created)
+            self.assertEqual(event.status, "pending")
+            cancelled = await repo.request_cancel("acme", forged_run.id)
+            self.assertTrue(cancelled)
+
+            # The same forged metadata on a genuinely ``paused`` run must
+            # not block a real /resume with a false RunResumeConflictError.
+            forged_thread = await repo.create_thread("acme", ThreadCreate())
+            forged_paused = await repo.create_run("acme", forged_thread.id, assistant, forged)
+            await repo.finish_run("acme", forged_paused.id, "paused", output={})
+            resume_request = RunCreate(assistant_id=assistant.id, resume=1)
+            resumed_run, _ = await repo.resume_run_with_pending_steering(
+                "acme", forged_thread.id, assistant, resume_request, forged_paused.id
+            )
+            self.assertIsNotNone(resumed_run.id)
+
+            # A REAL resume must write the typed column atomically and
+            # gate /steer and /cancel on it.
+            real_thread = await repo.create_thread("acme", ThreadCreate())
+            real_old = await repo.create_run(
+                "acme",
+                real_thread.id,
+                assistant,
+                RunCreate(assistant_id=assistant.id, input={}),
+            )
+            await repo.finish_run("acme", real_old.id, "paused", output={})
+            real_new, _ = await repo.resume_run_with_pending_steering(
+                "acme", real_thread.id, assistant, resume_request, real_old.id
+            )
+            real_old_after = await repo.get_run("acme", real_old.id)
+            self.assertEqual(real_old_after.superseded_by_run_id, real_new.id)
+            self.assertEqual(real_old_after.metadata, {})
+            with self.assertRaises(RunSupersededError):
+                await repo.submit_steering(
+                    "acme", real_old.id, kind="user_input", payload={"m": 1}
+                )
+            with self.assertRaises(RunSupersededError):
+                await repo.request_cancel("acme", real_old.id)
 
         asyncio.run(scenario())
 
@@ -375,7 +456,9 @@ class PostgresIntegrationTests(unittest.TestCase):
             )
             self.assertTrue(created)
             accepted = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
             ]
             self.assertEqual(len(accepted), 1)
 
@@ -391,7 +474,9 @@ class PostgresIntegrationTests(unittest.TestCase):
                     ("acme", run.id),
                 )
             gap = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
             ]
             self.assertEqual(gap, [])
 
@@ -403,7 +488,9 @@ class PostgresIntegrationTests(unittest.TestCase):
             self.assertFalse(retried_created)
             self.assertEqual(retried_event.id, event.id)
             repaired = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
             ]
             self.assertEqual(len(repaired), 1)
             self.assertEqual(repaired[0].data["steering_event_id"], event.id)
@@ -413,7 +500,9 @@ class PostgresIntegrationTests(unittest.TestCase):
                 "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
             )
             final_accepted = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
             ]
             self.assertEqual(len(final_accepted), 1)
 
@@ -436,12 +525,8 @@ class PostgresIntegrationTests(unittest.TestCase):
             )
             await repo.commit_steering_consumptions("acme", run.id, [consumption])
             all_events = await repo.list_events("acme", run.id)
-            self.assertEqual(
-                sum(1 for e in all_events if e.kind == "run.steer.accepted"), 1
-            )
-            self.assertEqual(
-                sum(1 for e in all_events if e.kind == "run.steer.consumed"), 1
-            )
+            self.assertEqual(sum(1 for e in all_events if e.kind == "run.steer.accepted"), 1)
+            self.assertEqual(sum(1 for e in all_events if e.kind == "run.steer.consumed"), 1)
 
         asyncio.run(scenario())
 
@@ -742,7 +827,9 @@ class PostgresIntegrationTests(unittest.TestCase):
             still_pending = await repo.list_pending_steering("acme", run.id)
             self.assertEqual([row.id for row in still_pending], [event.id])
             consumed_events = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.consumed"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.consumed"
             ]
             self.assertEqual(consumed_events, [])
 

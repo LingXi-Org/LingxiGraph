@@ -5,7 +5,7 @@ description: "Migration rollout order, PostgreSQL-as-source-of-truth, latency, r
 
 ## Migration rollout order
 
-Mid-run steering (issue #16) ships as three forward-only Alembic revisions on top of the base
+Mid-run steering (issue #16) ships as four forward-only Alembic revisions on top of the base
 schema:
 
 | Revision | Adds |
@@ -13,6 +13,7 @@ schema:
 | `0002_steering` | `run_steering_events` table, its indexes, and the worker/server code paths that read/write it |
 | `0003_steering_source_event` | `source_event_id` column + partial index on `run_steering_events`, used to correlate a steering event across repeated pause/resume migrations |
 | `0004_steering_closed` | `runs.steering_closed` — the atomic finalization admission gate (review round 6/7); see "The `steering_closed` finalization gate" below |
+| `0005_superseded_by_run_id` | `runs.superseded_by_run_id` — the typed control-plane lineage marker for resumed runs (review round 14, BLOCKER); moves this out of user-writable `metadata` so it cannot be forged. See "The `superseded_by_run_id` lineage marker" below |
 
 Apply them with the standard Alembic path:
 
@@ -20,18 +21,19 @@ Apply them with the standard Alembic path:
 alembic upgrade head
 ```
 
-All three are additive (`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, a `NOT NULL
-DEFAULT FALSE` column) and safe to run against a live database before deploying the new
-server/worker binaries — an old binary that predates `0004` simply never reads or writes
-`steering_closed`; it keeps behaving exactly as it did before the column existed. Deploy order
-for a zero-downtime rollout:
+All four are additive (`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, nullable/
+`NOT NULL DEFAULT FALSE` columns) and safe to run against a live database before deploying the
+new server/worker binaries — an old binary that predates `0004`/`0005` simply never reads or
+writes `steering_closed`/`superseded_by_run_id`; it keeps behaving exactly as it did before the
+columns existed. Deploy order for a zero-downtime rollout:
 
-1. Run `alembic upgrade head` (adds `run_steering_events`, `source_event_id`, and
-   `steering_closed`) while the old server/worker binaries are still serving traffic.
+1. Run `alembic upgrade head` (adds `run_steering_events`, `source_event_id`,
+   `steering_closed`, and `superseded_by_run_id`) while the old server/worker binaries are
+   still serving traffic.
 2. Roll out the new server and worker binaries.
 
-Do not reverse this order: a binary that writes `source_event_id`/`steering_closed` before the
-column exists will fail its inserts/updates. Because migrations in this project are
+Do not reverse this order: a binary that writes `source_event_id`/`steering_closed`/
+`superseded_by_run_id` before the column exists will fail its inserts/updates. Because migrations in this project are
 forward-only (`downgrade()` raises), there is no automated rollback path for the schema — see
 "Rollback boundaries" below.
 
@@ -39,8 +41,8 @@ forward-only (`downgrade()` raises), there is no automated rollback path for the
 `PostgresRepository.setup()` also applies the same SQL files directly (used by tests and by
 embedded/dev setups). That code path is **not** a substitute for driving the Alembic revision
 chain in a real deployment: only `alembic upgrade head` is what a production rollout should
-run, and it must reach `0004_steering_closed`, not stop at `0002_steering` or
-`0003_steering_source_event`.
+run, and it must reach `0005_superseded_by_run_id`, not stop at `0002_steering`,
+`0003_steering_source_event`, or `0004_steering_closed`.
 </Callout>
 
 ## The `steering_closed` finalization gate
@@ -96,6 +98,35 @@ though — an ordinary client-initiated **cancel** is not covered by that recove
 left `pending` on a `cancelled` run has no automatic future delivery attempt today. See the
 steering concept page's "Finalization and the steering
 admission boundary" section for the full policy.
+
+## The `superseded_by_run_id` lineage marker
+
+When `/resume` creates a descendant run from a `paused` run, the old run needs a durable way to
+say "I have been superseded — steer/cancel/resume the new run instead". Before `0005`, that
+marker lived in `metadata.superseded_by_run_id` — ordinary, user-writable `Run` metadata.
+Because `/steer`, `/cancel`, and the concurrent-resume conflict gate all treated that key as
+authoritative, a caller could forge it at run-creation time (`POST /v1/runs` with
+`metadata: {"superseded_by_run_id": "..."}`) to falsely trigger `409 run_superseded` /
+`409 run_resume_conflict` on a run that was never actually resumed (issue #16 PR #17 review
+round 14, BLOCKER).
+
+`runs.superseded_by_run_id` (added by `0005_superseded_by_run_id`) is a typed, nullable column
+that replaces that key as the sole source of truth:
+
+- It is written exactly once, atomically, inside the same fenced resume transaction that
+  creates the descendant run and migrates the old run's pending steering
+  (`resume_run_with_pending_steering()` / its Postgres counterpart) — never derived from,
+  or writable via, `RunCreate.metadata`.
+- `/steer`'s admission check, `/cancel`'s superseded check, and the resume conflict gate all
+  read `run.superseded_by_run_id` directly; none of them consult `metadata` for this decision
+  any more.
+- A caller submitting `metadata.superseded_by_run_id` on an ordinary `RunCreate` now has no
+  effect on control flow at all — the key is inert, stored (if at all) as plain user metadata,
+  and never copied into the typed column.
+- Upgrade compatibility: a pre-existing run from before this PR that happens to carry a user
+  metadata key with this exact name is never reinterpreted as system lineage after upgrading —
+  the typed column starts `NULL` for every existing row and is populated only by a future
+  resume.
 
 ## Idempotent replay is safe across every admission gate
 
@@ -203,9 +234,9 @@ runs against a schema the new binaries no longer expect. Practical implications:
 - Never plan a rollback strategy that downgrades the schema. If a deployment needs to be
   rolled back, roll back the **binaries** while leaving the schema at its current (forward)
   revision — the additive nature of `0002_steering`/`0003_steering_source_event`/
-  `0004_steering_closed` means older binaries that predate a given revision simply ignore the
-  extra table/columns.
+  `0004_steering_closed`/`0005_superseded_by_run_id` means older binaries that predate a given
+  revision simply ignore the extra table/columns.
 - Because there is no schema downgrade path, validate `0002_steering`/
-  `0003_steering_source_event`/`0004_steering_closed` against a staging database (or the CI
-  `test_postgres_integration.py` Postgres job) before applying to production, rather than
-  relying on the ability to undo it.
+  `0003_steering_source_event`/`0004_steering_closed`/`0005_superseded_by_run_id` against a
+  staging database (or the CI `test_postgres_integration.py` Postgres job) before applying to
+  production, rather than relying on the ability to undo it.

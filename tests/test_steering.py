@@ -577,7 +577,7 @@ class AtomicResumeMigrationTests(unittest.TestCase):
 
             winner_run, _ = successes[0]
             final_old = await repo.get_run("acme", old_run.id)
-            self.assertEqual(final_old.metadata.get("superseded_by_run_id"), winner_run.id)
+            self.assertEqual(final_old.superseded_by_run_id, winner_run.id)
 
             # The losing attempt must not have been silently allowed to
             # retry and create a second Run either.
@@ -591,8 +591,9 @@ class AtomicResumeMigrationTests(unittest.TestCase):
     def test_cancel_of_a_resumed_away_paused_run_is_rejected_as_superseded(self) -> None:
         """Issue #16 PR #17 review round 13 (BLOCKER): once a paused run
         ``A`` has been resumed into a descendant ``B``, ``A`` keeps
-        ``status='paused'`` by design (metadata.superseded_by_run_id marks
-        it stale instead) so that ``/steer`` can point callers at ``B``.
+        ``status='paused'`` by design (the typed ``superseded_by_run_id``
+        column marks it stale instead) so that ``/steer`` can point
+        callers at ``B``.
         ``request_cancel(A)`` must honor that same signal atomically --
         raising ``RunSupersededError`` -- instead of falsely succeeding by
         flipping ``A`` to ``cancelled`` while ``B`` keeps executing
@@ -621,7 +622,7 @@ class AtomicResumeMigrationTests(unittest.TestCase):
             # at the same descendant, not clobbered into a terminal state.
             old_after = await repo.get_run("acme", old_run.id)
             self.assertEqual(old_after.status, "paused")
-            self.assertEqual(old_after.metadata.get("superseded_by_run_id"), new_run.id)
+            self.assertEqual(old_after.superseded_by_run_id, new_run.id)
 
             # The actual resumed descendant is unaffected and still
             # cancellable normally.
@@ -661,6 +662,84 @@ class AtomicResumeMigrationTests(unittest.TestCase):
             self.assertEqual(extra.sequence, 3)
             all_events = await repo.list_steering("acme", new_run.id)
             self.assertEqual(sorted(event.sequence for event in all_events), [1, 2, 3])
+
+        asyncio.run(scenario())
+
+    def test_forged_metadata_superseded_by_run_id_cannot_forge_control_state(self) -> None:
+        """Issue #16 PR #17 review round 14 (BLOCKER): ``superseded_by_run_id``
+        is authoritative Runtime control state -- it must live in a typed
+        ``Run`` field, never in user-writable ``metadata``. A caller who
+        submits ``metadata.superseded_by_run_id`` at run-creation time must
+        not be able to forge a superseded/resume-conflict signal against a
+        run that was never actually resumed.
+        """
+
+        from lingxigraph.server.models import RunCreate
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            forged = RunCreate(
+                assistant_id=assistant.id,
+                input={},
+                metadata={"superseded_by_run_id": "some-other-run-that-never-existed"},
+            )
+            run = await repo.create_run("acme", None, assistant, forged)
+
+            # The typed field must be inert to the forged metadata --
+            # this run was never actually resumed.
+            self.assertIsNone(run.superseded_by_run_id)
+            self.assertEqual(
+                run.metadata.get("superseded_by_run_id"),
+                "some-other-run-that-never-existed",
+            )
+
+            # /steer must work normally -- not spuriously superseded.
+            event, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+            self.assertTrue(created)
+            self.assertEqual(event.status, "pending")
+
+            # /cancel must work normally -- not spuriously superseded.
+            cancelled = await repo.request_cancel("acme", run.id)
+            self.assertTrue(cancelled)
+            after = await repo.get_run("acme", run.id)
+            self.assertIn(after.status, ("cancelled", "cancelling"))
+
+        asyncio.run(scenario())
+
+    def test_forged_metadata_superseded_by_run_id_does_not_block_real_resume(self) -> None:
+        """Companion to the forging test above: a genuinely ``paused`` run
+        carrying the same forged ``metadata.superseded_by_run_id`` key must
+        still ``/resume`` normally -- the user metadata must never trigger
+        ``RunResumeConflictError``.
+        """
+
+        from lingxigraph.server.models import RunCreate
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            forged = RunCreate(
+                assistant_id=assistant.id,
+                input={},
+                metadata={"superseded_by_run_id": "some-other-run-that-never-existed"},
+            )
+            run = await repo.create_run("acme", None, assistant, forged)
+            await repo.finish_run("acme", run.id, "paused", output={})
+
+            resume_request = RunCreate(assistant_id=assistant.id, resume=1)
+            new_run, _transferred = await repo.resume_run_with_pending_steering(
+                "acme", run.thread_id, assistant, resume_request, run.id
+            )
+            self.assertIsNotNone(new_run.id)
+            old_after = await repo.get_run("acme", run.id)
+            self.assertEqual(old_after.superseded_by_run_id, new_run.id)
 
         asyncio.run(scenario())
 
@@ -928,7 +1007,11 @@ class DurableAckOrderingTests(unittest.TestCase):
             async def observer() -> None:
                 while not stop_observing.is_set():
                     current = await repo.get_run("acme", run.id)
-                    status = current.status.value if hasattr(current.status, "value") else current.status
+                    status = (
+                        current.status.value
+                        if hasattr(current.status, "value")
+                        else current.status
+                    )
                     observed_statuses.append(status)
                     await asyncio.sleep(0.005)
 
@@ -960,7 +1043,9 @@ class DurableAckOrderingTests(unittest.TestCase):
             self.assertNotIn("paused", observed_statuses)
 
             final = await repo.get_run("acme", run.id)
-            final_status = final.status.value if hasattr(final.status, "value") else final.status
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
             self.assertEqual(final_status, "succeeded")
             self.assertIn("stop", final.output["drained"])
 
@@ -1030,7 +1115,9 @@ class DurableAckOrderingTests(unittest.TestCase):
             real_commit = repo.commit_steering_consumptions
             fail_once = {"done": False}
 
-            async def fail_first_attempt_only(tenant_id, run_id, worker_id, attempt, consumptions):
+            async def fail_first_attempt_only(
+                tenant_id, run_id, worker_id, attempt, consumptions
+            ):
                 if not fail_once["done"]:
                     fail_once["done"] = True
                     worker._stop.set()
@@ -1109,7 +1196,11 @@ class FinalizationFencingTests(unittest.TestCase):
             )
 
             worker_a = Worker(
-                make_registry(), repo, worker_id="worker-a", lease_seconds=1, heartbeat_seconds=10
+                make_registry(),
+                repo,
+                worker_id="worker-a",
+                lease_seconds=1,
+                heartbeat_seconds=10,
             )
 
             async def inert_heartbeat(run, token, graph):
@@ -1180,7 +1271,11 @@ class FinalizationFencingTests(unittest.TestCase):
             )
 
             worker_a = Worker(
-                make_registry(), repo, worker_id="worker-a", lease_seconds=1, heartbeat_seconds=10
+                make_registry(),
+                repo,
+                worker_id="worker-a",
+                lease_seconds=1,
+                heartbeat_seconds=10,
             )
 
             async def inert_heartbeat(run, token, graph):
@@ -1575,7 +1670,9 @@ class SteeringClosedGateTests(unittest.TestCase):
             superseded_events = [e for e in events if e.kind == "run.steer.superseded"]
             self.assertEqual(len(superseded_events), 1)
             self.assertEqual(superseded_events[0].data["steering_event_id"], accepted.id)
-            self.assertEqual(superseded_events[0].data["reason"], "unconsumed_at_final_boundary")
+            self.assertEqual(
+                superseded_events[0].data["reason"], "unconsumed_at_final_boundary"
+            )
             self.assertIsNone(superseded_events[0].data["superseded_by_run_id"])
 
         asyncio.run(scenario())
@@ -1959,7 +2056,9 @@ class AtomicSteerAcceptedEventTests(unittest.TestCase):
             )
             self.assertTrue(created)
             accepted = [
-                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.accepted"
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.accepted"
             ]
             self.assertEqual(len(accepted), 1)
 
@@ -2035,7 +2134,11 @@ class AtomicSteerAcceptedEventTests(unittest.TestCase):
             await repo.finish_run("acme", old_run.id, "paused", output={})
 
             new_run, transferred = await repo.resume_run_with_pending_steering(
-                "acme", old_run.thread_id, assistant, RunCreate(assistant_id=assistant.id), old_run.id
+                "acme",
+                old_run.thread_id,
+                assistant,
+                RunCreate(assistant_id=assistant.id),
+                old_run.id,
             )
             self.assertEqual(len(transferred), 1)
             new_events = await repo.list_events("acme", new_run.id)
@@ -3148,7 +3251,9 @@ class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
             assert claimed is not None
             claimed.attempt = 999  # force the max-attempts (dead-letter) branch
 
-            worker = Worker(make_registry_double(), repo, worker_id="worker-a", max_delivery_attempts=1)
+            worker = Worker(
+                make_registry_double(), repo, worker_id="worker-a", max_delivery_attempts=1
+            )
 
             async def lost_lease(*args: Any, **kwargs: Any) -> None:
                 return None
@@ -3186,7 +3291,9 @@ class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_final_steering_flush_returns_false_when_heartbeat_confirms_lease_lost(self) -> None:
+    def test_final_steering_flush_returns_false_when_heartbeat_confirms_lease_lost(
+        self,
+    ) -> None:
         from lingxigraph.server.worker import Worker
 
         async def scenario() -> None:
@@ -3221,7 +3328,9 @@ class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
 
             repo.commit_steering_consumptions_if_owned = always_fails  # type: ignore[method-assign]
             repo.heartbeat = lease_gone  # type: ignore[method-assign]
-            result = await worker._final_steering_flush(claimed, graph, base_delay=0.001, max_delay=0.001)
+            result = await worker._final_steering_flush(
+                claimed, graph, base_delay=0.001, max_delay=0.001
+            )
             self.assertFalse(result)
 
         asyncio.run(scenario())

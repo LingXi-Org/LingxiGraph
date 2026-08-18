@@ -5,13 +5,14 @@ description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重�
 
 ## 迁移上线顺序
 
-运行中输入（issue #16）在基础 schema 之上新增了三个 forward-only 的 Alembic revision：
+运行中输入（issue #16）在基础 schema 之上新增了四个 forward-only 的 Alembic revision：
 
 | Revision | 新增内容 |
 | --- | --- |
 | `0002_steering` | `run_steering_events` 表及其索引，以及读写它的 worker/server 代码路径 |
 | `0003_steering_source_event` | `run_steering_events` 上的 `source_event_id` 列 + 局部索引，用于跨多次 pause/resume 迁移关联同一条 steering |
 | `0004_steering_closed` | `runs.steering_closed`——finalization 准入闸门（review round 6/7）；详见下方"`steering_closed` finalization 闸门" |
+| `0005_superseded_by_run_id` | `runs.superseded_by_run_id`——被 resume 覆盖的类型化控制面血缘标记（review round 14，BLOCKER）；把它从可被用户写入的 `metadata` 中移出，使其无法被伪造。详见下方"`superseded_by_run_id` 血缘标记" |
 
 按标准 Alembic 路径应用：
 
@@ -19,24 +20,25 @@ description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重�
 alembic upgrade head
 ```
 
-三者都是纯新增（`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`、一个
+四者都是纯新增（`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`、可为空/
 `NOT NULL DEFAULT FALSE` 列），可以在部署新的 server/worker 二进制之前先对存活数据库
-执行——早于 `0004` 的旧二进制根本不会读写 `steering_closed`，行为与该列不存在时完全一致。
-零停机上线顺序：
+执行——早于 `0004`/`0005` 的旧二进制根本不会读写 `steering_closed`/`superseded_by_run_id`，
+行为与这些列不存在时完全一致。零停机上线顺序：
 
 1. 在旧的 server/worker 二进制仍在提供服务时执行 `alembic upgrade head`
-   （新增 `run_steering_events`、`source_event_id` 与 `steering_closed`）；
+   （新增 `run_steering_events`、`source_event_id`、`steering_closed` 与
+   `superseded_by_run_id`）；
 2. 再滚动发布新的 server 与 worker 二进制。
 
-不要颠倒这个顺序：在列存在之前就尝试写入 `source_event_id`/`steering_closed` 的二进制会
-插入/更新失败。因为本项目的迁移是 forward-only 的（`downgrade()` 会直接抛错），schema
+不要颠倒这个顺序：在列存在之前就尝试写入 `source_event_id`/`steering_closed`/
+`superseded_by_run_id` 的二进制会插入/更新失败。因为本项目的迁移是 forward-only 的（`downgrade()` 会直接抛错），schema
 层面没有自动回滚路径——见下方"升级与回滚边界"。
 
 <Callout type="warn">
 `PostgresRepository.setup()` 也会直接应用同一批 SQL 文件（测试和嵌入式/开发环境会用到）。
 这条路径**不能**替代在真实部署中驱动 Alembic revision 链：生产上线应该且只应该执行
-`alembic upgrade head`，并且必须走到 `0004_steering_closed`，而不是停在
-`0002_steering` 或 `0003_steering_source_event`。
+`alembic upgrade head`，并且必须走到 `0005_superseded_by_run_id`，而不是停在
+`0002_steering`、`0003_steering_source_event` 或 `0004_steering_closed`。
 </Callout>
 
 ## `steering_closed` finalization 闸门
@@ -85,6 +87,30 @@ retry/dead-letter 流程——只有在这种情况下，一个 `dead_letter` �
 普通的、由客户端发起的 **cancel** 不在这条恢复路径之内，因此留在 `cancelled` run 上的
 `pending` steering 目前没有任何自动的未来投递机会。完整策略见 steering 概念页"终结流程与
 steering 准入边界"一节。
+
+## `superseded_by_run_id` 血缘标记
+
+当 `/resume` 从一个 `paused` 的 run 创建出后继 run 时，旧 run 需要一种可靠的方式来表示
+"我已经被取代了——请对新 run 执行 steer/cancel/resume"。在 `0005` 之前，这个标记存放在
+`metadata.superseded_by_run_id` 中——普通的、用户可写的 `Run` metadata。由于 `/steer`、
+`/cancel` 以及并发 resume 的冲突闸门都把这个 key 当作权威状态来读取，调用方可以在创建 run
+时伪造它（`POST /v1/runs` 携带 `metadata: {"superseded_by_run_id": "..."}`），从而在一个从未
+真正被 resume 过的 run 上错误触发 `409 run_superseded` / `409 run_resume_conflict`
+（issue #16 PR #17 review round 14，BLOCKER）。
+
+`runs.superseded_by_run_id`（由 `0005_superseded_by_run_id` 新增）是一个类型化、可为空的列，
+取代该 key 成为唯一的真相来源：
+
+- 它只在创建后继 run、迁移旧 run 待处理 steering 的同一个受 fence 保护的 resume 事务内
+  （`resume_run_with_pending_steering()` 及其 PostgreSQL 对应实现）被原子地写入一次——
+  永远不会从 `RunCreate.metadata` 派生，也不能通过它写入。
+- `/steer` 的准入检查、`/cancel` 的 superseded 检查，以及 resume 冲突闸门，现在都直接读取
+  `run.superseded_by_run_id`；它们都不再为此决策查询 `metadata`。
+- 调用方在普通 `RunCreate` 上提交 `metadata.superseded_by_run_id` 现在对控制流完全没有
+  影响——这个 key 是惰性的，最多作为普通用户 metadata 存储，永远不会被拷贝进类型化列。
+- 升级兼容性：升级到本 PR 之后，一个升级前就存在、恰好携带同名用户 metadata key 的历史
+  run，不会被重新解释为系统血缘状态——类型化列对每一条既有记录都从 `NULL` 开始，只有未来
+  真正发生的 resume 才会填充它。
 
 ## 幂等重放在所有准入闸门前都是安全的
 
@@ -182,8 +208,10 @@ durable 的 steering 历史，要么需要把正在进行的 run 与新二进制
 
 - 永远不要把"回滚 schema"当作回滚策略的一部分。如果确实需要回滚一次部署，应该回滚
   **二进制**、保持 schema 停在当前（更靠前）的 revision——`0002_steering`/
-  `0003_steering_source_event`/`0004_steering_closed` 都是纯新增，早于对应特性的旧
+  `0003_steering_source_event`/`0004_steering_closed`/`0005_superseded_by_run_id` 都是纯
+  新增，早于对应特性的旧
   二进制会直接忽略多出来的表/列；
 - 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event`/
-  `0004_steering_closed` 应该先在 staging 环境（或 CI 的 `test_postgres_integration.py`
+  `0004_steering_closed`/`0005_superseded_by_run_id` 应该先在 staging 环境（或 CI 的
+  `test_postgres_integration.py`
   Postgres job）中验证过，再应用到生产环境，而不是依赖"出问题了还能撤销"。

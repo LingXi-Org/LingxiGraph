@@ -750,13 +750,18 @@ class InMemoryRepository:
             if run is None or enum_value(run.status) in TERMINAL:
                 return False
             # Round 13 review (BLOCKER): a paused run that has since been
-            # resumed is only marked stale via ``metadata.superseded_by_run_id``
-            # -- its ``status`` deliberately stays ``paused`` so /steer's
-            # existing superseded gate keeps working. Cancel must honor that
-            # same signal *inside this lock*, or a cancel racing behind a
-            # resume would silently "succeed" against the old run while the
-            # real (resumed) descendant keeps executing untouched.
-            superseded_by = run.metadata.get("superseded_by_run_id")
+            # resumed is only marked stale via the typed
+            # ``Run.superseded_by_run_id`` field -- its ``status``
+            # deliberately stays ``paused`` so /steer's existing superseded
+            # gate keeps working. Cancel must honor that same signal
+            # *inside this lock*, or a cancel racing behind a resume would
+            # silently "succeed" against the old run while the real
+            # (resumed) descendant keeps executing untouched.
+            # Round 14 review (BLOCKER): this MUST be the typed field, not
+            # user-writable ``metadata`` -- a caller could otherwise forge
+            # ``metadata.superseded_by_run_id`` at run-creation time to
+            # falsely trigger this gate on a run that was never resumed.
+            superseded_by = run.superseded_by_run_id
             if superseded_by is not None:
                 raise RunSupersededError(
                     f"run {run_id!r} was resumed as {superseded_by!r}; "
@@ -764,8 +769,7 @@ class InMemoryRepository:
                 )
             status = (
                 RunStatus.CANCELLED.value
-                if enum_value(run.status)
-                in {RunStatus.PENDING.value, RunStatus.PAUSED.value}
+                if enum_value(run.status) in {RunStatus.PENDING.value, RunStatus.PAUSED.value}
                 else RunStatus.CANCELLING.value
             )
             self._runs[key] = run.model_copy(
@@ -872,7 +876,9 @@ class InMemoryRepository:
                     f"run {run_id!r} has finished executing and is finalizing; "
                     "no further steering input can be safely consumed"
                 )
-            superseded_by = run.metadata.get("superseded_by_run_id")
+            # Round 14 review (BLOCKER): read the typed field, not
+            # user-writable ``metadata`` -- see ``request_cancel`` above.
+            superseded_by = run.superseded_by_run_id
             if superseded_by is not None:
                 raise RunSupersededError(
                     f"run {run_id!r} was resumed as {superseded_by!r}; "
@@ -1348,13 +1354,10 @@ class InMemoryRepository:
 
         old_run = self._runs.get((tenant_id, old_run_id))
         if old_run is not None:
+            # Round 14 review (BLOCKER): write the typed field, not
+            # user-writable ``metadata`` -- see ``request_cancel`` above.
             self._runs[(tenant_id, old_run_id)] = old_run.model_copy(
-                update={
-                    "metadata": {
-                        **old_run.metadata,
-                        "superseded_by_run_id": new_run_id,
-                    }
-                }
+                update={"superseded_by_run_id": new_run_id}
             )
         old_events = self._steering.get((tenant_id, old_run_id), [])
         pending = sorted(
@@ -1449,7 +1452,9 @@ class InMemoryRepository:
             if (
                 old_run is None
                 or enum_value(old_run.status) != RunStatus.PAUSED.value
-                or old_run.metadata.get("superseded_by_run_id") is not None
+                # Round 14 review (BLOCKER): typed field, not user-writable
+                # ``metadata`` -- see ``request_cancel`` above.
+                or old_run.superseded_by_run_id is not None
             ):
                 raise RunResumeConflictError(
                     f"run {old_run_id!r} is no longer resumable "
@@ -2015,7 +2020,9 @@ class PostgresRepository(InMemoryRepository):
             return None
         return self._run_from_row(row)
 
-    def _retry_run_if_owned_sync(self, tenant_id, run_id, worker_id, attempt, error):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    def _retry_run_if_owned_sync(
+        self, tenant_id, run_id, worker_id, attempt, error
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
@@ -2185,7 +2192,9 @@ class PostgresRepository(InMemoryRepository):
             self._close_steering_sync, tenant_id, run_id, worker_id, attempt
         )
 
-    def _close_steering_sync(self, tenant_id, run_id, worker_id, attempt) -> bool:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    def _close_steering_sync(
+        self, tenant_id, run_id, worker_id, attempt
+    ) -> bool:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         """SQL counterpart of
         :meth:`InMemoryRepository.close_steering` -- see its docstring for
         why no "undrained" check happens here (issue #16 PR #17 review
@@ -2242,18 +2251,23 @@ class PostgresRepository(InMemoryRepository):
     ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
-            # Round 13 review (BLOCKER): lock the row first and check
-            # ``metadata.superseded_by_run_id`` *inside this same lock*,
-            # before deciding the status transition. A resumed-away paused
-            # run keeps status='paused' (by design, so /steer's existing
-            # superseded gate works) -- cancel must honor that same signal
-            # atomically, or a cancel racing behind a resume could falsely
-            # report success against the stale run while the real
-            # (resumed) descendant keeps running untouched. Doing this as
-            # a pre-read outside the lock would reopen the same TOCTOU
-            # class of bug already fixed for double-resume.
+            # Round 13 review (BLOCKER): lock the row first and check the
+            # typed ``superseded_by_run_id`` column *inside this same
+            # lock*, before deciding the status transition. A resumed-away
+            # paused run keeps status='paused' (by design, so /steer's
+            # existing superseded gate works) -- cancel must honor that
+            # same signal atomically, or a cancel racing behind a resume
+            # could falsely report success against the stale run while the
+            # real (resumed) descendant keeps running untouched. Doing
+            # this as a pre-read outside the lock would reopen the same
+            # TOCTOU class of bug already fixed for double-resume.
+            # Round 14 review (BLOCKER): this reads the typed
+            # ``superseded_by_run_id`` column, not user-writable
+            # ``metadata`` -- a caller could otherwise forge
+            # ``metadata.superseded_by_run_id`` at run-creation time to
+            # falsely trigger this gate on a run that was never resumed.
             cursor.execute(
-                f"""SELECT status, metadata FROM {self._schema}.runs
+                f"""SELECT status, superseded_by_run_id FROM {self._schema}.runs
                 WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, run_id),
             )
@@ -2268,8 +2282,7 @@ class PostgresRepository(InMemoryRepository):
                 "dead_letter",
             }:
                 return False
-            metadata = row["metadata"] or {}
-            superseded_by = metadata.get("superseded_by_run_id")
+            superseded_by = row["superseded_by_run_id"]
             if superseded_by is not None:
                 raise RunSupersededError(
                     f"run {run_id!r} was resumed as {superseded_by!r}; "
@@ -2362,7 +2375,8 @@ class PostgresRepository(InMemoryRepository):
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
-                f"""SELECT status, metadata, steering_closed FROM {self._schema}.runs
+                f"""SELECT status, steering_closed, superseded_by_run_id
+                FROM {self._schema}.runs
                 WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, run_id),
             )
@@ -2408,8 +2422,9 @@ class PostgresRepository(InMemoryRepository):
                     f"run {run_id!r} has finished executing and is finalizing; "
                     "no further steering input can be safely consumed"
                 )
-            run_metadata = run_row.get("metadata") or {}
-            superseded_by = run_metadata.get("superseded_by_run_id")
+            # Round 14 review (BLOCKER): typed column, not user-writable
+            # ``metadata`` -- see ``_request_cancel_sync`` above.
+            superseded_by = run_row.get("superseded_by_run_id")
             if superseded_by is not None:
                 raise RunSupersededError(
                     f"run {run_id!r} was resumed as {superseded_by!r}; "
@@ -2730,7 +2745,9 @@ class PostgresRepository(InMemoryRepository):
 
     def _supersede_pending_steering_if_owned_sync(
         self, tenant_id: str, run_id: str, worker_id: str, attempt: int
-    ) -> list[RunEvent] | None:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    ) -> (
+        list[RunEvent] | None
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         """SQL counterpart of
         :meth:`InMemoryRepository.supersede_pending_steering_if_owned` --
         see its docstring (issue #16 PR #17 review round 8, point 1,
@@ -2811,7 +2828,9 @@ class PostgresRepository(InMemoryRepository):
             self._mark_steering_consumed_sync, tenant_id, run_id, list(event_ids)
         )
 
-    def _mark_steering_consumed_sync(self, tenant_id, run_id, event_ids):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    def _mark_steering_consumed_sync(
+        self, tenant_id, run_id, event_ids
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
@@ -2873,7 +2892,9 @@ class PostgresRepository(InMemoryRepository):
         worker_id: str,
         attempt: int,
         consumptions: list[SteeringConsumption],
-    ) -> list[RunEvent] | None:  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
+    ) -> (
+        list[RunEvent] | None
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         """Fenced counterpart of ``_commit_steering_consumptions_sync``.
 
         Issue #16 PR #17 review round 7, point 2 (BLOCKER): see the
@@ -3024,7 +3045,7 @@ class PostgresRepository(InMemoryRepository):
             # against the same paused run_id serialize instead of both
             # migrating (and superseding) the same steering rows.
             cursor.execute(
-                f"""SELECT status, metadata FROM {self._schema}.runs
+                f"""SELECT status, superseded_by_run_id FROM {self._schema}.runs
                 WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, old_run_id),
             )
@@ -3035,12 +3056,13 @@ class PostgresRepository(InMemoryRepository):
             # Re-validate under the lock just acquired above -- still
             # ``paused``, and not already superseded by a resume that won
             # the race -- before creating a second descendant Run.
+            # Round 14 review (BLOCKER): typed column, not user-writable
+            # ``metadata`` -- see ``_request_cancel_sync`` above.
             if old_run_row is None:
                 raise RunResumeConflictError(f"run {old_run_id!r} no longer exists")
-            old_run_metadata = dict(old_run_row.get("metadata") or {})
             if (
                 old_run_row.get("status") != "paused"
-                or old_run_metadata.get("superseded_by_run_id") is not None
+                or old_run_row.get("superseded_by_run_id") is not None
             ):
                 raise RunResumeConflictError(
                     f"run {old_run_id!r} is no longer resumable "
@@ -3127,11 +3149,13 @@ class PostgresRepository(InMemoryRepository):
                 ),
             )
 
-            old_run_metadata["superseded_by_run_id"] = run.id
+            # Round 14 review (BLOCKER): write the typed column
+            # atomically as part of this same resume transaction, not
+            # user-writable ``metadata``.
             cursor.execute(
-                f"""UPDATE {self._schema}.runs SET metadata=%s
+                f"""UPDATE {self._schema}.runs SET superseded_by_run_id=%s
                 WHERE tenant_id=%s AND id=%s""",
-                (self._jsonb(old_run_metadata), tenant_id, old_run_id),
+                (run.id, tenant_id, old_run_id),
             )
 
             cursor.execute(
