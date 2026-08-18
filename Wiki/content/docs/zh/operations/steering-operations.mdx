@@ -210,7 +210,15 @@ durable 的 steering 历史，要么需要把正在进行的 run 与新二进制
   **二进制**、保持 schema 停在当前（更靠前）的 revision——`0002_steering`/
   `0003_steering_source_event`/`0004_steering_closed`/`0005_superseded_by_run_id` 都是纯
   新增，早于对应特性的旧
-  二进制会直接忽略多出来的表/列；
+  二进制会直接忽略多出来的表/列，不会因此启动失败；
+- **schema 兼容不等于语义兼容。** 旧二进制在新 schema 上不会崩溃，但它并不理解
+  `steering_closed` 或 `superseded_by_run_id`——它不会执行 finalization 的 steering
+  admission 门控，也不会执行本 PR 新增的 resume-lineage cancel/steer 拒绝逻辑。应该把
+  新的 steering/lineage 控制语义视为"只有当所有控制面实例都升级到新二进制后才可用"，
+  而不是 schema 迁移一落地就生效。如果一个二进制已经真正执行过这些语义（例如某次
+  resume 已经写入了 `superseded_by_run_id`），把它回滚成旧版本并不会撤销这次转换——
+  旧二进制只是从此不再强制执行它。如果必须在 steering 正在被使用时回滚二进制，应先
+  quiesce 或等待 in-flight run 结束，不要假设旧二进制能保留同样的保证；
 - 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event`/
   `0004_steering_closed`/`0005_superseded_by_run_id` 应该先在 staging 环境（或 CI 的
   `test_postgres_integration.py`

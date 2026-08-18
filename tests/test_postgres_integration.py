@@ -582,15 +582,22 @@ class PostgresIntegrationTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_alembic_upgrade_head_applies_source_event_id(self) -> None:
-        """Issue #16 PR #17 review round 3, point 1.
+        """Issue #16 PR #17 review round 3, point 1; round 15 (REQUIRED
+        VERIFICATION): explicitly asserts the *current* migration head
+        (0005_superseded_by_run_id), not just the round-3-era 0003 finding.
 
         ``PostgresRepository._setup_sync()`` applies the SQL migration
         files directly and is *not* a substitute for driving the real
         Alembic revision chain that a production deployment uses
         (``alembic upgrade head``). This regresses that ``0002_steering``
-        -> ``0003_steering_source_event`` is reachable through Alembic
-        itself and actually creates the ``source_event_id`` column and its
-        partial index.
+        -> ``0003_steering_source_event`` -> ``0004_steering_closed`` ->
+        ``0005_superseded_by_run_id`` is reachable through Alembic itself
+        and actually creates every column/index the production SQL in
+        this PR hard-depends on (``run_steering_events.source_event_id``,
+        ``runs.steering_closed``, ``runs.superseded_by_run_id``) -- so a
+        future accidental break in the revision chain, a mis-registered
+        SQL resource, or a stale assertion left over from an earlier round
+        cannot silently drift the "tested head" away from the real one.
         """
 
         import psycopg
@@ -632,6 +639,35 @@ class PostgresIntegrationTests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(
                     index, "alembic head must create the source_event_id index"
+                )
+                steering_closed = conn.execute(
+                    """SELECT 1 FROM information_schema.columns
+                    WHERE table_schema=%s AND table_name='runs'
+                    AND column_name='steering_closed'""",
+                    (self.schema,),
+                ).fetchone()
+                self.assertIsNotNone(
+                    steering_closed, "alembic head must create runs.steering_closed"
+                )
+                superseded_by_run_id = conn.execute(
+                    """SELECT 1 FROM information_schema.columns
+                    WHERE table_schema=%s AND table_name='runs'
+                    AND column_name='superseded_by_run_id'""",
+                    (self.schema,),
+                ).fetchone()
+                self.assertIsNotNone(
+                    superseded_by_run_id,
+                    "alembic head must create runs.superseded_by_run_id",
+                )
+                head_revision = conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchone()
+                self.assertEqual(
+                    head_revision[0],
+                    "0005_superseded_by_run_id",
+                    "alembic head must be 0005_superseded_by_run_id, not an earlier "
+                    "revision -- if this fails, the revision chain or the head "
+                    "assertion has drifted apart from the real production head",
                 )
         finally:
             os.environ.pop("LINGXIGRAPH_POSTGRES_SCHEMA", None)

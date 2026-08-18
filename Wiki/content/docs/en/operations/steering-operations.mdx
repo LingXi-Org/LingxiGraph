@@ -235,7 +235,17 @@ runs against a schema the new binaries no longer expect. Practical implications:
   rolled back, roll back the **binaries** while leaving the schema at its current (forward)
   revision — the additive nature of `0002_steering`/`0003_steering_source_event`/
   `0004_steering_closed`/`0005_superseded_by_run_id` means older binaries that predate a given
-  revision simply ignore the extra table/columns.
+  revision simply ignore the extra table/columns and do not fail to start.
+- **Schema compatibility is not the same as semantic compatibility.** An older binary running
+  against the new schema will not crash, but it also does not understand `steering_closed` or
+  `superseded_by_run_id` — it will not enforce the finalization admission gate or the
+  resume-lineage cancel/steer rejection this PR adds. Treat the new steering/lineage control
+  semantics as available only once every control-plane instance is running the new binary, not
+  the moment the schema migration lands. Rolling a binary back after it has already exercised
+  these semantics (e.g. after a resume has set `superseded_by_run_id`) does not un-happen that
+  transition; the old binary simply stops enforcing it going forward. If you must roll back
+  binaries while steering is in active use, quiesce or let in-flight runs finish first rather
+  than assuming the old binary preserves the same guarantees.
 - Because there is no schema downgrade path, validate `0002_steering`/
   `0003_steering_source_event`/`0004_steering_closed`/`0005_superseded_by_run_id` against a
   staging database (or the CI `test_postgres_integration.py` Postgres job) before applying to
