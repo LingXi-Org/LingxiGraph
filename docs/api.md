@@ -69,16 +69,16 @@ JWT claim 派生，绝不信任调用方自报 header。
   `EventBus`（进程内或 Redis）时会发布一个可选的低延迟唤醒通知供 worker 心跳循环等待，
   但它不是事件流中的具名事件（不存在 `run.steer.available` 事件），也从不作为唯一来源——
   worker 自身的周期性 PostgreSQL 安全点检查始终是最终保证。
-- `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受durable写入。
+- `running`/`pending`/`cancelling` 均可接受；`paused` run 也接受durable写入。
 - 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）对一个**新**事件
   返回 HTTP 409 `run_terminal`，不会静默生成一条永远不会被消费的事件。
-- **finalization 闸门（`run_finalizing`）：** 一旦某个 worker 的图执行到达终态/暂停
-  结果，该 worker 会立即（在 durably flush 最终 steering 消费、提交最终状态**之前**）
-  关闭这次投递尝试的新 steering 准入——此时 Run 行可能仍读作 `running`/`cancelling`，
-  但已经没有更多图安全点可以消费任何新输入了。在这个窗口内提交一个**新**事件（尚无
-  匹配 idempotency key）会返回 HTTP 409 `run_finalizing`，而不是被静默接受进一个再也
-  没人会 drain 的 channel。`paused` 不受此闸门影响——它是刻意设计支持继续接受 steering
-  的（迁移到 resume 后的新 run，见下）。
+- **finalization 闸门（`run_finalizing`）：** 一旦某个 worker 的图执行到达真正的终态结果，
+  该 worker 会立即（在 durably flush 最终 steering 消费、提交最终状态**之前**）关闭这次
+  投递尝试的新 steering 准入——此时 Run 行可能仍读作 `running`/`cancelling`，但已经没有
+  更多图安全点可以消费任何新输入了。在这个窗口内提交一个**新**事件（尚无匹配
+  idempotency key）会返回 HTTP 409 `run_finalizing`，而不是被静默接受进一个再也没人会
+  drain 的 channel。`paused` 不属于这条终结路径，也不会关闭闸门；它会继续接受 steering，
+  并在 resume 时把 pending steering 迁移到新的 descendant run。
 - `Idempotency-Key` header 或 body 的 `idempotency_key` 二选一；同一 `(tenant, run, key)`
   只会创建一条事件——**且这条幂等重放检查发生在上面所有准入判断之前，而不是之后**：
   同一个 key 的重试永远返回已存在事件的当前持久化状态（`id`/`sequence` 不变），即使该
@@ -93,9 +93,9 @@ JWT claim 派生，绝不信任调用方自报 header。
 Run 上所有仍处于 `pending`/`delivered` 的 steering 事件**迁移**到新 Run（保序、保留
 `kind`/`payload`/`metadata`/`idempotency_key`，旧事件被标记为 `superseded`），随后由新 Run
 的 worker 按正常路径投递、消费——即：paused 时提交的 steering 会在 resume 之后被新 Run
-实际消费，而不是永远 pending。旧 Run 同时被标记「已被 resume 取代」；resume 之后再对
-旧 `run_id` 调 `/steer` 会返回 HTTP 409 `run_superseded`（而不是再次静默积压），提示调用方
-改为对新 Run 调用 `/steer`。
+实际消费，而不是永远 pending。旧 Run 同时通过类型化的 `superseded_by_run_id` 字段标记为
+「已被 resume 取代」；resume 之后再对旧 `run_id` 调 `/steer` 或 `/cancel` 会返回 HTTP 409
+`run_superseded`，提示调用方改为操作新 Run。
 
 图内部通过 `runtime.has_steering`、`runtime.peek_steering()`、`runtime.drain_steering()`
 在安全点（节点开始前、节点完成后、下一 superstep 前、重试前、resume 之后）读取；
@@ -117,23 +117,32 @@ LingxiGraph 只保证durable delivery、顺序、去重与安全消费，"新消
 或上一跳的 id`），不会被中间某一跳的 id 覆盖。`created_at` 同样保留最初 durable
 accepted 的时间，因此后续 `run.steer.consumed` 的 `queue_latency_seconds`
 包含了全部 pause 等待时间，而不仅仅是最后一次 resume 之后的等待时间。客户端只需记住
-最初 `/steer` 返回的 `id`，即可用它在 `run.steer.accepted`/`run.steer.consumed` 事件的
-`source_event_id` 字段里找到最终归宿，无需跟踪中间产生的每一个 run_id。
+最初 `/steer` 返回的 `id`，即可用它在后续 lifecycle 事件的 `source_event_id` 字段里找到
+最终归宿，无需跟踪中间产生的每一个 run_id。
 
 **accepted ≠ consumed。** `POST /steer` 的 202 响应只代表事件已durably写入
 `run_steering_events`（`run.steer.accepted`，状态 `pending`）；只有当某个安全点的图代码
-真正调用 `drain_steering()` 并且该 drain 结果被 `commit_steering_consumptions()`
-durably提交后，才会出现 `run.steer.consumed`。两者严格分离：调用方不能仅凭 202 假设图
-已经看到这条输入。
+真正调用 `drain_steering()` 并且该 drain 结果被
+`commit_steering_consumptions_if_owned()` durably 提交后，才会出现 `run.steer.consumed`。
+两者严格分离：调用方不能仅凭 202 假设图已经看到这条输入。
 
-**观测性：** worker 在消费（drain）steering 事件后写入的 `run.steer.consumed` 事件包含
-`steering_event_id`、`source_event_id`（若来自迁移，否则省略）、`sequence`、`kind`，以及
-用于定位与诊断的 `queue_latency_seconds`（从 durably accepted 到被消费的等待时长）、
-`node`（消费该事件的节点名）、`namespace`（该节点所在的 subgraph 命名空间路径）、
-`task_id`（区分同一 superstep 内并行/`Send` 任务的具体 task）。`commit_steering_
-consumptions()` 本身是幂等的：只有真正发生 `pending`/`delivered` → `consumed` 状态转换
-的事件才会生成一条 `run.steer.consumed`；worker 因网络/DB 瞬时故障重试同一批
-consumption 时，不会产生第二条重复的 lifecycle 事件。
+**观测性：** steering 有三种专用 durable lifecycle 事件：
+
+- `run.steer.accepted`：事件被 durably 接受；
+- `run.steer.consumed`：图 drain 该事件且 fenced consumption commit 成功，包含
+  `steering_event_id`、`source_event_id`（若来自迁移，否则省略）、`sequence`、`kind`、
+  `queue_latency_seconds`、`node`、`namespace`、`task_id`；
+- `run.steer.superseded`：事件未被消费但获得明确 durable 归宿。`reason=resume_transfer` 表示
+  paused run 被 resume 后旧事件被迁移到 descendant run；
+  `reason=unconsumed_at_final_boundary` 表示真正终态 finalization 时仍有
+  `pending`/`delivered` steering。该 disposition、对应 lifecycle event 与 Run 的终态写入在
+  同一个 lease/attempt-fenced 事务中提交，因此不会出现“Run 已终结但 steering 归宿丢失”的
+  中间状态。
+
+`commit_steering_consumptions_if_owned()` 本身是幂等并按 `(lease_owner, attempt)` fenced：
+只有真正发生 `pending`/`delivered` → `consumed` 状态转换的事件才会生成一条
+`run.steer.consumed`；worker 因网络/DB 瞬时故障重试同一批 consumption 时，不会产生第二条
+重复 lifecycle 事件。
 
 ## SSE 续传
 
@@ -170,6 +179,12 @@ with LingxiGraphClient(
         thread_id=thread["id"],
         input={"request": "reset access", "result": ""},
     )
+    accepted = client.runs.steer(
+        run["id"],
+        payload={"message": "switch to Spanish"},
+        idempotency_key="msg-123",
+    )
+    print(accepted["id"], accepted["status"])
     for event in client.runs.stream(run["id"]):
         print(event)
 ```
