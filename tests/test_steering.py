@@ -1204,14 +1204,18 @@ class FinalizationFencingTests(unittest.TestCase):
             # cancelling re-check to happen.
             gate = asyncio.Event()
             commit_entered = asyncio.Event()
-            real_finish = repo.finish_run_if_owned
+            # Issue #16 PR #17 review round 9, point 2 (BLOCKER): a
+            # terminal ``finish`` intent now finalizes via the merged
+            # ``finalize_run_with_steering_disposition_if_owned`` -- gate
+            # that instead of the now-bypassed ``finish_run_if_owned``.
+            real_finalize = repo.finalize_run_with_steering_disposition_if_owned
 
-            async def gated_finish(*args: Any, **kwargs: Any):
+            async def gated_finalize(*args: Any, **kwargs: Any):
                 commit_entered.set()
                 await gate.wait()
-                return await real_finish(*args, **kwargs)
+                return await real_finalize(*args, **kwargs)
 
-            repo.finish_run_if_owned = gated_finish  # type: ignore[method-assign]
+            repo.finalize_run_with_steering_disposition_if_owned = gated_finalize  # type: ignore[method-assign]
 
             execute_task = asyncio.ensure_future(worker.run_once())
             await asyncio.wait_for(commit_entered.wait(), timeout=5)
@@ -1354,14 +1358,18 @@ class SteeringClosedGateTests(unittest.TestCase):
 
             gate = asyncio.Event()
             commit_entered = asyncio.Event()
-            real_finish = repo.finish_run_if_owned
+            # Issue #16 PR #17 review round 9, point 2 (BLOCKER): a
+            # terminal ``finish`` intent now finalizes via the merged
+            # ``finalize_run_with_steering_disposition_if_owned`` -- gate
+            # that instead of the now-bypassed ``finish_run_if_owned``.
+            real_finalize = repo.finalize_run_with_steering_disposition_if_owned
 
-            async def gated_finish(*args: Any, **kwargs: Any):
+            async def gated_finalize(*args: Any, **kwargs: Any):
                 commit_entered.set()
                 await gate.wait()
-                return await real_finish(*args, **kwargs)
+                return await real_finalize(*args, **kwargs)
 
-            repo.finish_run_if_owned = gated_finish  # type: ignore[method-assign]
+            repo.finalize_run_with_steering_disposition_if_owned = gated_finalize  # type: ignore[method-assign]
 
             execute_task = asyncio.ensure_future(worker.run_once())
             await asyncio.wait_for(commit_entered.wait(), timeout=5)
@@ -1521,7 +1529,7 @@ class SteeringClosedGateTests(unittest.TestCase):
             superseded_events = [e for e in events if e.kind == "run.steer.superseded"]
             self.assertEqual(len(superseded_events), 1)
             self.assertEqual(superseded_events[0].data["steering_event_id"], accepted.id)
-            self.assertEqual(superseded_events[0].data["reason"], "late_boundary_race")
+            self.assertEqual(superseded_events[0].data["reason"], "unconsumed_at_final_boundary")
             self.assertIsNone(superseded_events[0].data["superseded_by_run_id"])
 
         asyncio.run(scenario())
@@ -3073,6 +3081,121 @@ class WorkerFencedWriteLeaseLostBranchTests(unittest.TestCase):
             self.assertEqual(len(channel.peek_consumed()), 1)
 
         asyncio.run(scenario())
+
+    def test_delivery_retry_recovers_steering_not_yet_drained(self) -> None:
+        """Issue #16 PR #17 review round 9, point 1 (BLOCKER).
+
+        A REAL Worker-level delivery-retry regression -- not a graph-level
+        ``RetryPolicy`` test (a node-level retry never leaves the Worker's
+        ``_execute`` at all, so it can never exercise the
+        ``closing_steering``/``intent.kind == "retry"`` scoping bug this
+        covers). Steering E is durably pending; attempt 1's graph node
+        raises a retryable exception *before* calling ``drain_steering()``
+        at all, so the exception unwinds all the way out of
+        ``graph.astream`` and into ``Worker._execute``'s ``except
+        Exception`` branch, producing a ``kind="retry"`` intent. Before the
+        round 9 fix, ``closing_steering`` was true for *any* non-paused
+        intent (including retry), so this sequence would close steering
+        admission and supersede E -- permanently losing it -- the instant
+        before the Run was sent back to ``pending``. Assert E survives: it
+        is still ``pending``/``delivered`` (never ``superseded``) after
+        attempt 1, and attempt 2 (a fresh ``claim_run()``, mirroring a real
+        redelivery) re-ingests and drains it successfully.
+        """
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("flaky_before_drain"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "hello"}
+            )
+            self.assertTrue(created)
+
+            registry, attempts, drained_log = make_registry_flaky_before_drain()
+            worker = Worker(registry, repo, worker_id="worker-a", max_delivery_attempts=5)
+
+            # Attempt 1: the node raises a retryable exception before ever
+            # calling drain_steering() -- the run must go back to pending,
+            # and E must remain fully recoverable, never superseded.
+            claimed1 = await worker.run_once()
+            self.assertTrue(claimed1)
+            self.assertEqual(len(attempts), 1)
+
+            after_attempt_1 = await repo.get_run("acme", run.id)
+            assert after_attempt_1 is not None
+            status_1 = (
+                after_attempt_1.status.value
+                if hasattr(after_attempt_1.status, "value")
+                else after_attempt_1.status
+            )
+            self.assertEqual(status_1, "pending")
+
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual([event.id for event in still_pending], [accepted.id])
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(len(all_steering), 1)
+            self.assertIn(all_steering[0].status, ("pending", "delivered"))
+
+            events_after_1 = await repo.list_events("acme", run.id)
+            self.assertFalse(
+                any(event.kind == "run.steer.superseded" for event in events_after_1)
+            )
+
+            # Attempt 2: a fresh delivery attempt re-ingests E via the
+            # ordinary claim -> _sync_steering_in path and drains it.
+            claimed2 = await worker.run_once()
+            self.assertTrue(claimed2)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(drained_log, [["hello"]])
+
+            final = await repo.get_run("acme", run.id)
+            assert final is not None
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
+            self.assertEqual(final_status, "succeeded")
+
+            final_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(len(final_steering), 1)
+            self.assertEqual(final_steering[0].status, "consumed")
+
+        asyncio.run(scenario())
+
+
+def make_registry_flaky_before_drain() -> tuple[GraphRegistry, list[int], list[list[str]]]:
+    """A single-node graph whose node raises a retryable ``ConnectionError``
+    on its first *delivery* attempt, before ever calling
+    ``drain_steering()``, and succeeds (draining whatever is pending) on
+    the second. No node-level ``RetryPolicy`` is attached -- the exception
+    is meant to propagate all the way out of ``graph.astream`` into the
+    Worker's own delivery-retry handling, not be swallowed by a
+    node-internal retry.
+    """
+
+    attempts: list[int] = []
+    drained_log: list[list[str]] = []
+
+    builder = StateGraph(State)
+
+    async def flaky(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionError("transient, before draining anything")
+        drained = [event.payload["message"] for event in runtime.drain_steering()]
+        drained_log.append(drained)
+        return {"ticks": state.get("ticks", 0) + 1}
+
+    builder.add_node("flaky", flaky)
+    builder.add_edge(START, "flaky")
+    builder.add_edge("flaky", END)
+    return GraphRegistry({"flaky_before_drain": builder.compile()}), attempts, drained_log
 
 
 def _assistant_create_named(graph_id: str):

@@ -264,9 +264,22 @@ class Worker:
         # to the resumed run at ``/resume`` time), so it must keep
         # accepting new steering input, not be permanently gated shut by
         # a worker that is merely yielding control, not finishing.
-        closing_steering = not (
-            intent.kind == "finish" and intent.status is RunStatus.PAUSED
-        )
+        #
+        # Issue #16 PR #17 review round 9, point 1 (BLOCKER): a ``retry``
+        # intent is likewise NOT terminal finalization -- the next delivery
+        # attempt is a legitimate future safe point, not the end of the
+        # line. Closing/superseding steering on retry meant any steering
+        # durably accepted but not yet drained by this attempt was marked
+        # ``superseded`` here and then, moments later, the Run was sent
+        # back to ``pending`` by ``retry_run_if_owned`` -- so the next
+        # attempt's ``_sync_steering_in`` (which only re-ingests
+        # ``pending``/``delivered`` rows) could never see it again,
+        # permanently losing steering on the very next delivery attempt.
+        # Only a genuinely terminal ``finish`` (i.e. not ``paused``) closes
+        # admission and supersedes leftovers; ``retry`` leaves steering
+        # fully open and recoverable, exactly like an ordinary mid-run
+        # failure that predates this finalization step entirely.
+        closing_steering = intent.kind == "finish" and intent.status is not RunStatus.PAUSED
         if closing_steering:
             gate_closed = await self.repository.close_steering(
                 run.tenant_id, run.id, self.worker_id, run.attempt
@@ -315,12 +328,32 @@ class Worker:
                 # run finalizes with its originally computed intent. Only
                 # relevant when we actually closed admission -- a
                 # ``paused`` outcome intentionally leaves steering open for
-                # the eventual ``/resume`` transfer instead.
+                # the eventual ``/resume`` transfer instead, and a
+                # ``retry`` intent never closed admission in the first
+                # place (review round 9, point 1, BLOCKER) so there is
+                # nothing to supersede.
                 if closing_steering:
-                    superseded = await self.repository.supersede_pending_steering_if_owned(
-                        run.tenant_id, run.id, self.worker_id, run.attempt
+                    # Issue #16 PR #17 review round 9, point 2 (BLOCKER):
+                    # the leftover-steering disposition and the Run's
+                    # terminal status commit must be the *same* durable
+                    # write, not two separate fenced calls -- a crash or
+                    # lease loss between them used to be able to leave
+                    # steering permanently ``superseded`` while the Run
+                    # itself never actually reached a terminal status (see
+                    # ``finalize_run_with_steering_disposition_if_owned``'s
+                    # docstring for the full failure mode). ``intent.kind``
+                    # is always ``"finish"`` here -- ``closing_steering``
+                    # is only true for a genuinely terminal finish.
+                    result = await self.repository.finalize_run_with_steering_disposition_if_owned(
+                        run.tenant_id,
+                        run.id,
+                        self.worker_id,
+                        run.attempt,
+                        intent.status,
+                        output=intent.output,
+                        error=intent.error,
                     )
-                    if superseded is None:
+                    if result is None:
                         # Lease was reclaimed by a new owner between the
                         # final flush and this call -- same as any other
                         # fenced write losing the race: abandon without
@@ -328,12 +361,16 @@ class Worker:
                         # solely responsible for it.
                         logger.warning(
                             "run finalization abandoned: lease no longer owned before "
-                            "superseding stale steering",
+                            "finalizing with steering disposition",
                             extra={"run_id": run.id, "tenant_id": run.tenant_id},
                         )
                         return
+                    updated, superseded = result
                     for stored in superseded:
                         await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+                    self._log_finalize_outcome(run, updated, intent)
+                    graph.forget_steering(run.id)
+                    return
                 committed = await self._commit_intent(run, intent)
                 if committed:
                     graph.forget_steering(run.id)
@@ -434,6 +471,18 @@ class Worker:
                 extra={"run_id": run.id, "tenant_id": run.tenant_id},
             )
             return False
+        self._log_finalize_outcome(run, updated, intent)
+        return True
+
+    @staticmethod
+    def _log_finalize_outcome(run: Run, updated: Run, intent: "Worker._Intent") -> None:
+        """Log the actual resulting status of a terminal/paused finalize
+        write -- factored out so both ``_commit_intent`` (the ``paused``
+        and non-steering-closing paths) and the merged
+        ``finalize_run_with_steering_disposition_if_owned`` path (issue
+        #16 PR #17 review round 9, point 2, BLOCKER) log identically.
+        """
+
         final_status = updated.status if isinstance(updated.status, str) else updated.status.value
         if final_status == RunStatus.SUCCEEDED.value:
             logger.info(
@@ -455,7 +504,6 @@ class Worker:
                     "status": final_status,
                 },
             )
-        return True
 
     async def _emit_retry_outcome_event(
         self, run: Run, updated: Run, error: dict[str, Any] | None
@@ -509,13 +557,28 @@ class Worker:
         """Route a run that could not safely finalize into the ordinary
         retry/dead-letter path, fenced on ``(lease_owner, attempt)``.
 
-        Factored out of the two call sites that need it -- a final flush
-        that never durably succeeded, and (issue #16 PR #17 review round
-        7, point 1, BLOCKER) a flush that succeeded but left a steering
-        event durably accepted after the last safe point closed. Both are
-        "this attempt cannot safely finalize" situations that must resolve
-        the same way: retry while attempts remain, dead-letter once they
-        are exhausted, never write the intended terminal/paused status.
+        The only remaining caller is a final steering flush that never
+        durably succeeded (the worker is draining, or the lease was lost
+        to another worker mid-flush): the intended outcome computed in
+        ``_execute`` must never be written, so this instead resolves the
+        attempt the same way an ordinary mid-run delivery failure would --
+        retry while attempts remain, dead-letter once they are exhausted.
+
+        Historical note: round 7 also routed "steering landed too late to
+        be safely consumed" through this same path, forcing an indefinite
+        retry/dead-letter loop onto any run that ever had undrained
+        steering -- even a graph that legitimately never calls
+        ``drain_steering()`` at all. Round 8 replaced that with "seal
+        admission at the safe boundary + supersede late events" (see
+        ``finalize_run_with_steering_disposition_if_owned``): a steering
+        row still ``pending``/``delivered`` once the run reaches its
+        terminal finalization boundary is durably superseded, not routed
+        through a retry loop, so it no longer reaches this method at all.
+        And a genuine delivery ``retry`` intent (as opposed to a terminal
+        finalization failure) never closes steering admission in the first
+        place (review round 9, point 1, BLOCKER) -- it goes straight to
+        ``_commit_intent``, leaving steering fully open and recoverable by
+        the next delivery attempt, without ever passing through here.
         """
 
         if run.attempt < self.max_delivery_attempts:

@@ -73,9 +73,9 @@ event's existence and status. The schema reserves a `delivered` value for forwar
 compatibility, but the currently implemented flow never writes it — the real transition is
 `pending` → `consumed` directly (via a single atomic `commit_steering_consumptions_if_owned()` call),
 or `pending`/`delivered` → `superseded` — either because the paused run it belonged to was
-resumed (its still-pending steering migrates onto the new run) or because it durably landed
-after the owning worker's last safe point closed (a narrow race; see "Finalization and the
-steering admission boundary" below). Treat `delivered` as a status your code may need to read/allow
+resumed (its still-pending steering migrates onto the new run) or because it was still
+unconsumed once the owning run reached its terminal finalization boundary, for one of several
+possible reasons (see "Finalization and the steering admission boundary" below). Treat `delivered` as a status your code may need to read/allow
 today, not one anything currently produces. The Redis notification is purely an optimization
 to reduce polling latency; losing
 it never loses a steering event — the worker's periodic safe-point checks fall back to reading
@@ -146,32 +146,46 @@ drained. From that instant on, a fresh `/steer` call is refused with a stable `4
 run_finalizing` — there is no safe point left for the graph to ever consume a newly accepted
 event.
 
-This still leaves one narrow race: a `/steer` call can win the run row's lock, and durably
-commit its row, a moment *before* `close_steering()` wins that same lock — even though the
-graph has already produced its terminal output and the heartbeat loop that would have
-ingested the event has already stopped. Once the final flush completes, the Runtime checks for
-exactly this: any steering row still `pending`/`delivered` at that point is durably
-transitioned to `superseded` (reason `late_boundary_race`), paired with a `run.steer.superseded`
-lifecycle event, in the same lease/attempt-fenced write as the rest of finalization. The run
-then finalizes normally with its already-computed outcome (`succeeded`, `paused`, `failed`,
-etc.) — it is **not** forced through a retry loop just because a steering event happened to
-exist. A graph that legitimately never calls `drain_steering()` at all (a documented, allowed
-choice — see "Safe points are application-chosen" above) is never penalized by this: it
-finalizes on its first attempt exactly as if the steering event had never arrived, and that
-event's disposition is recorded as `superseded`, not silently dropped.
+This still leaves a gap: a `/steer` call can win the run row's lock, and durably commit its
+row, a moment *before* `close_steering()` wins that same lock — even though the graph has
+already produced its terminal output and the heartbeat loop that would have ingested the event
+has already stopped. Once the final flush completes, the Runtime checks for exactly this: any
+steering row still `pending`/`delivered` at that point is durably transitioned to `superseded`
+(reason `unconsumed_at_final_boundary`), paired with a `run.steer.superseded` lifecycle event,
+in the *same* lease/attempt-fenced transaction as the rest of finalization — the steering
+disposition and the run's terminal status commit together or not at all (see
+`finalize_run_with_steering_disposition_if_owned`; a crash or lease loss between two separately
+committed writes used to be able to leave steering permanently `superseded` while the run
+itself never actually finished). The run then finalizes normally with its already-computed
+outcome (`succeeded`, `paused`, `failed`, etc.) — it is **not** forced through a retry loop just
+because a steering event happened to exist.
+
+The `unconsumed_at_final_boundary` reason is deliberately generic and does **not** claim a
+race occurred. It covers two different situations the Runtime cannot currently tell apart from
+the data it has: the narrow lock race described above, and the far more common case of a graph
+that legitimately never calls `drain_steering()` at all (a documented, allowed choice — see
+"Safe points are application-chosen" above), where the row had been sitting there, fully
+visible, for the run's entire lifetime. Either way the outcome is the same: the run finalizes
+on its first attempt exactly as if the steering event had never arrived, and that event's
+disposition is recorded as `superseded`, not silently dropped.
 
 **Final disposition policy, stated precisely:** a terminal run's *own* finalization decision
-can never silently strand a race-losing steering event without a durable, observable
+can never silently strand an unconsumed steering event without a durable, observable
 disposition — that is what the mechanism above guarantees. It does **not** mean no terminal run
-can ever have a `pending` steering row for any reason at all: an ordinary client-initiated
-cancel (or a run that exhausts delivery attempts and is dead-lettered) can legitimately leave
-steering that the graph simply never got around to draining still `pending` — that is
-deliberate, retained durable history, not a bug, and a later redrive of that run picks the
-still-pending row back up like any other queued steering. The two cases are different: the
-boundary-race disposition above exists because that specific steering event durably has *no
-delivery attempt left, ever* that could consume it; an ordinary cancel's unconsumed steering
-still has a legitimate future delivery path (redrive) that a `superseded` disposition would
-incorrectly foreclose.
+can ever have a `pending` steering row for any reason at all: a run that exhausts delivery
+attempts and is dead-lettered (or fails outright) can legitimately leave steering that the
+graph simply never got around to draining still `pending` — that is deliberate, retained
+durable history, not a bug, and a later `/redrive` of that run (allowed only from `failed` or
+`dead_letter`) picks the still-pending row back up like any other queued steering. An ordinary
+client-initiated **cancel** is different, and not currently covered by that same recovery path:
+`/redrive` does not accept a `cancelled` run, so steering left `pending` on a cancelled run has
+no automatic future delivery attempt today — recovering it, if ever needed, is an operator/API
+task outside this mechanism, not something the Runtime resolves on its own. The two disposition
+cases above are different from cancel: the boundary-race/non-consumption disposition exists
+because that specific steering event durably has *no delivery attempt left, ever* that could
+consume it; a `failed`/`dead_letter` run's unconsumed steering has a legitimate future delivery
+path (`/redrive`) that a `superseded` disposition would incorrectly foreclose, which is why it
+is intentionally left `pending` instead.
 
 ## Parallel supersteps, `Send`, and subgraphs share one channel
 

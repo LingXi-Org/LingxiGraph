@@ -86,24 +86,33 @@ data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{}
 | --- | --- | --- |
 | `run.steer.accepted` | `/steer` 调用被 durably 接受时（202） | `steering_event_id`、`source_event_id`（若来自 resume 迁移）、`sequence`、`kind` |
 | `run.steer.consumed` | 图代码调用 `drain_steering()` 消费该事件，且这次消费被 `commit_steering_consumptions_if_owned()` durably 提交后 | `steering_event_id`、`source_event_id`、`sequence`、`kind`、`queue_latency_seconds`、`node`、`namespace`、`task_id` |
-| `run.steer.superseded` | 某条 steering 事件在从未被消费的情况下，其行 durably 转为 `superseded` 状态——原因可能是它所属的 paused run 被 resume（其仍 pending 的 steering 被迁移到新 run），也可能是它在所属 worker 的最后安全点关闭之后才落地（见下文） | `steering_event_id`、`source_event_id`、`reason`（`resume_transfer` 或 `late_boundary_race`）、`superseded_by_run_id`（`resume_transfer` 时有值，`late_boundary_race` 时为 `null`）、`replacement_steering_event_id`（`resume_transfer` 时有值，`late_boundary_race` 时为 `null`） |
+| `run.steer.superseded` | 某条 steering 事件在从未被消费的情况下，其行 durably 转为 `superseded` 状态——原因可能是它所属的 paused run 被 resume（其仍 pending 的 steering 被迁移到新 run），也可能是它在该 run 到达终结 finalization 边界时仍处于 `pending`/`delivered`（见下文） | `steering_event_id`、`source_event_id`、`sequence`、`kind`、`reason`（`resume_transfer` 或 `unconsumed_at_final_boundary`）、`superseded_by_run_id`（`resume_transfer` 时有值，`unconsumed_at_final_boundary` 时为 `null`）、`replacement_steering_event_id`（`resume_transfer` 时有值，`unconsumed_at_final_boundary` 时为 `null`） |
 
-`run.steer.superseded` 的 `late_boundary_race` 场景覆盖一种狭窄但确实存在的竞争：某次
-`/steer` 调用可能恰好在拥有该 run 的 worker 关闭新 steering 准入之前完成 durable 提交，
-但此时图早已产生最终输出，不再存在任何安全点能让它观察到这条事件。与其仅因为存在一条
-steering 事件就强制该 run 进入无限重试循环——这会惩罚那些本就合法地从不调用
-`drain_steering()` 的图——Runtime 会把这条行 durably 转为 `superseded`，并以之前已经算出的
-结果正常终结该 run。这种情况下 `run.steer.superseded` 事件绝不会被静默丢弃：它总是与状态
-转换在同一个 durable 事务中一起产生，并且在重试下是幂等的（对已经 `superseded` 的行重复
-尝试转换不会产生重复事件）。
+`run.steer.superseded` 的 `unconsumed_at_final_boundary` 原因是一个刻意保持诚实、笼统的
+标签——它**并不**声称该事件在与什么竞争。它涵盖了 worker 到达真正的终结 finalization 边界
+时仍处于 `pending`/`delivered` 的每一条 steering 行，而这背后的成因不止一种：某次 `/steer`
+调用确实可能恰好在 worker 关闭新准入之前完成 durable 提交（这是真实的竞争）；但同样常见的
+情况是，图从始至终就没有调用过 `drain_steering()` 去消费一条其实一直可见的行——这是普通的
+应用层未消费，根本不是竞争。Runtime 目前无法从现有数据中区分这两种情况，因此它也不假装能
+区分：两者都得到相同的 `unconsumed_at_final_boundary` 原因。与其仅因为存在一条 steering
+事件就强制该 run 进入无限重试循环——这会惩罚那些本就合法地从不调用 `drain_steering()` 的
+图——Runtime 会把这条行 durably 转为 `superseded`，并以之前已经算出的结果正常终结该 run。
+这种情况下 `run.steer.superseded` 事件绝不会被静默丢弃：它总是与 run 的终结状态在同一个
+durable 事务中一起提交，并且在重试下是幂等的（对已经 `superseded` 的行重复尝试转换不会
+产生重复事件）。
 
 字段说明：
 
 - `steering_event_id`：被消费的 steering 事件在**当前** run 下的 id（如果该事件是从旧 run
   迁移过来的，这是迁移后的新 id，不是客户端最初收到的 id）；
 - `source_event_id`：客户端最初 `/steer` 调用收到的**根** id。同一根 steering 即使经过多次
-  pause/resume 迁移，该字段在每一跳都保持一致，客户端可用它把最终 `run.steer.consumed`
-  与自己最初发出的请求关联起来；仅当事件来自迁移时出现，直接在原 run 上消费的事件没有此字段；
+  pause/resume 迁移，该字段在每一跳都保持一致，客户端可用它把最终
+  `run.steer.consumed`/`run.steer.superseded` 与自己最初发出的请求关联起来。这一行为按具体
+  生命周期事件而定，并非统一规则：在 `run.steer.accepted` 与 `run.steer.consumed` 上，仅当
+  事件来自迁移时才出现该字段——直接提交（从未被迁移）的事件在这两类事件上没有此字段；
+  `run.steer.superseded` 则不同：它总是把 `source_event_id` 设为
+  `event.source_event_id or event.id`，因此即便是一条直接提交、从未迁移过的事件，其
+  superseded 记录里也会带有一个根 id——就是它自己的 id；
 - `sequence`：该 steering 事件在其所属 run 的 steering 序列里的序号（与 run 事件流的
   `sequence` 是两个独立计数器）；
 - `kind`：透传自 `/steer` 请求体的 `kind`；

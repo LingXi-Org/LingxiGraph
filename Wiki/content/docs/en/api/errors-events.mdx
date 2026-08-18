@@ -86,18 +86,25 @@ produces three dedicated SSE event kinds across its lifecycle:
 | --- | --- | --- |
 | `run.steer.accepted` | A `/steer` call is durably accepted (202) | `steering_event_id`, `source_event_id` (if from a resume migration), `sequence`, `kind` |
 | `run.steer.consumed` | Graph code calls `drain_steering()` and that consumption is durably committed by `commit_steering_consumptions_if_owned()` | `steering_event_id`, `source_event_id`, `sequence`, `kind`, `queue_latency_seconds`, `node`, `namespace`, `task_id` |
-| `run.steer.superseded` | A steering event's row durably transitions to the `superseded` disposition without ever being consumed — either because a paused run it belonged to was resumed (its still-pending steering is migrated onto the new run) or because it landed after the owning worker's last safe point closed (see below) | `steering_event_id`, `source_event_id`, `reason` (`resume_transfer` or `late_boundary_race`), `superseded_by_run_id` (set for `resume_transfer`, `null` for `late_boundary_race`), `replacement_steering_event_id` (set for `resume_transfer`, `null` for `late_boundary_race`) |
+| `run.steer.superseded` | A steering event's row durably transitions to the `superseded` disposition without ever being consumed — either because a paused run it belonged to was resumed (its still-pending steering is migrated onto the new run) or because it was still `pending`/`delivered` when the run reached its terminal-finalization boundary (see below) | `steering_event_id`, `source_event_id`, `sequence`, `kind`, `reason` (`resume_transfer` or `unconsumed_at_final_boundary`), `superseded_by_run_id` (set for `resume_transfer`, `null` for `unconsumed_at_final_boundary`), `replacement_steering_event_id` (set for `resume_transfer`, `null` for `unconsumed_at_final_boundary`) |
 
-`run.steer.superseded`'s `late_boundary_race` reason covers a narrow, deliberate race: a
-`/steer` call can durably commit its row a moment before the owning worker closes new
-admission, even though the graph has already produced its final output and there is no safe
-point left for it to ever observe that event. Rather than forcing the run through an
-indefinite retry loop just because a steering event happened to exist — which would penalize
-a graph that legitimately never calls `drain_steering()` at all — the Runtime durably
-transitions that row to `superseded` and finalizes the run with its already-computed outcome.
-A `run.steer.superseded` event is never silently dropped in this case; it is always paired
-with the disposition change, in the same durable transaction, and is idempotent under retry
-(a repeated attempt to supersede an already-superseded row emits no duplicate event).
+`run.steer.superseded`'s `unconsumed_at_final_boundary` reason is a deliberately honest,
+generic label — it does **not** claim the event was racing anything. It covers every steering
+row still `pending`/`delivered` once the owning worker reaches a genuinely terminal
+finalization boundary, and that has more than one possible cause: a `/steer` call can durably
+commit its row a moment before the worker closes new admission (a real race), but just as
+commonly the graph simply never called `drain_steering()` at all for a row that had been
+sitting there, fully visible, for the run's entire lifetime — ordinary application-level
+non-consumption, not a race. The Runtime cannot currently distinguish these two cases from the
+data it has, so it does not pretend to; both get the same `unconsumed_at_final_boundary`
+reason. Rather than forcing the run through an indefinite retry loop just because a steering
+event happened to exist — which would penalize a graph that legitimately never calls
+`drain_steering()` at all — the Runtime durably transitions the row to `superseded` and
+finalizes the run with its already-computed outcome. A `run.steer.superseded` event is never
+silently dropped in this case; it is always paired with the disposition change, committed
+together with the run's terminal status in the same durable transaction, and is idempotent
+under retry (a repeated attempt to supersede an already-superseded row emits no duplicate
+event).
 
 Field meanings:
 
@@ -107,9 +114,13 @@ Field meanings:
 - `source_event_id`: the **root** id the client originally received from its `/steer` call.
   Even across repeated pause/resume migrations of the same underlying steering, this field
   stays consistent at every hop, letting a client correlate the eventual
-  `run.steer.consumed` back to its original request. It is present only for events that
-  arrived via a migration — an event consumed directly on the run it was submitted to has no
-  `source_event_id`;
+  `run.steer.consumed`/`run.steer.superseded` back to its original request. This is
+  per-lifecycle-event, not a blanket rule: on `run.steer.accepted` and `run.steer.consumed` it
+  is present only for events that arrived via a migration — a directly-submitted event (never
+  transferred) has no `source_event_id` on those two. `run.steer.superseded` is different: it
+  always sets `source_event_id` to `event.source_event_id or event.id`, so a directly-submitted
+  event's superseded record still carries a root id — its own — even though it was never
+  migrated;
 - `sequence`: this event's position in its run's steering sequence (a separate counter from
   the run's overall event-stream `sequence`);
 - `kind`: passed through from the `/steer` request body's `kind`;

@@ -815,7 +815,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             self.assertEqual(len(stored), 1)
             self.assertEqual(stored[0].kind, "run.steer.superseded")
             self.assertEqual(stored[0].data["steering_event_id"], event.id)
-            self.assertEqual(stored[0].data["reason"], "late_boundary_race")
+            self.assertEqual(stored[0].data["reason"], "unconsumed_at_final_boundary")
             self.assertIsNone(stored[0].data["superseded_by_run_id"])
 
             self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
@@ -834,6 +834,174 @@ class PostgresIntegrationTests(unittest.TestCase):
                 if e.kind == "run.steer.superseded"
             ]
             self.assertEqual(len(superseded_events), 1)
+
+        asyncio.run(scenario())
+
+    def test_finalize_run_with_steering_disposition_if_owned_postgres_path(self) -> None:
+        """Issue #16 PR #17 review round 9, point 2 (BLOCKER), PostgreSQL
+        path: the merged ``finalize_run_with_steering_disposition_if_owned``
+        must durably supersede leftover steering AND commit the run's
+        terminal status together, and must be rejected outright for a
+        worker whose lease has already been reclaimed by a new owner."""
+
+        from lingxigraph.server.models import (
+            AssistantCreate,
+            RunCreate,
+            RunStatus,
+            ThreadCreate,
+        )
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+
+            claimed_a = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed_a is not None
+
+            # A's lease expires; B claims the same run at a new attempt.
+            await asyncio.sleep(1.2)
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertEqual(claimed_b.attempt, claimed_a.attempt + 1)
+
+            # A's now-stale attempt must be rejected outright, touching
+            # neither the steering row nor the run's status.
+            stale_result = await repo.finalize_run_with_steering_disposition_if_owned(
+                "acme", run.id, "worker-a", claimed_a.attempt, RunStatus.SUCCEEDED, output={}
+            )
+            self.assertIsNone(stale_result)
+            self.assertEqual(
+                [row.id for row in await repo.list_pending_steering("acme", run.id)],
+                [event.id],
+            )
+            still_running = await repo.get_run("acme", run.id)
+            assert still_running is not None
+            self.assertEqual(still_running.status, "running")
+
+            # B, the current owner, finalizes normally: steering disposition
+            # and terminal status commit together.
+            result = await repo.finalize_run_with_steering_disposition_if_owned(
+                "acme", run.id, "worker-b", claimed_b.attempt, RunStatus.SUCCEEDED, output={}
+            )
+            assert result is not None
+            updated, superseded = result
+            self.assertEqual(updated.status, "succeeded")
+            self.assertEqual(len(superseded), 1)
+            self.assertEqual(superseded[0].data["steering_event_id"], event.id)
+            self.assertEqual(superseded[0].data["reason"], "unconsumed_at_final_boundary")
+            self.assertEqual(superseded[0].data["sequence"], event.sequence)
+            self.assertEqual(superseded[0].data["kind"], event.kind)
+
+            final = await repo.get_run("acme", run.id)
+            assert final is not None
+            self.assertEqual(final.status, "succeeded")
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+            all_steering = await repo.list_steering("acme", run.id)
+            self.assertEqual(all_steering[0].status, "superseded")
+
+        asyncio.run(scenario())
+
+    def test_finalize_run_with_steering_disposition_rolls_back_atomically_on_failure(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 9, point 2 (BLOCKER) -- the real
+        Postgres rollback/takeover regression the review explicitly asked
+        for: deliberately fail partway through the merged transaction
+        (after the steering row has been superseded in-transaction, but
+        before the run's terminal UPDATE and the transaction's COMMIT) and
+        assert the WHOLE transaction rolls back -- the steering row is
+        still pending/delivered and recoverable by the next owner, and the
+        run's status is untouched. This must run against a real PostgreSQL
+        connection to prove actual transactional atomicity; an
+        InMemoryRepository ordering test cannot demonstrate this."""
+
+        from lingxigraph.server.models import (
+            AssistantCreate,
+            RunCreate,
+            RunStatus,
+            ThreadCreate,
+        )
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            class _InjectedFailure(Exception):
+                pass
+
+            real_ensure = repo._ensure_steer_superseded_event_sync
+
+            def failing_ensure(cursor, tenant_id, run_id, steering_event, **kwargs):
+                # Let the steering row's own UPDATE (to 'superseded') and
+                # the superseded-event insert happen first -- exactly what
+                # a real "fails right before the run's terminal UPDATE and
+                # COMMIT" crash would leave in-flight -- then blow up
+                # before the surrounding ``with self._connect()`` block
+                # ever reaches the run status UPDATE or exits normally.
+                real_ensure(cursor, tenant_id, run_id, steering_event, **kwargs)
+                raise _InjectedFailure("simulated crash before terminal status commit")
+
+            repo._ensure_steer_superseded_event_sync = failing_ensure  # type: ignore[method-assign]
+
+            with self.assertRaises(_InjectedFailure):
+                await repo.finalize_run_with_steering_disposition_if_owned(
+                    "acme", run.id, "worker-a", claimed.attempt, RunStatus.SUCCEEDED, output={}
+                )
+
+            repo._ensure_steer_superseded_event_sync = real_ensure  # type: ignore[method-assign]
+
+            # Everything must have rolled back together: the run is still
+            # running (not succeeded), the steering row is still
+            # pending/delivered (never left stranded as superseded), and no
+            # run.steer.superseded event was recorded.
+            still_running = await repo.get_run("acme", run.id)
+            assert still_running is not None
+            self.assertEqual(still_running.status, "running")
+            self.assertEqual(
+                [row.id for row in await repo.list_pending_steering("acme", run.id)],
+                [event.id],
+            )
+            superseded_events = [
+                e
+                for e in await repo.list_events("acme", run.id)
+                if e.kind == "run.steer.superseded"
+            ]
+            self.assertEqual(superseded_events, [])
+
+            # A subsequent owner (the same worker, still holding its lease
+            # here) can still finalize normally and recover the row -- it
+            # was never lost.
+            result = await repo.finalize_run_with_steering_disposition_if_owned(
+                "acme", run.id, "worker-a", claimed.attempt, RunStatus.SUCCEEDED, output={}
+            )
+            assert result is not None
+            updated, superseded = result
+            self.assertEqual(updated.status, "succeeded")
+            self.assertEqual(len(superseded), 1)
 
         asyncio.run(scenario())
 
