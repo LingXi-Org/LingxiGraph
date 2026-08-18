@@ -328,9 +328,7 @@ class AgentServerTests(unittest.TestCase):
             # genuinely paused run produced by the Worker, not a
             # hand-faked status).
             repository = app.state.repository
-            self.assertIsNone(
-                asyncio.run(repository.get_run("acme", paused["id"])).lease_owner
-            )
+            self.assertIsNone(asyncio.run(repository.get_run("acme", paused["id"])).lease_owner)
             cancel_result = asyncio.run(repository.request_cancel("acme", paused["id"]))
             self.assertTrue(cancel_result)
             after_cancel = asyncio.run(repository.get_run("acme", paused["id"]))
