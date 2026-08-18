@@ -11,7 +11,7 @@ from typing import Annotated, Any, TypedDict
 from fastapi.testclient import TestClient
 
 from lingxigraph import END, START, RetryPolicy, Runtime, Send, StateGraph
-from lingxigraph.errors import RunResumeConflictError, RunTerminalError
+from lingxigraph.errors import RunResumeConflictError, RunSupersededError, RunTerminalError
 from lingxigraph.server import GraphRegistry, create_app
 from lingxigraph.server.models import ThreadCreate
 from lingxigraph.server.repository import InMemoryRepository
@@ -585,6 +585,52 @@ class AtomicResumeMigrationTests(unittest.TestCase):
                 await repo.resume_run_with_pending_steering(
                     "acme", old_run.thread_id, assistant, request, old_run.id
                 )
+
+        asyncio.run(scenario())
+
+    def test_cancel_of_a_resumed_away_paused_run_is_rejected_as_superseded(self) -> None:
+        """Issue #16 PR #17 review round 13 (BLOCKER): once a paused run
+        ``A`` has been resumed into a descendant ``B``, ``A`` keeps
+        ``status='paused'`` by design (metadata.superseded_by_run_id marks
+        it stale instead) so that ``/steer`` can point callers at ``B``.
+        ``request_cancel(A)`` must honor that same signal atomically --
+        raising ``RunSupersededError`` -- instead of falsely succeeding by
+        flipping ``A`` to ``cancelled`` while ``B`` keeps executing
+        untouched.
+        """
+
+        from lingxigraph.server.models import RunCreate
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create(), graph_version="1"
+            )
+            old_run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            new_run, _ = await repo.resume_run_with_pending_steering(
+                "acme", old_run.thread_id, assistant, request, old_run.id
+            )
+
+            with self.assertRaises(RunSupersededError):
+                await repo.request_cancel("acme", old_run.id)
+
+            # The old run must be untouched -- still paused, still pointing
+            # at the same descendant, not clobbered into a terminal state.
+            old_after = await repo.get_run("acme", old_run.id)
+            self.assertEqual(old_after.status, "paused")
+            self.assertEqual(old_after.metadata.get("superseded_by_run_id"), new_run.id)
+
+            # The actual resumed descendant is unaffected and still
+            # cancellable normally.
+            new_before_cancel = await repo.get_run("acme", new_run.id)
+            self.assertNotEqual(new_before_cancel.status, "cancelled")
+            cancelled = await repo.request_cancel("acme", new_run.id)
+            self.assertTrue(cancelled)
+            new_after_cancel = await repo.get_run("acme", new_run.id)
+            self.assertEqual(new_after_cancel.status, "cancelled")
 
         asyncio.run(scenario())
 

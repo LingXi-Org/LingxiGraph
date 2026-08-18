@@ -80,6 +80,7 @@ POST /v1/runs/{run_id}/redrive
 
 - Cancellation is cooperative and usually returns `cancelling` first; nodes and providers should honor the cancellation token.
 - Cancelling a `pending` (not yet claimed) or `paused` (parked on `interrupt`, no live worker holding it) run resolves to `cancelled` immediately, with `finished_at` set — there is no live delivery attempt for either status to cooperatively observe a token, so there is nothing to wait on.
+- Cancelling a `paused` run that has since been `resume`d returns `409 run_superseded` instead — the same signal `/steer` gives for a stale `run_id` (see below). The old run's `status` deliberately stays `paused` after a resume (only `metadata.superseded_by_run_id` marks it stale), so cancel checks that same field, atomically, before deciding the status transition; it never silently succeeds against the historical run while the resumed descendant keeps executing. Cancel the new `run_id` instead.
 - Only a `paused` run can resume. The response is a new run whose `metadata.resumed_from_run_id` points to the original.
 - Concurrent resume calls against the same paused run have exactly one winner: it creates the new run as above, and every other concurrent caller gets `409 run_resume_conflict` instead of a duplicate run.
 - Only `failed` or `dead_letter` runs can redrive. Redrive preserves input/config/version and re-enqueues the run.

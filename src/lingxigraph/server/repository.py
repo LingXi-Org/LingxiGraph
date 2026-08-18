@@ -749,6 +749,19 @@ class InMemoryRepository:
             run = self._runs.get(key)
             if run is None or enum_value(run.status) in TERMINAL:
                 return False
+            # Round 13 review (BLOCKER): a paused run that has since been
+            # resumed is only marked stale via ``metadata.superseded_by_run_id``
+            # -- its ``status`` deliberately stays ``paused`` so /steer's
+            # existing superseded gate keeps working. Cancel must honor that
+            # same signal *inside this lock*, or a cancel racing behind a
+            # resume would silently "succeed" against the old run while the
+            # real (resumed) descendant keeps executing untouched.
+            superseded_by = run.metadata.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"cancel the new run instead"
+                )
             status = (
                 RunStatus.CANCELLED.value
                 if enum_value(run.status)
@@ -2224,15 +2237,49 @@ class PostgresRepository(InMemoryRepository):
     async def request_cancel(self, tenant_id, run_id):
         return await asyncio.to_thread(self._request_cancel_sync, tenant_id, run_id)
 
-    def _request_cancel_sync(self, tenant_id, run_id):
+    def _request_cancel_sync(
+        self, tenant_id, run_id
+    ):  # pragma: no cover -- Postgres-only, covered by the `postgres` CI job
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
+            # Round 13 review (BLOCKER): lock the row first and check
+            # ``metadata.superseded_by_run_id`` *inside this same lock*,
+            # before deciding the status transition. A resumed-away paused
+            # run keeps status='paused' (by design, so /steer's existing
+            # superseded gate works) -- cancel must honor that same signal
+            # atomically, or a cancel racing behind a resume could falsely
+            # report success against the stale run while the real
+            # (resumed) descendant keeps running untouched. Doing this as
+            # a pre-read outside the lock would reopen the same TOCTOU
+            # class of bug already fixed for double-resume.
+            cursor.execute(
+                f"""SELECT status, metadata FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+                (tenant_id, run_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            if row["status"] in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "timed_out",
+                "dead_letter",
+            }:
+                return False
+            metadata = row["metadata"] or {}
+            superseded_by = metadata.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"cancel the new run instead"
+                )
             cursor.execute(
                 f"""UPDATE {self._schema}.runs SET
                 status=CASE WHEN status IN ('pending','paused') THEN 'cancelled' ELSE 'cancelling' END,
                 finished_at=CASE WHEN status IN ('pending','paused') THEN NOW() ELSE finished_at END
-                WHERE tenant_id=%s AND id=%s
-                  AND status NOT IN ('succeeded','failed','cancelled','timed_out','dead_letter')""",
+                WHERE tenant_id=%s AND id=%s""",
                 (tenant_id, run_id),
             )
             return cursor.rowcount > 0

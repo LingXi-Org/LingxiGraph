@@ -272,6 +272,77 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_concurrent_resume_vs_cancel_never_false_succeeds(self) -> None:
+        """Issue #16 PR #17 review round 13 (BLOCKER), PostgreSQL path.
+
+        Races a real ``resume_run_with_pending_steering`` transaction
+        against a real ``request_cancel`` transaction for the same paused
+        run's row lock. PostgreSQL's ``FOR UPDATE`` linearizes the two, but
+        under *either* winning order the caller must never be lied to:
+
+        * cancel wins the lock first -> old run cancelled, resume then
+          fails as a resume conflict (no descendant created).
+        * resume wins the lock first -> exactly one descendant created,
+          cancel is rejected as superseded (never a false-success True).
+
+        Under no interleaving may ``request_cancel`` return ``True`` while
+        a resumed descendant exists and keeps running untouched.
+        """
+
+        from lingxigraph.errors import RunResumeConflictError, RunSupersededError
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            old_run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            await repo.finish_run("acme", old_run.id, "paused", output={})
+
+            request = RunCreate(assistant_id=assistant.id, resume=1)
+            resume_result, cancel_result = await asyncio.gather(
+                repo.resume_run_with_pending_steering(
+                    "acme", thread.id, assistant, request, old_run.id
+                ),
+                repo.request_cancel("acme", old_run.id),
+                return_exceptions=True,
+            )
+
+            all_runs = await repo.list_runs("acme", thread_id=thread.id)
+            descendants = [r for r in all_runs if r.id != old_run.id]
+            final_old = await repo.get_run("acme", old_run.id)
+
+            if isinstance(cancel_result, bool) and cancel_result:
+                # Cancel linearized first: old run cancelled, resume must
+                # have failed as a conflict, and no descendant exists.
+                self.assertEqual(final_old.status, "cancelled")
+                self.assertIsInstance(resume_result, RunResumeConflictError)
+                self.assertEqual(descendants, [])
+            else:
+                # Resume linearized first: exactly one descendant exists,
+                # and cancel must have been rejected as superseded --
+                # never a silent False either, since that would also read
+                # to a caller as "nothing to cancel" without pointing at
+                # the real successor.
+                self.assertIsInstance(cancel_result, RunSupersededError)
+                self.assertEqual(len(descendants), 1)
+                new_run, _transferred = resume_result
+                self.assertEqual(descendants[0].id, new_run.id)
+                self.assertEqual(final_old.status, "paused")
+                self.assertEqual(final_old.metadata.get("superseded_by_run_id"), new_run.id)
+
+                # The real descendant remains genuinely cancellable.
+                really_cancelled = await repo.request_cancel("acme", new_run.id)
+                self.assertTrue(really_cancelled)
+
+        asyncio.run(scenario())
+
     def test_steer_accept_and_accepted_event_commit_atomically(self) -> None:
         """Issue #16 PR #17 review round 4, point 2, PostgreSQL path.
 

@@ -34,7 +34,7 @@ Common stable codes include `idempotency_conflict`, `quota_exceeded`, and `join_
 | `code` | HTTP | Triggered when |
 | --- | --- | --- |
 | `run_terminal` | 409 | `/steer` is called against a run in a terminal status (`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`); no durable write is created |
-| `run_superseded` | 409 | `/steer` is called against an old `run_id` already superseded by a `resume`; call it against the new run's `id` instead (see `metadata.resumed_from_run_id`) |
+| `run_superseded` | 409 | `/steer` or `/cancel` is called against an old `run_id` already superseded by a `resume`; call it against the new run's `id` instead (see `metadata.resumed_from_run_id`). For `/cancel`, this fires even though the old run's `status` is still `paused` -- the check reads `metadata.superseded_by_run_id`, not `status`, so the historical run is never mutated to `cancelled` while its resumed descendant keeps running |
 | `payload_too_large` | 413/422 | Serialized `payload` + `metadata` exceed the size cap (32KB, or the server's event size cap, whichever is smaller); no durable write is created |
 | `run_resume_conflict` | 409 | Concurrent resume calls raced against the same paused run; exactly one wins and creates the new run, every other caller gets this instead |
 | `run_finalizing` | 409 | `/steer` is called after the run's graph has already finished executing but before its final status is committed (a short window while the worker durably flushes and finalizes); there is no safe point left to consume the event, so it is rejected rather than durably accepted with nobody to ever read it. A `paused` outcome is not affected -- steering a paused run remains normal |
