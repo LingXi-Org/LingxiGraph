@@ -1,12 +1,17 @@
 name: Publish Python package
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/lingxigraph/version.py'
   workflow_dispatch:
     inputs:
       tag:
         description: Annotated release tag to publish
         required: true
-        default: v2.2.0
+        default: v2.3.0
         type: string
       repository:
         description: Package index
@@ -21,36 +26,113 @@ permissions:
   contents: read
 
 jobs:
-  publish:
+  prepare:
+    name: Prepare release identity
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      id-token: write
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      repository: ${{ steps.release.outputs.repository }}
     steps:
-      - name: Validate tag input
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release
+        id: release
+        shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_REPOSITORY: ${{ inputs.repository }}
         run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RELEASE_TAG="$INPUT_TAG"
+            TARGET_REPOSITORY="$INPUT_REPOSITORY"
+          else
+            VERSION=$(python - <<'PY'
+          import pathlib
+          import re
+          text = pathlib.Path("src/lingxigraph/version.py").read_text()
+          match = re.search(r'__version__\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+          if match is None:
+              raise SystemExit("Unable to read __version__ from src/lingxigraph/version.py")
+          print(match.group(1))
+          PY
+            )
+            RELEASE_TAG="v$VERSION"
+            TARGET_REPOSITORY="pypi"
+          fi
+
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Expected a tag such as v2.1.0, got: $RELEASE_TAG" >&2
+            echo "Expected a tag such as v2.3.0, got: $RELEASE_TAG" >&2
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+          VERSION="${RELEASE_TAG#v}"
+          PYPROJECT_VERSION=$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as stream:
+              print(tomllib.load(stream)["project"]["version"])
+          PY
+          )
+          RUNTIME_VERSION=$(python - <<'PY'
+          import pathlib
+          import re
+          text = pathlib.Path("src/lingxigraph/version.py").read_text()
+          match = re.search(r'__version__\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+          if match is None:
+              raise SystemExit("Unable to read runtime version")
+          print(match.group(1))
+          PY
+          )
+
+          test "$PYPROJECT_VERSION" = "$VERSION"
+          test "$RUNTIME_VERSION" = "$VERSION"
+          grep -q "^## $VERSION - " CHANGELOG.md
+
+          git fetch --tags --force
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$(git cat-file -t "$RELEASE_TAG")" = tag
+            git checkout --detach "$RELEASE_TAG"
+            test "$(git cat-file -t "$RELEASE_TAG")" = tag
+          else
+            if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "Release tag $RELEASE_TAG already exists; refusing an automatic duplicate publish." >&2
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" -m "LingxiGraph $VERSION"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "repository=$TARGET_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build release distributions
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
           fetch-depth: 0
 
-      - name: Verify annotated tag
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
-          test "$(git cat-file -t "$RELEASE_TAG")" = tag
-
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: '3.13'
 
       - name: Build distributions
         run: |
@@ -59,7 +141,7 @@ jobs:
 
       - name: Verify distribution metadata
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           python - <<'PY'
           import email
@@ -83,12 +165,105 @@ jobs:
           assert expected in wheels[0].name and expected in sdists[0].name
           PY
 
-      - name: Publish to TestPyPI
-        if: inputs.repository == 'testpypi'
+      - name: Upload release distributions
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-dists-${{ needs.prepare.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: needs.prepare.outputs.repository == 'pypi'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download release distributions
+        uses: actions/download-artifact@v7
+        with:
+          name: python-dists-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' }}
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: needs.prepare.outputs.repository == 'testpypi'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download release distributions
+        uses: actions/download-artifact@v7
+        with:
+          name: python-dists-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Publish package distributions to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
 
-      - name: Publish to PyPI
-        if: inputs.repository == 'pypi'
-        uses: pypa/gh-action-pypi-publish@release/v1
+  github-release:
+    name: Publish GitHub Release
+    if: needs.prepare.outputs.repository == 'pypi'
+    needs:
+      - prepare
+      - build
+      - publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download release distributions
+        uses: actions/download-artifact@v7
+        with:
+          name: python-dists-${{ needs.prepare.outputs.version }}
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES_FILE=".github/release-notes/$RELEASE_TAG.md"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            exit 0
+          fi
+
+          if [ -f "$NOTES_FILE" ]; then
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --latest \
+              --title "LingxiGraph $RELEASE_TAG" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --latest \
+              --title "LingxiGraph $RELEASE_TAG" \
+              --generate-notes
+          fi

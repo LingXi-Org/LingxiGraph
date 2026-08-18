@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+_No unreleased changes._
+
+## 2.3.0 - 2026-08-18
+
 ### Durable mid-run steering (issue #16)
 
 - 新增 `POST /v1/runs/{run_id}/steer`：在 Run 执行期间（含 `paused`）durably 注入新的

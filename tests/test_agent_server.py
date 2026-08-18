@@ -5,7 +5,7 @@ from typing import TypedDict
 
 from fastapi.testclient import TestClient
 
-from lingxigraph import END, START, StateGraph, interrupt
+from lingxigraph import END, START, StateGraph, __version__, interrupt
 from lingxigraph.server import GraphRegistry, create_app
 from lingxigraph.server.security import Authenticator
 
@@ -550,7 +550,7 @@ class AgentServerTests(unittest.TestCase):
                 json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
             )
             self.assertEqual(initialized.json()["result"]["serverInfo"]["name"], "LingxiGraph")
-            self.assertEqual(initialized.json()["result"]["serverInfo"]["version"], "2.2.0")
+            self.assertEqual(initialized.json()["result"]["serverInfo"]["version"], __version__)
             tools = client.post(
                 "/mcp",
                 headers=headers,
