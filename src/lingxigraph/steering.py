@@ -79,6 +79,38 @@ def new_steering_id() -> str:
     return str(uuid4())
 
 
+@dataclass(frozen=True, slots=True)
+class SteeringConsumption:
+    """Where and how long an event waited before a safe point drained it.
+
+    Produced by :meth:`SteeringChannel.drain` for every event it returns,
+    and surfaced end-to-end as the ``run.steer.consumed`` observability
+    event's payload (see :mod:`lingxigraph.server.worker`) so a production
+    deployment can answer "where did this get consumed, and how long did it
+    queue" -- the two pieces of information issue #16's acceptance criteria
+    call out that a bare ``steering_event_id/sequence/kind`` record cannot
+    answer on its own.
+    """
+
+    event: SteeringEvent
+    consumed_at: datetime
+    #: The node (task) whose call to ``runtime.drain_steering()`` drained
+    #: this event -- ``None`` when drained outside node execution (e.g. a
+    #: direct ``channel.drain()`` call with no consumer context attached).
+    node: str | None = None
+    #: The subgraph namespace path of that node, e.g. ``("supervisor",)``.
+    namespace: tuple[str, ...] = ()
+    #: The specific task id (distinguishes parallel/``Send`` fan-out tasks
+    #: that share one node name within the same superstep).
+    task_id: str | None = None
+
+    @property
+    def queue_latency_seconds(self) -> float:
+        """Wall-clock time between durable acceptance and consumption."""
+
+        return max(0.0, (self.consumed_at - self.event.created_at).total_seconds())
+
+
 class SteeringChannel:
     """Thread-safe, ordered, dedup'd inbox of :class:`SteeringEvent`.
 
@@ -99,14 +131,25 @@ class SteeringChannel:
     ``consumed`` in PostgreSQL when the graph actually drains them.
     """
 
-    def __init__(self, run_id: str = "") -> None:
+    def __init__(self, run_id: str = "", *, owned_by_executor: bool = True) -> None:
         self.run_id = run_id
         self._lock = threading.Lock()
         self._pending: dict[str, SteeringEvent] = {}
         self._seen_ids: set[str] = set()
         self._next_sequence = 1
-        self._consumed_log: list[SteeringEvent] = []
+        self._consumed_log: list[SteeringConsumption] = []
         self.on_drain: Any = None
+        #: Whether the graph executor's own embedded run lifecycle may
+        #: release (``forget``) this channel automatically once its run
+        #: finishes. ``True`` for channels created implicitly by
+        #: ``CompiledStateGraph.steer()``/``_run()`` (plain embedded
+        #: ``invoke``/``ainvoke`` with no server involved). A server
+        #: integration explicitly registers a channel ahead of time via
+        #: ``get_steering_channel()`` and flips this to ``False`` -- it owns
+        #: the channel's lifecycle end to end (see ``Worker._execute``'s
+        #: explicit ``forget_steering`` call) since a queued run may receive
+        #: steering before any worker has claimed it.
+        self.owned_by_executor = owned_by_executor
 
     def submit(
         self,
@@ -177,11 +220,34 @@ class SteeringChannel:
         with self._lock:
             return tuple(sorted(self._pending.values(), key=lambda item: item.sequence))
 
-    def drain(self) -> tuple[SteeringEvent, ...]:
+    def drain(
+        self,
+        *,
+        node: str | None = None,
+        namespace: tuple[str, ...] = (),
+        task_id: str | None = None,
+    ) -> tuple[SteeringEvent, ...]:
+        """Atomically consume and return pending events, in order.
+
+        ``node``/``namespace``/``task_id`` identify *where* the drain
+        happened -- the executor's safe point (see
+        :meth:`lingxigraph.runtime.Runtime.drain_steering`) passes its own
+        task coordinates through so the consumption record (see
+        :meth:`pop_consumed`) can answer "which node consumed this, in
+        which subgraph namespace" for observability. Callers outside node
+        execution (e.g. a bare ``channel.drain()``) may omit them.
+        """
+
+        now = datetime.now(UTC)
         with self._lock:
             drained = tuple(sorted(self._pending.values(), key=lambda item: item.sequence))
             self._pending.clear()
-            self._consumed_log.extend(drained)
+            self._consumed_log.extend(
+                SteeringConsumption(
+                    event=event, consumed_at=now, node=node, namespace=namespace, task_id=task_id
+                )
+                for event in drained
+            )
         if drained and self.on_drain is not None:
             try:
                 self.on_drain(drained)
@@ -192,7 +258,7 @@ class SteeringChannel:
                 pass
         return drained
 
-    def pop_consumed(self) -> tuple[SteeringEvent, ...]:
+    def pop_consumed(self) -> tuple[SteeringConsumption, ...]:
         """Return and clear the log of events drained since the last call.
 
         A server-mode worker polls this (e.g. on its heartbeat cadence) to
@@ -200,7 +266,9 @@ class SteeringChannel:
         ``run.steer.consumed`` observability events -- consumption is
         recorded as soon as the graph drains an event, independent of
         checkpoint commit timing in this implementation (documented scope
-        cut; see issue #16 design notes).
+        cut; see issue #16 design notes). Each entry is a
+        :class:`SteeringConsumption`, carrying queue latency and the
+        consuming node/namespace/task_id alongside the raw event.
         """
 
         with self._lock:
@@ -212,6 +280,7 @@ class SteeringChannel:
 __all__ = [
     "MAX_STEERING_PAYLOAD_BYTES",
     "SteeringChannel",
+    "SteeringConsumption",
     "SteeringEvent",
     "SteeringPayloadTooLarge",
     "new_steering_id",

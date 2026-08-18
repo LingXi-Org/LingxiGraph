@@ -140,6 +140,16 @@ class Worker:
             store=self.store_factory(run.tenant_id),
             cache=self.cache,
         )
+        # Register the steering channel *before* the graph ever executes a
+        # single task, even when there is nothing pending yet. This marks
+        # it server-owned (``owned_by_executor=False``, see
+        # SteeringChannel/CompiledStateGraph._run) so the executor's own
+        # embedded-run cleanup never releases it out from under us --
+        # otherwise a run claimed with no steering pending yet would get an
+        # executor-owned channel by default, and steering that arrived
+        # later plus the worker's final flush could race the executor
+        # popping the channel the moment the run finishes.
+        graph.get_steering_channel(run.id)
         # Recover any steering events that were durably accepted while this
         # run was queued (or before a prior worker crashed) -- the channel
         # is the same live object the executor reads from at every safe
@@ -321,9 +331,10 @@ class Worker:
         if not consumed:
             return
         await self.repository.mark_steering_consumed(
-            run.tenant_id, run.id, [event.id for event in consumed]
+            run.tenant_id, run.id, [consumption.event.id for consumption in consumed]
         )
-        for event in consumed:
+        for consumption in consumed:
+            event = consumption.event
             stored = await self.repository.append_event(
                 run.tenant_id,
                 run.id,
@@ -332,6 +343,12 @@ class Worker:
                     "steering_event_id": event.id,
                     "sequence": event.sequence,
                     "kind": event.kind,
+                    # Where and how long it queued -- see
+                    # SteeringConsumption / issue #16 observability gap.
+                    "queue_latency_seconds": consumption.queue_latency_seconds,
+                    "node": consumption.node,
+                    "namespace": list(consumption.namespace),
+                    "task_id": consumption.task_id,
                 },
             )
             await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)

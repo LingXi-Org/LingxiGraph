@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from ..errors import ConcurrentRunError, IdempotencyConflictError, RunTerminalError
+from ..errors import (
+    ConcurrentRunError,
+    IdempotencyConflictError,
+    RunSupersededError,
+    RunTerminalError,
+)
 from ..steering import MAX_STEERING_PAYLOAD_BYTES, validate_steering_payload
 from ..types import MultitaskStrategy, RunStatus
 from .models import (
@@ -476,6 +481,12 @@ class InMemoryRepository:
                     f"run {run_id!r} is in terminal state "
                     f"{enum_value(run.status)!r} and cannot accept new steering input"
                 )
+            superseded_by = run.metadata.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"steer the new run instead"
+                )
             if idempotency_key is not None:
                 existing_id = self._steering_keys.get((tenant_id, run_id, idempotency_key))
                 if existing_id is not None:
@@ -536,6 +547,73 @@ class InMemoryRepository:
                 event.model_copy(deep=True)
                 for event in self._steering.get((tenant_id, run_id), ())
             ]
+
+    async def transfer_pending_steering(
+        self, tenant_id: str, old_run_id: str, new_run_id: str
+    ) -> list[RunSteeringEvent]:
+        """Move never-consumed steering from a paused Run onto its resume.
+
+        Implements the "issue #16 durably-accepted steer must eventually be
+        consumed" contract for the specific gap a resume creates: ``/resume``
+        starts a brand-new Run row (see ``create_run`` /
+        ``metadata.resumed_from_run_id``), and a worker only ever pulls
+        pending steering for the run it is actually executing. Without this,
+        anything durably accepted while the old Run was paused would sit
+        forever under a ``run_id`` no worker will ever claim again.
+
+        Every event still ``pending``/``delivered`` under ``old_run_id`` is
+        marked ``superseded`` in place (its terminal state -- it was never
+        drained by the paused run) and re-inserted as a fresh ``pending``
+        event under ``new_run_id``, preserving order, ``kind``, ``payload``,
+        ``metadata`` and ``idempotency_key``. The old run is also marked
+        with ``metadata.superseded_by_run_id`` (even when there was nothing
+        to transfer) so any *later* steer attempt against the stale
+        ``old_run_id`` fails with :class:`~lingxigraph.errors.RunSupersededError`
+        instead of silently pending forever a second time.
+        """
+
+        async with self._lock:
+            old_run = self._runs.get((tenant_id, old_run_id))
+            if old_run is not None:
+                self._runs[(tenant_id, old_run_id)] = old_run.model_copy(
+                    update={
+                        "metadata": {
+                            **old_run.metadata,
+                            "superseded_by_run_id": new_run_id,
+                        }
+                    }
+                )
+            old_events = self._steering.get((tenant_id, old_run_id), [])
+            pending = sorted(
+                (event for event in old_events if event.status in ("pending", "delivered")),
+                key=lambda event: event.sequence,
+            )
+            if not pending:
+                return []
+            for index, event in enumerate(old_events):
+                if event.status in ("pending", "delivered"):
+                    old_events[index] = event.model_copy(update={"status": "superseded"})
+            new_events = self._steering.setdefault((tenant_id, new_run_id), [])
+            transferred: list[RunSteeringEvent] = []
+            for event in pending:
+                new_event = RunSteeringEvent(
+                    tenant_id=tenant_id,
+                    run_id=new_run_id,
+                    sequence=len(new_events) + 1,
+                    kind=event.kind,
+                    payload=dict(event.payload),
+                    metadata=dict(event.metadata),
+                    idempotency_key=event.idempotency_key,
+                    status="pending",
+                )
+                new_events.append(new_event)
+                if event.idempotency_key is not None:
+                    self._steering_keys[
+                        (tenant_id, new_run_id, event.idempotency_key)
+                    ] = new_event.id
+                transferred.append(new_event.model_copy(deep=True))
+        await self._notify()
+        return transferred
 
     async def create_schedule(
         self, tenant_id: str, request: ScheduleCreate
@@ -1142,7 +1220,8 @@ class PostgresRepository(InMemoryRepository):
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
-                f"SELECT status FROM {self._schema}.runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
+                f"""SELECT status, metadata FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
                 (tenant_id, run_id),
             )
             run_row = cursor.fetchone()
@@ -1152,6 +1231,13 @@ class PostgresRepository(InMemoryRepository):
                 raise RunTerminalError(
                     f"run {run_id!r} is in terminal state {run_row['status']!r} "
                     "and cannot accept new steering input"
+                )
+            run_metadata = run_row.get("metadata") or {}
+            superseded_by = run_metadata.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"steer the new run instead"
                 )
             if idempotency_key is not None:
                 cursor.execute(
@@ -1239,6 +1325,85 @@ class PostgresRepository(InMemoryRepository):
                 WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'""",
                 (tenant_id, run_id, event_ids),
             )
+
+    async def transfer_pending_steering(self, tenant_id, old_run_id, new_run_id):
+        return await asyncio.to_thread(
+            self._transfer_pending_steering_sync, tenant_id, old_run_id, new_run_id
+        )
+
+    def _transfer_pending_steering_sync(self, tenant_id, old_run_id, new_run_id):
+        """SQL counterpart of :meth:`InMemoryRepository.transfer_pending_steering`."""
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT metadata FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s FOR UPDATE""",
+                (tenant_id, old_run_id),
+            )
+            old_run_row = cursor.fetchone()
+            if old_run_row is not None:
+                metadata = dict(old_run_row.get("metadata") or {})
+                metadata["superseded_by_run_id"] = new_run_id
+                cursor.execute(
+                    f"""UPDATE {self._schema}.runs SET metadata=%s
+                    WHERE tenant_id=%s AND id=%s""",
+                    (self._jsonb(metadata), tenant_id, old_run_id),
+                )
+            cursor.execute(
+                f"""SELECT * FROM {self._schema}.run_steering_events
+                WHERE tenant_id=%s AND run_id=%s AND status IN ('pending','delivered')
+                ORDER BY sequence FOR UPDATE""",
+                (tenant_id, old_run_id),
+            )
+            pending_rows = cursor.fetchall()
+            if not pending_rows:
+                return []
+            pending_ids = [row["id"] for row in pending_rows]
+            cursor.execute(
+                f"""UPDATE {self._schema}.run_steering_events
+                SET status='superseded' WHERE tenant_id=%s AND id=ANY(%s)""",
+                (tenant_id, pending_ids),
+            )
+            cursor.execute(
+                f"""SELECT COALESCE(MAX(sequence),0) AS next
+                FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
+                (tenant_id, new_run_id),
+            )
+            next_sequence = int(cursor.fetchone()["next"])
+            transferred: list[RunSteeringEvent] = []
+            for row in pending_rows:
+                next_sequence += 1
+                event = RunSteeringEvent(
+                    tenant_id=tenant_id,
+                    run_id=new_run_id,
+                    sequence=next_sequence,
+                    kind=row["kind"],
+                    payload=dict(row["payload"] or {}),
+                    metadata=dict(row["metadata"] or {}),
+                    idempotency_key=row["idempotency_key"],
+                    status="pending",
+                )
+                cursor.execute(
+                    f"""INSERT INTO {self._schema}.run_steering_events
+                    (id,tenant_id,run_id,sequence,kind,payload,metadata,idempotency_key,
+                     status,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        event.id,
+                        tenant_id,
+                        new_run_id,
+                        event.sequence,
+                        event.kind,
+                        self._jsonb(event.payload),
+                        self._jsonb(event.metadata),
+                        event.idempotency_key,
+                        event.status,
+                        event.created_at,
+                    ),
+                )
+                transferred.append(event)
+            return transferred
 
     async def create_schedule(self, tenant_id, request):
         value = Schedule(tenant_id=tenant_id, **request.model_dump())

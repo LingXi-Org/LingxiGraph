@@ -259,11 +259,33 @@ class Runtime(Generic[ContextT]):
         The graph decides what to do with them (update state, replan, goto
         another node, ignore, ask the user) -- LingxiGraph only guarantees
         durable delivery, ordering, dedup and safe consumption.
+
+        Documented design choice -- "safe point" is application-chosen, not
+        executor-enforced: LingxiGraph guarantees *when* a fresh, correctly
+        ordered, deduplicated view of the channel is available to a node
+        (at every node invocation, via this ``Runtime``), but it does not
+        restrict *where inside the node's own code* that node is allowed to
+        call ``drain_steering()``. A node may call it at the very top before
+        doing any work, in the middle between two tool calls, or not at
+        all -- the executor has no notion of an in-node checkpoint to pin
+        the call to, and enforcing one would mean pausing arbitrary user
+        code mid-function, which LingxiGraph does not attempt. What *is*
+        guaranteed and executor-enforced is the channel's consistency
+        properties (atomic drain-once, dedup, ordering) and that consumption
+        is recorded (node/namespace/task_id/queue latency -- see
+        :class:`~lingxigraph.steering.SteeringConsumption`) against whichever
+        node actually called this method. See ``docs/api.md`` (steering
+        section) for the full statement of this contract.
         """
 
         if self._steering is None:
             return ()
-        return self._steering.drain()
+        # ``task_id`` is either the plain node name or ``"{node}#{index}"``
+        # for a ``Send``-fanout task (see ``CompiledStateGraph._plan_tasks``)
+        # -- split off the fan-out suffix so the observability record names
+        # the node itself, not a synthetic per-task id.
+        node = self.task_id.split("#", 1)[0] if self.task_id else None
+        return self._steering.drain(node=node, namespace=self.namespace, task_id=self.task_id)
 
     @property
     def cancelled(self) -> bool:

@@ -67,8 +67,7 @@ JWT claim 派生，绝不信任调用方自报 header。
 
 - 202 只代表已durably写入 PostgreSQL 的 steering inbox，不代表图已经处理；Redis 只用于
   可选的低延迟 `run.steer.available` 通知，从不作为唯一来源。
-- `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受，但仅在 `resume` 时才会被
-  图实际消费（steer 不替代 resume 的 `{resume, update, goto}` 协议）。
+- `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受durable写入。
 - 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）返回 HTTP 409
   `run_terminal`，不会静默生成一条永远不会被消费的事件。
 - `Idempotency-Key` header 或 body 的 `idempotency_key` 二选一；同一 `(tenant, run, key)`
@@ -76,10 +75,34 @@ JWT claim 派生，绝不信任调用方自报 header。
 - cancel 优先于 steer：先 steer 后 cancel，cancel 依然立即生效，steer 从不撤销/延迟取消。
 - payload+metadata 序列化后大小受限（默认约 32KB / 服务端事件字节上限，先到者生效）。
 
+**Paused run 的 steering 归属哪个 run_id？** `POST /v1/runs/{run_id}/resume` 会创建一条
+*新* Run（新的 `run_id`，通过 `metadata.resumed_from_run_id` 关联旧 Run），worker 只会为它
+正在执行的 run_id 拉取 pending steering。因此 resume 端点在创建新 Run 后，会原子地把旧
+Run 上所有仍处于 `pending`/`delivered` 的 steering 事件**迁移**到新 Run（保序、保留
+`kind`/`payload`/`metadata`/`idempotency_key`，旧事件被标记为 `superseded`），随后由新 Run
+的 worker 按正常路径投递、消费——即：paused 时提交的 steering 会在 resume 之后被新 Run
+实际消费，而不是永远 pending。旧 Run 同时被标记「已被 resume 取代」；resume 之后再对
+旧 `run_id` 调 `/steer` 会返回 HTTP 409 `run_superseded`（而不是再次静默积压），提示调用方
+改为对新 Run 调用 `/steer`。
+
 图内部通过 `runtime.has_steering`、`runtime.peek_steering()`、`runtime.drain_steering()`
 在安全点（节点开始前、节点完成后、下一 superstep 前、重试前、resume 之后）读取；
 LingxiGraph 只保证durable delivery、顺序、去重与安全消费，"新消息是否意味着重新规划"完全
 由业务图决定。嵌入式/无 Server 场景下同一套 API 生效：`compiled_graph.steer(run_id, ...)`。
+
+**"安全点"由谁定义？** LingxiGraph 保证的是 channel 本身的一致性（原子 drain-once、去重、
+顺序）以及*调用* `drain_steering()` 这件事发生时机的新鲜性——每次节点被 executor 调用时，
+它读到的都是当前最新、未被消费过的事件集合。但**在节点函数内部的哪一行代码调用
+`drain_steering()`，完全由应用节点自己决定**：executor 不会在节点函数内部插入任何强制
+边界（例如"只能在函数开头调用一次"），也不会暂停用户代码的执行去插入安全点。这是刻意的
+设计选择而非缺口：真正的边界语义体现在 executor *何时把节点当作一个 task 来调度*
+（节点开始前、下一 superstep 前、重试前、resume 之后见上），而不是节点内部的执行位置。
+
+**观测性：** worker 在消费（drain）steering 事件后写入的 `run.steer.consumed` 事件包含
+`steering_event_id`、`sequence`、`kind`，以及用于定位与诊断的
+`queue_latency_seconds`（从 durably accepted 到被消费的等待时长）、
+`node`（消费该事件的节点名）、`namespace`（该节点所在的 subgraph 命名空间路径）、
+`task_id`（区分同一 superstep 内并行/`Send` 任务的具体 task）。
 
 ## SSE 续传
 

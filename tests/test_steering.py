@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import operator
 import time
 import unittest
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from fastapi.testclient import TestClient
 
-from lingxigraph import END, START, Runtime, StateGraph
+from lingxigraph import END, START, RetryPolicy, Runtime, Send, StateGraph
 from lingxigraph.errors import RunTerminalError
 from lingxigraph.server import GraphRegistry, create_app
 from lingxigraph.server.repository import InMemoryRepository
@@ -17,6 +18,7 @@ from lingxigraph.server.security import Authenticator
 from lingxigraph.steering import (
     MAX_STEERING_PAYLOAD_BYTES,
     SteeringChannel,
+    SteeringConsumption,
     SteeringPayloadTooLarge,
     validate_steering_payload,
 )
@@ -139,6 +141,260 @@ class RuntimeDrainTests(unittest.TestCase):
         builder.add_edge(START, "node").add_edge("node", END)
         result = builder.compile().invoke({"ticks": 0}, {"configurable": {}})
         self.assertEqual(result["ticks"], 1)
+
+
+class SteeringConsumptionTests(unittest.TestCase):
+    """SteeringChannel.drain()'s observability record (issue #16 review point 4):
+    consuming node/namespace/task_id and queue latency, not just id/sequence/kind."""
+
+    def test_drain_records_consumer_location_and_latency(self) -> None:
+        channel = SteeringChannel("run-x")
+        channel.submit(kind="user_input", payload={"i": 1})
+        time.sleep(0.01)
+        drained = channel.drain(node="worker", namespace=("team",), task_id="worker#0")
+        self.assertEqual(len(drained), 1)
+        consumed = channel.pop_consumed()
+        self.assertEqual(len(consumed), 1)
+        record = consumed[0]
+        self.assertIsInstance(record, SteeringConsumption)
+        self.assertEqual(record.event.id, drained[0].id)
+        self.assertEqual(record.node, "worker")
+        self.assertEqual(record.namespace, ("team",))
+        self.assertEqual(record.task_id, "worker#0")
+        self.assertGreater(record.queue_latency_seconds, 0)
+
+    def test_drain_without_consumer_context_defaults_to_none(self) -> None:
+        channel = SteeringChannel("run-x")
+        channel.submit(kind="user_input", payload={})
+        channel.drain()
+        record = channel.pop_consumed()[0]
+        self.assertIsNone(record.node)
+        self.assertEqual(record.namespace, ())
+        self.assertIsNone(record.task_id)
+        self.assertGreaterEqual(record.queue_latency_seconds, 0)
+
+    def test_runtime_drain_steering_reports_the_calling_node(self) -> None:
+        """``Runtime.drain_steering()`` (the real node-facing API) must
+        thread the node/namespace/task_id through to the consumption
+        record automatically -- nodes never pass this by hand."""
+
+        captured: list[SteeringConsumption] = []
+
+        def node(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            runtime.drain_steering()
+            return {"ticks": 1}
+
+        builder = StateGraph(State)
+        builder.add_node("node", node)
+        builder.add_edge(START, "node").add_edge("node", END)
+        graph = builder.compile()
+        run_id = "consumption-node-run"
+        graph.steer(run_id, kind="user_input", payload={})
+        channel = graph.get_steering_channel(run_id)
+        graph.invoke({"ticks": 0}, {"configurable": {}}, run_id=run_id)
+        captured.extend(channel.pop_consumed())
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].node, "node")
+        self.assertEqual(captured[0].namespace, ())
+
+
+class EmbeddedSteeringLifecycleTests(unittest.TestCase):
+    """Issue #16 review point 2: embedded/library-mode steering channels
+    must not accumulate one entry per run forever on a long-lived compiled
+    graph, while a paused run's channel must still survive until resume
+    actually completes."""
+
+    def test_plain_invoke_never_using_steering_does_not_leak(self) -> None:
+        builder = StateGraph(State)
+        builder.add_node("node", lambda state: {"ticks": state.get("ticks", 0) + 1})
+        builder.add_edge(START, "node").add_edge("node", END)
+        graph = builder.compile()
+        for _ in range(200):
+            graph.invoke({"ticks": 0}, {"configurable": {}})
+        self.assertEqual(len(graph._run_steering), 0)
+
+    def test_steer_before_invoke_still_releases_after_the_run_completes(self) -> None:
+        builder = StateGraph(State)
+
+        def node(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            runtime.drain_steering()
+            return {"ticks": state.get("ticks", 0) + 1}
+
+        builder.add_node("node", node)
+        builder.add_edge(START, "node").add_edge("node", END)
+        graph = builder.compile()
+        for index in range(50):
+            run_id = f"leak-check-{index}"
+            graph.steer(run_id, kind="user_input", payload={"i": index})
+            graph.invoke({"ticks": 0}, {"configurable": {}}, run_id=run_id)
+        self.assertEqual(len(graph._run_steering), 0)
+
+    def test_paused_run_channel_survives_pause_and_releases_after_resume(self) -> None:
+        from lingxigraph import Command, interrupt
+        from lingxigraph.checkpoint import InMemorySaver
+
+        def node(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            value = interrupt("pause")
+            drained = [event.payload["m"] for event in runtime.drain_steering()]
+            return {"ticks": int(value), "drained": drained}
+
+        builder = StateGraph(State)
+        builder.add_node("node", node)
+        builder.add_edge(START, "node").add_edge("node", END)
+        graph = builder.compile(checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": "leak-thread"}}
+        run_id = "leak-pause-resume"
+
+        graph.invoke({"ticks": 0}, config, run_id=run_id)
+        # Paused: the channel must stay alive for a future resume/steer.
+        self.assertEqual(len(graph._run_steering), 1)
+
+        graph.steer(run_id, kind="user_input", payload={"m": "hi"})
+        result = graph.invoke(Command(resume="9"), config, run_id=run_id)
+        self.assertEqual(result["drained"], ["hi"])
+        # The run truly finished (no further interrupt) -- released.
+        self.assertEqual(len(graph._run_steering), 0)
+
+
+class ParallelAndSubgraphSteeringTests(unittest.TestCase):
+    """Issue #16 review point 3: node retry, parallel/superstep fan-out, and
+    subgraph namespace sharing were called out as required but missing."""
+
+    def test_retry_does_not_lose_steering_submitted_before_the_successful_attempt(
+        self,
+    ) -> None:
+        """A transient failure *before* draining must not swallow the event
+        -- it has to still be there for the attempt that actually succeeds."""
+
+        attempts: list[int] = []
+        seen: list[list[str]] = []
+
+        def flaky(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise ConnectionError("transient, before draining anything")
+            drained = [event.payload["m"] for event in runtime.drain_steering()]
+            seen.append(drained)
+            return {"ticks": state.get("ticks", 0) + 1}
+
+        builder = StateGraph(State)
+        builder.add_node(
+            "flaky", flaky, retry=RetryPolicy(max_attempts=3, initial_interval=0, jitter=False)
+        )
+        builder.add_edge(START, "flaky").add_edge("flaky", END)
+        graph = builder.compile()
+        run_id = "retry-not-swallowed"
+        graph.steer(run_id, kind="user_input", payload={"m": "hello"})
+        graph.invoke({"ticks": 0}, {"configurable": {}}, run_id=run_id)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(seen, [["hello"]])
+
+    def test_retry_does_not_re_expose_an_event_already_drained_by_a_failed_attempt(
+        self,
+    ) -> None:
+        """Documented scope cut (see ``SteeringChannel.pop_consumed``):
+        drain-once semantics apply per *channel read*, not per node
+        *attempt*. If an attempt drains an event and then fails, that
+        event is gone from the channel for good -- a retry must not see it
+        a second time (no duplicate exposure), even though the attempt
+        that originally read it never got to finish using it."""
+
+        attempts: list[int] = []
+        seen: list[list[str]] = []
+
+        def flaky(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            attempts.append(1)
+            drained = [event.payload["m"] for event in runtime.drain_steering()]
+            seen.append(drained)
+            if len(attempts) < 2:
+                raise ConnectionError("transient, after already draining")
+            return {"ticks": state.get("ticks", 0) + 1}
+
+        builder = StateGraph(State)
+        builder.add_node(
+            "flaky", flaky, retry=RetryPolicy(max_attempts=3, initial_interval=0, jitter=False)
+        )
+        builder.add_edge(START, "flaky").add_edge("flaky", END)
+        graph = builder.compile()
+        run_id = "retry-no-duplicate"
+        graph.steer(run_id, kind="user_input", payload={"m": "once"})
+        graph.invoke({"ticks": 0}, {"configurable": {}}, run_id=run_id)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(seen, [["once"], []])
+
+    def test_parallel_send_fanout_drain_is_mutually_exclusive_and_ordered(self) -> None:
+        """Multiple nodes in the same superstep race to call
+        ``drain_steering()`` concurrently -- the channel's lock makes that
+        atomic: exactly one task observes the full, correctly ordered
+        batch and every other concurrent task observes nothing left."""
+
+        class ParallelState(TypedDict, total=False):
+            items: list[int]
+            drained_by_task: Annotated[list[tuple[int, tuple[str, ...]]], operator.add]
+
+        async def worker(payload: dict[str, Any], runtime: Runtime[Any]) -> dict[str, Any]:
+            events = runtime.drain_steering()
+            return {
+                "drained_by_task": [
+                    (payload["idx"], tuple(event.payload["m"] for event in events))
+                ]
+            }
+
+        builder = StateGraph(ParallelState)
+        builder.add_node("plan", lambda state: {})
+        builder.add_node("worker", worker)
+        builder.add_edge(START, "plan")
+        builder.add_conditional_edges(
+            "plan",
+            lambda state: [Send("worker", {"idx": item}) for item in state["items"]],
+        )
+        builder.add_edge("worker", END)
+        graph = builder.compile()
+        run_id = "parallel-fanout-run"
+        graph.steer(run_id, kind="user_input", payload={"m": "a"})
+        graph.steer(run_id, kind="user_input", payload={"m": "b"})
+        result = graph.invoke({"items": [0, 1, 2, 3]}, {"configurable": {}}, run_id=run_id)
+
+        non_empty = [batch for _, batch in result["drained_by_task"] if batch]
+        self.assertEqual(len(non_empty), 1, result["drained_by_task"])
+        self.assertEqual(non_empty[0], ("a", "b"))
+        total_events = sum(len(batch) for _, batch in result["drained_by_task"])
+        self.assertEqual(total_events, 2)
+        self.assertFalse(graph.has_pending_steering(run_id))
+
+    def test_subgraph_node_shares_the_parent_runs_steering_channel(self) -> None:
+        """A subgraph node's ``runtime.drain_steering()`` must observe (and
+        durably consume) the exact same per-run channel as the parent --
+        steering is scoped per top-level run, not per namespace."""
+
+        class ChildState(TypedDict, total=False):
+            messages: Annotated[list[str], operator.add]
+
+        class ParentState(TypedDict, total=False):
+            messages: Annotated[list[str], operator.add]
+
+        def child_node(state: ChildState, runtime: Runtime[Any]) -> dict[str, Any]:
+            drained = [event.payload["m"] for event in runtime.drain_steering()]
+            self_namespace = runtime.namespace
+            return {"messages": [f"child-drained:{drained}:{self_namespace}"]}
+
+        child = StateGraph(ChildState)
+        child.add_node("work", child_node)
+        child.add_edge(START, "work").add_edge("work", END)
+
+        parent = StateGraph(ParentState)
+        parent.add_node("team", child.compile())
+        parent.add_edge(START, "team").add_edge("team", END)
+        graph = parent.compile()
+        run_id = "subgraph-shared-channel"
+        graph.steer(run_id, kind="user_input", payload={"m": "x"})
+        self.assertTrue(graph.has_pending_steering(run_id))
+
+        result = graph.invoke({"messages": []}, {"configurable": {}}, run_id=run_id)
+        self.assertEqual(result["messages"], ["child-drained:['x']:('team',)"])
+        self.assertFalse(graph.has_pending_steering(run_id))
+        # Top-level embedded run finished cleanly -- no leaked channel.
+        self.assertEqual(len(graph._run_steering), 0)
 
 
 class RepositorySteeringTests(unittest.TestCase):
@@ -537,10 +793,14 @@ class ServerSteeringTests(unittest.TestCase):
             )
             self.assertEqual(len(pending), 1)
 
-    def test_paused_run_steer_is_durably_accepted_not_immediately_consumed(self) -> None:
-        """Documented choice: steer during pause is durably accepted, and only
-        delivered to the graph at resume time (resume remains the API for
-        actually unpausing -- steer never substitutes for it)."""
+    def test_paused_run_steer_is_transferred_and_consumed_after_resume(self) -> None:
+        """Documented choice (option B): steer during pause is durably
+        accepted under the *paused* run_id, but ``/resume`` creates a brand
+        new Run row -- so at resume time any still-pending steering is
+        atomically transferred onto the new run_id and delivered/consumed
+        by the graph there. This is the end-to-end regression for the
+        blocking review point: the old test only asserted resume succeeded,
+        never that the paused steer was actually drained/consumed."""
 
         from lingxigraph import interrupt
 
@@ -551,8 +811,16 @@ class ServerSteeringTests(unittest.TestCase):
             value = interrupt({"question": "approve?", "seen_before_resume": drained_before})
             return {"ticks": int(value)}
 
+        def after_approval(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            # Proves the transferred event is actually delivered to *this*
+            # (new) run's safe point, not merely accepted somewhere.
+            drained = [event.payload["message"] for event in runtime.drain_steering()]
+            return {"drained": drained}
+
         paused_builder.add_node("approval", approval)
-        paused_builder.add_edge(START, "approval").add_edge("approval", END)
+        paused_builder.add_node("after_approval", after_approval)
+        paused_builder.add_edge(START, "approval").add_edge("approval", "after_approval")
+        paused_builder.add_edge("after_approval", END)
         registry = GraphRegistry({"approval": paused_builder.compile()})
 
         app = create_app(
@@ -587,8 +855,94 @@ class ServerSteeringTests(unittest.TestCase):
             resumed = client.post(
                 f"/v1/runs/{run_id}/resume", headers=headers, json={"resume": 9}
             ).json()
-            result = wait_for_status(client, resumed["id"], headers, {"succeeded", "failed"})
+            new_run_id = resumed["id"]
+            self.assertNotEqual(new_run_id, run_id)
+            result = wait_for_status(client, new_run_id, headers, {"succeeded", "failed"})
             self.assertEqual(result.json()["status"], "succeeded", result.text)
+
+            # The graph actually saw and drained the while-paused event
+            # under the *new* run.
+            self.assertEqual(result.json()["output"]["drained"], ["while-paused"])
+
+            # The old run's steering row is terminal ("superseded"), not
+            # stuck "pending" forever -- and the new run's inbox shows it
+            # went pending -> consumed there.
+            old_events = asyncio.run(app.state.repository.list_steering("acme", run_id))
+            self.assertEqual([event.status for event in old_events], ["superseded"])
+            new_events = asyncio.run(
+                app.state.repository.list_steering("acme", new_run_id)
+            )
+            self.assertEqual(len(new_events), 1)
+            self.assertEqual(new_events[0].status, "consumed")
+            self.assertEqual(new_events[0].payload, {"message": "while-paused"})
+
+            new_run_events = asyncio.run(app.state.repository.list_events("acme", new_run_id))
+            kinds = [event.kind for event in new_run_events]
+            self.assertIn("run.steer.accepted", kinds)
+            self.assertIn("run.steer.consumed", kinds)
+            consumed_event = next(
+                event for event in new_run_events if event.kind == "run.steer.consumed"
+            )
+            self.assertEqual(consumed_event.data["node"], "after_approval")
+            self.assertIn("queue_latency_seconds", consumed_event.data)
+            self.assertGreaterEqual(consumed_event.data["queue_latency_seconds"], 0)
+
+            # Further steer attempts against the now-superseded old run_id
+            # are rejected loudly instead of silently pending again.
+            stale = client.post(
+                f"/v1/runs/{run_id}/steer",
+                headers=headers,
+                json={"kind": "user_input", "payload": {"message": "too-late"}},
+            )
+            self.assertEqual(stale.status_code, 409)
+            self.assertEqual(stale.json()["code"], "run_superseded")
+
+    def test_resume_with_no_pending_steering_still_marks_old_run_superseded(self) -> None:
+        """Even with nothing to transfer, resume closes the old run_id off
+        from future steering so it cannot silently pend forever a second
+        time (see RunSupersededError)."""
+
+        from lingxigraph import interrupt
+
+        builder = StateGraph(State)
+
+        def approval(state: State, runtime: Runtime[Any]) -> dict[str, Any]:
+            value = interrupt({"question": "approve?"})
+            return {"ticks": int(value)}
+
+        builder.add_node("approval", approval)
+        builder.add_edge(START, "approval").add_edge("approval", END)
+        registry = GraphRegistry({"approval": builder.compile()})
+
+        app = create_app(
+            registry=registry, authenticator=Authenticator.insecure_dev(), embedded_worker=True
+        )
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants", headers=headers, json={"graph_id": "approval"}
+            ).json()
+            thread = client.post("/v1/threads", headers=headers, json={}).json()
+            run = client.post(
+                f"/v1/threads/{thread['id']}/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"ticks": 0}},
+            ).json()
+            run_id = run["id"]
+            wait_for_status(client, run_id, headers, {"paused"})
+
+            resumed = client.post(
+                f"/v1/runs/{run_id}/resume", headers=headers, json={"resume": 1}
+            ).json()
+            wait_for_status(client, resumed["id"], headers, {"succeeded", "failed"})
+
+            stale = client.post(
+                f"/v1/runs/{run_id}/steer",
+                headers=headers,
+                json={"kind": "user_input", "payload": {}},
+            )
+            self.assertEqual(stale.status_code, 409)
+            self.assertEqual(stale.json()["code"], "run_superseded")
 
 
 def _assistant_create_named(graph_id: str):

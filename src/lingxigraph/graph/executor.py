@@ -287,9 +287,22 @@ class CompiledStateGraph:
         Used by server integrations (see :mod:`lingxigraph.server.worker`)
         to feed durable PostgreSQL steering rows into the live executor
         without going through the public ``steer()`` re-sequencing path.
+
+        A channel freshly created here is marked ``owned_by_executor=False``
+        -- the caller (a server Worker) is registering it explicitly, ahead
+        of a run that may not have started executing yet (a still-queued
+        run can receive steering before any worker claims it), and is
+        responsible for releasing it via ``forget_steering()`` once done.
+        This is what lets ``_run()`` distinguish "I created this channel for
+        a plain embedded invoke and must release it myself when the run
+        finishes" from "someone else owns this channel's lifecycle".
         """
 
-        return self._run_steering.setdefault(run_id, SteeringChannel(run_id))
+        channel = self._run_steering.get(run_id)
+        if channel is None:
+            channel = SteeringChannel(run_id, owned_by_executor=False)
+            self._run_steering[run_id] = channel
+        return channel
 
     def forget_steering(self, run_id: str) -> None:
         """Release the in-process channel for a finished run.
@@ -855,11 +868,29 @@ class CompiledStateGraph:
         # Subgraphs share the parent run's steering channel (same run_id,
         # nested namespace) so draining is deterministic regardless of which
         # namespace's node happens to call ``runtime.drain_steering()``.
-        self._run_steering[run_id] = (
-            parent_steering
-            or self._run_steering.get(run_id)
-            or SteeringChannel(run_id)
+        #
+        # Ownership: ``SteeringChannel.owned_by_executor`` (see steering.py)
+        # says whether *this* embedded run lifecycle is responsible for
+        # releasing the channel once the run truly finishes, as opposed to
+        # a server integration that pre-registered it via
+        # ``get_steering_channel()`` and manages release explicitly (see
+        # ``Worker._execute``'s ``forget_steering`` call). The flag lives on
+        # the channel object itself (not recomputed per call) so it stays
+        # correct across a paused run's repeated ``_run()`` invocations --
+        # e.g. embedded pause -> ``steer()`` -> resume reuses the exact same
+        # channel instance under the same ``run_id``, and it is only
+        # released once that sequence finally completes without pausing
+        # again. Only the top-level call for a run_id (``parent_steering``
+        # is ``None``, i.e. not a subgraph) may release it -- see the
+        # ``finally`` block below. A run that pauses on an interrupt is
+        # deliberately excluded from that release (``run_paused`` below) so
+        # steering submitted while paused remains deliverable at resume.
+        steering_channel = (
+            parent_steering or self._run_steering.get(run_id) or SteeringChannel(run_id)
         )
+        owns_steering = parent_steering is None and steering_channel.owned_by_executor
+        run_paused = False
+        self._run_steering[run_id] = steering_channel
         limits = {**dict(config.get("configurable", {})), **config}
         self._run_budgets[run_id] = parent_budget or ExecutionBudget(
             max_tool_calls=(
@@ -1035,6 +1066,11 @@ class CompiledStateGraph:
                 )
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
+            # This branch re-surfaces an *already* paused run without a
+            # resume -- leave the steering channel alone (whether it is the
+            # original paused run's externally-owned channel, or, for a
+            # fresh unowned run_id, an unused empty channel not worth a
+            # special-cased pop).
             return
 
         if not active and not sends:
@@ -1054,6 +1090,8 @@ class CompiledStateGraph:
                 )
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
+            if owns_steering:
+                self._run_steering.pop(run_id, None)
             return
 
         executed_steps = 0
@@ -1118,6 +1156,7 @@ class CompiledStateGraph:
                         writer=checkpoint_writer,
                     )
                     parent_checkpoint_id = saved_id or parent_checkpoint_id
+                    run_paused = True
                     if stream_mode == "values":
                         yield copy.deepcopy(state)
                     elif stream_mode == "updates":
@@ -1372,6 +1411,7 @@ class CompiledStateGraph:
                             await checkpoint_writer.flush()
                         await self._put_pending_results(config, saved_id, tasks, successful)
                         parent_checkpoint_id = saved_id
+                    run_paused = True
                     if stream_mode == "values":
                         yield self._interrupt_output(state, interrupts)
                     elif stream_mode == "updates":
@@ -1553,6 +1593,7 @@ class CompiledStateGraph:
 
                 if completed & self.interrupt_after:
                     self._require_interrupt_support(config)
+                    run_paused = True
                     if stream_mode == "events":
                         marker = Interrupt(
                             value={
@@ -1671,12 +1712,27 @@ class CompiledStateGraph:
             self._active_runs.pop(run_id, None)
             self._event_sequences.pop(run_id, None)
             self._run_budgets.pop(run_id, None)
-            # Deliberately NOT popping `_run_steering[run_id]` here: a server
-            # integration (see Worker._sync_steering_out) needs to flush any
-            # events the graph drained during its very last safe point
-            # *after* this generator has fully finished. Callers that own
-            # the channel's lifecycle should call `forget_steering(run_id)`
-            # once that final flush is done.
+            # Steering-channel lifecycle depends on who owns it (see the
+            # ``owns_steering`` comment above where the channel is set up):
+            #
+            # * Externally owned (server worker via ``get_steering_channel``
+            #   before claiming the run, or inherited from a parent run for
+            #   a subgraph): deliberately NOT popped here. A server
+            #   integration (see Worker._sync_steering_out) needs to flush
+            #   any events the graph drained during its very last safe
+            #   point *after* this generator has fully finished, and the
+            #   owner calls ``forget_steering(run_id)`` itself once that
+            #   final flush is done.
+            # * Owned by this call (plain embedded/library ``invoke`` /
+            #   ``ainvoke`` with no server and no pre-registered channel):
+            #   released automatically once the run truly finishes, so a
+            #   long-lived compiled graph reused across many embedded runs
+            #   does not leak one ``SteeringChannel`` per run forever. A
+            #   run that paused on an interrupt is exempt -- its channel
+            #   must survive so steering submitted while paused is still
+            #   deliverable when the same ``run_id`` is resumed.
+            if owns_steering and not run_paused:
+                self._run_steering.pop(run_id, None)
 
     def _plan_tasks(
         self,

@@ -24,6 +24,7 @@ from ..errors import (
     ConcurrentRunError,
     EmptyInputError,
     IdempotencyConflictError,
+    RunSupersededError,
     RunTerminalError,
 )
 from ..steering import SteeringPayloadTooLarge
@@ -195,6 +196,10 @@ def create_app(
     @app.exception_handler(RunTerminalError)
     async def run_terminal_error(request: Request, exc: RunTerminalError):
         return _problem(request, 409, "run_terminal", str(exc))
+
+    @app.exception_handler(RunSupersededError)
+    async def run_superseded_error(request: Request, exc: RunSupersededError):
+        return _problem(request, 409, "run_superseded", str(exc))
 
     @app.exception_handler(SteeringPayloadTooLarge)
     async def steering_payload_error(request: Request, exc: SteeringPayloadTooLarge):
@@ -639,6 +644,30 @@ def create_app(
         value = await repository.create_run(
             user.tenant_id, previous.thread_id, assistant, request
         )
+        # Carry over any steering that was durably accepted while `previous`
+        # was paused -- the worker only pulls pending steering for the run
+        # it is actually executing (the new one), so without this an
+        # accepted-while-paused event would sit forever under a run_id no
+        # worker will ever claim again. Also marks `previous` so any *later*
+        # steer attempt against the stale run_id is rejected instead of
+        # silently pending again (see RunSupersededError).
+        transferred = await repository.transfer_pending_steering(
+            user.tenant_id, previous.id, value.id
+        )
+        for event in transferred:
+            await repository.append_event(
+                user.tenant_id,
+                value.id,
+                "run.steer.accepted",
+                {
+                    "steering_event_id": event.id,
+                    "sequence": event.sequence,
+                    "kind": event.kind,
+                    "transferred_from_run_id": previous.id,
+                },
+            )
+        if transferred:
+            await event_bus.publish(user.tenant_id, value.id, 0)
         await audit(user, "runs.resume", "run", value.id)
         return value
 

@@ -49,6 +49,18 @@ class RunTerminalError(LingxiGraphError):
     """Raised when an operation targets a Run that has already finished."""
 
 
+class RunSupersededError(LingxiGraphError):
+    """Raised when steering targets a paused Run that has already been resumed.
+
+    Resume durably transfers any steering that was pending at resume time
+    onto the new Run it creates (see
+    ``repository.transfer_pending_steering`` and issue #16's paused-run
+    steering semantics) -- once that happens the old Run id is a dead end
+    for *further* steering, so new steer attempts against it fail loudly
+    instead of silently pending forever.
+    """
+
+
 class GraphInterrupt(BaseException):
     """Internal control-flow signal used by :func:`interrupt`."""
 
@@ -70,5 +82,6 @@ __all__ = [
     "IdempotencyConflictError",
     "LingxiGraphError",
     "PersistenceError",
+    "RunSupersededError",
     "RunTerminalError",
 ]
