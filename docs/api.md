@@ -98,11 +98,30 @@ LingxiGraph 只保证durable delivery、顺序、去重与安全消费，"新消
 设计选择而非缺口：真正的边界语义体现在 executor *何时把节点当作一个 task 来调度*
 （节点开始前、下一 superstep 前、重试前、resume 之后见上），而不是节点内部的执行位置。
 
+**`source_event_id`：跨 resume 的稳定关联。** 迁移到新 Run 的 steering 事件会获得一个
+全新的 `id`（它是新 Run 下一条独立的durable行），但其 `source_event_id` 字段回指客户端
+最初 `/steer` 调用收到的那个 `id`。即使一个 Run 被反复 pause/resume 多次（A → B → C →
+……），每一跳迁移都保留**最初**那个根 id（`source_event_id = 上一跳的 source_event_id
+或上一跳的 id`），不会被中间某一跳的 id 覆盖。`created_at` 同样保留最初 durable
+accepted 的时间，因此后续 `run.steer.consumed` 的 `queue_latency_seconds`
+包含了全部 pause 等待时间，而不仅仅是最后一次 resume 之后的等待时间。客户端只需记住
+最初 `/steer` 返回的 `id`，即可用它在 `run.steer.accepted`/`run.steer.consumed` 事件的
+`source_event_id` 字段里找到最终归宿，无需跟踪中间产生的每一个 run_id。
+
+**accepted ≠ consumed。** `POST /steer` 的 202 响应只代表事件已durably写入
+`run_steering_events`（`run.steer.accepted`，状态 `pending`）；只有当某个安全点的图代码
+真正调用 `drain_steering()` 并且该 drain 结果被 `commit_steering_consumptions()`
+durably提交后，才会出现 `run.steer.consumed`。两者严格分离：调用方不能仅凭 202 假设图
+已经看到这条输入。
+
 **观测性：** worker 在消费（drain）steering 事件后写入的 `run.steer.consumed` 事件包含
-`steering_event_id`、`sequence`、`kind`，以及用于定位与诊断的
-`queue_latency_seconds`（从 durably accepted 到被消费的等待时长）、
+`steering_event_id`、`source_event_id`（若来自迁移，否则省略）、`sequence`、`kind`，以及
+用于定位与诊断的 `queue_latency_seconds`（从 durably accepted 到被消费的等待时长）、
 `node`（消费该事件的节点名）、`namespace`（该节点所在的 subgraph 命名空间路径）、
-`task_id`（区分同一 superstep 内并行/`Send` 任务的具体 task）。
+`task_id`（区分同一 superstep 内并行/`Send` 任务的具体 task）。`commit_steering_
+consumptions()` 本身是幂等的：只有真正发生 `pending`/`delivered` → `consumed` 状态转换
+的事件才会生成一条 `run.steer.consumed`；worker 因网络/DB 瞬时故障重试同一批
+consumption 时，不会产生第二条重复的 lifecycle 事件。
 
 ## SSE 续传
 

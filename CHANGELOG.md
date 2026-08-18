@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Durable mid-run steering (issue #16)
+
+- 新增 `POST /v1/runs/{run_id}/steer`：在 Run 执行期间（含 `paused`）durably 注入新的
+  结构化输入，不等待完成、不强制取消、也不需要先暂停。支持 `Idempotency-Key`
+  header/body 去重、`kind`/`payload`/`metadata` 结构化 payload、大小上限校验。
+- Python SDK（同步/异步）新增 `client.runs.steer(run_id, kind=..., payload=..., metadata=...,
+  idempotency_key=...)`。
+- Runtime 新增 `runtime.has_steering`、`runtime.peek_steering()`、
+  `runtime.drain_steering()`；`compiled_graph.steer(run_id, ...)` 在嵌入式/无 Server
+  场景下提供同一套语义，未使用时零开销、不泄漏 channel 状态。
+- Run 生命周期新增 `run.steer.accepted`、`run.steer.consumed` SSE 事件；`consumed`
+  事件携带 `steering_event_id`、`source_event_id`、`sequence`、`kind`、
+  `queue_latency_seconds`、`node`、`namespace`、`task_id`。
+- Resume 语义：`POST /v1/runs/{run_id}/resume` 在**同一原子事务**中创建新 Run 并把旧
+  Run 上仍 `pending`/`delivered` 的 steering 事件迁移到新 Run（保序、保留身份）；旧
+  Run 之后再收到 `/steer` 返回 `409 run_superseded`。`source_event_id` 在跨多次
+  pause/resume 时始终指向客户端最初 `/steer` 收到的根 id，`created_at`/
+  `queue_latency_seconds` 从最初 durable accepted 时刻起算，不因中间的 resume 跳数
+  被重置。
+- `commit_steering_consumptions()`（状态更新 + `run.steer.consumed` 写入）是原子且
+  幂等的：同一批 consumption 的重复提交（例如 worker 在收到 ack 前连接断开后重试）
+  只会产生一次 `run.steer.consumed`，不会重复。
+- PostgreSQL schema：新增 `run_steering_events` 表（Alembic `0002_steering`）及其
+  `source_event_id` 列/局部索引（Alembic `0003_steering_source_event`）。两个
+  revision 均为纯新增、forward-only，可在部署新二进制前对存活数据库执行；
+  `alembic upgrade head` 是生产环境唯一支持的迁移路径，必须到达
+  `0003_steering_source_event`。Redis 仅用于可选的低延迟通知，从不作为唯一数据源；
+  Redis 丢失不影响最终投递。
+- 兼容性：不影响不使用 steering 的现有图与调用方；`run_steering_events` 与
+  `source_event_id` 为纯新增 schema 变更；无 breaking API 变更。
+- 新增中英文文档：`Wiki/content/docs/{zh,en}/api/threads-runs.mdx`（steer API 全量
+  语义）、`python-sdk.mdx`（SDK 示例）、`errors-events.mdx`（错误码与生命周期事件）、
+  新增概念页 `Wiki/content/docs/{zh,en}/concepts/steering.mdx`、新增运维页
+  `Wiki/content/docs/{zh,en}/operations/steering-operations.mdx`；`docs/api.md`
+  同步更新。
+
 ## 2.2.0
 
 ### Cache-first prompt optimization

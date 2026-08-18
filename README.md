@@ -32,6 +32,8 @@ StateGraph · Runtime · Checkpoint · Events
 
 - **StateGraph**：用节点和边描述 Agent 与业务执行逻辑。
 - **Durable Execution**：支持 checkpoint、暂停恢复、重试与长任务执行。
+- **Durable Steering**：运行中（甚至暂停中）durably 注入新的结构化输入，无需取消 run；投递
+  durable、有序、去重，并能在 worker 崩溃和 paused run resume 后依然可靠送达。
 - **Streaming Events**：通过 Python Runtime、REST 与可续传 SSE 暴露运行状态。
 - **Production Runtime**：提供 Agent Server、Worker、持久化、权限、审计与观测能力。
 - **Open Integrations**：支持 OpenAI-compatible、Coze、A2A、MCP 与开放 Agent Skills。

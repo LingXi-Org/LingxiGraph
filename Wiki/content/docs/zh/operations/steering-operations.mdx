@@ -1,0 +1,112 @@
+---
+title: "运行中输入（Steering）的运维"
+description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重试与回滚边界"
+---
+
+## 迁移上线顺序
+
+运行中输入（issue #16）在基础 schema 之上新增了两个 forward-only 的 Alembic revision：
+
+| Revision | 新增内容 |
+| --- | --- |
+| `0002_steering` | `run_steering_events` 表及其索引，以及读写它的 worker/server 代码路径 |
+| `0003_steering_source_event` | `run_steering_events` 上的 `source_event_id` 列 + 局部索引，用于跨多次 pause/resume 迁移关联同一条 steering |
+
+按标准 Alembic 路径应用：
+
+```bash
+alembic upgrade head
+```
+
+两者都是纯新增（`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`），可以在部署新的
+server/worker 二进制之前先对存活数据库执行——旧二进制根本不会读取新列。零停机上线顺序：
+
+1. 在旧的 server/worker 二进制仍在提供服务时执行 `alembic upgrade head`
+   （新增 `run_steering_events` 与 `source_event_id`）；
+2. 再滚动发布新的 server 与 worker 二进制。
+
+不要颠倒这个顺序：在列存在之前就尝试写入 `source_event_id` 的二进制会插入失败。因为本
+项目的迁移是 forward-only 的（`downgrade()` 会直接抛错），schema 层面没有自动回滚路径——
+见下方"升级与回滚边界"。
+
+<Callout type="warn">
+`PostgresRepository.setup()` 也会直接应用同一批 SQL 文件（测试和嵌入式/开发环境会用到）。
+这条路径**不能**替代在真实部署中驱动 Alembic revision 链：生产上线应该且只应该执行
+`alembic upgrade head`，并且必须走到 `0003_steering_source_event`，而不是停在
+`0002_steering`。
+</Callout>
+
+## PostgreSQL 是真相来源，Redis 只是加速器
+
+每一条 steering 事件是否存在及其状态，都存放在 PostgreSQL 的 `run_steering_events` 表里。
+Redis pub/sub 只用于缩短"事件变为 durable"和"worker 注意到它"之间的延迟——从不会被用来
+判断一个事件是否存在，它的丢失（Redis 重启、连接断开、NOTIFY 被漏掉）也从不会丢失一条
+事件。运维可以把 Redis 视为对 steering 正确性完全可丢弃的组件：即使 Redis 宕机或被驱逐，
+steering 仍能正常工作，只是 worker 的发现方式退化为在每个安全点周期性轮询 PostgreSQL，
+而不是近乎即时的唤醒。
+
+## Worker heartbeat 对 steering 投递延迟的影响
+
+一个 worker 只会在其持有租约的 run 到达下一个安全点时（节点开始、下一 superstep、重试、
+resume 之后）去拉取该 run 新产生的 steering。因此投递延迟主要受两个因素支配：
+
+- **该 run 多久到达一次安全点。** 一个正在做单次长耗时 tool 调用的节点，在调用返回之前
+  看不到调用期间提交的 steering——直到该节点结束，或节点自己主动调用了
+  `drain_steering()`；
+- **Redis 通知不可用时的 worker 轮询/heartbeat 间隔。** 更大的间隔用更低的 PostgreSQL
+  轮询负载换取更高的 steering 延迟；可参照 `docs/api.md` 与部署时
+  `lingxigraph worker` 的相关参数调优。
+
+## 如何诊断长期 pending 的 steering
+
+如果某条 steering 事件停留在 `pending` 状态的时间远超预期：
+
+1. 先确认该 run 确实已被 claim 并在推进：`GET /v1/runs/{run_id}`——一个仍处于 `pending`
+   的 run 还没有 worker 在执行它，其上的 steering 在等待被 claim，而不是 bug；
+2. 检查该 run 的图代码是否真的调用了 `runtime.drain_steering()`，以及调用频率——
+   steering 投递完全取决于图是否选择去查看，这是应用自选安全点模型的一部分（详见
+   Steering 概念页）；
+3. 直接查询 `run_steering_events` 该行的 `status`、`created_at`、`source_event_id`，
+   看它是否是从更早、曾经 paused 的 run 迁移过来的——最终 `run.steer.consumed` 事件上的
+   `queue_latency_seconds` 会包含所有累积的暂停等待时间，这是预期行为，不是 bug；
+4. 检查 worker 日志/指标中是否有反复的 `commit_steering_consumptions()` 失败——该操作
+   重试是安全的（幂等），但持续失败说明存在值得告警的数据库连通性问题。
+
+## 正常的 `run.steer.accepted → consumed` 生命周期
+
+1. `POST /steer` durably 插入一条 `pending` 行，并（202 响应中）产生
+   `run.steer.accepted`；
+2. 持有该 run 租约的 worker 发现这条行（通过 Redis 提示或 PostgreSQL 轮询），把它摄入
+   该 run 的内存 `SteeringChannel`；
+3. 图代码在某个安全点调用 `drain_steering()` 并收到它；
+4. worker durably 提交这次消费（`commit_steering_consumptions()`），在**同一事务**中
+   把该行原子地转为 `consumed` 并产生 `run.steer.consumed`。
+
+这条链路中没有任何一步是可选或可打乱顺序的；客户端应该只把第 4 步的
+`run.steer.consumed` 事件当作"确实被处理"的证据。
+
+## 为什么 worker/DB 瞬时故障不会丢失一次 consumption，以及如何观察重试
+
+状态更新与 `run.steer.consumed` 事件的插入发生在同一个 PostgreSQL 事务内。如果事务已经
+提交，但连接在 worker 看到确认之前断开，worker 的重试逻辑会重新发送同一批 consumption。
+因为 `commit_steering_consumptions()` 是幂等的——只为这次调用中真正发生状态转换的行
+产生 lifecycle 事件——针对已经 consumed 的行重放同一批次是安全的空操作：状态保持
+`consumed`，也不会产生第二条 `run.steer.consumed`。运维可以在 worker 日志里观察到这种
+模式：同一批 steering id 反复出现 `commit_steering_consumptions` 调用，但
+`run_events` 里对应的 `run.steer.consumed` 数量并没有增长——只要重试最终会停止，这就是
+预期行为，而不是卡住的重试循环。
+
+## 升级与回滚边界
+
+本项目的迁移是 forward-only 的：每个 revision 的 `downgrade()` 都会直接抛错，而不是
+尝试撤销变更。这是刻意的设计：真正回滚 `run_steering_events` 表或其新增列，要么会丢失
+durable 的 steering 历史，要么需要把正在进行的 run 与新二进制已经不再预期的 schema
+重新对齐，代价过高。实践含义：
+
+- 永远不要把"回滚 schema"当作回滚策略的一部分。如果确实需要回滚一次部署，应该回滚
+  **二进制**、保持 schema 停在当前（更靠前）的 revision——`0002_steering`/
+  `0003_steering_source_event` 都是纯新增，早于 steering 特性的旧二进制会直接忽略
+  多出来的表/列；
+- 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event` 应该先在
+  staging 环境（或 CI 的 `test_postgres_integration.py` Postgres job）中验证过，
+  再应用到生产环境，而不是依赖"出问题了还能撤销"。

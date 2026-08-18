@@ -1,4 +1,4 @@
 {
   "title": "Core concepts",
-  "pages": ["architecture", "durable-execution", "agents-tools", "agent-skills"]
+  "pages": ["architecture", "durable-execution", "steering", "agents-tools", "agent-skills"]
 }

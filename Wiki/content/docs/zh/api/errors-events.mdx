@@ -29,6 +29,14 @@ description: "处理 problem details、run 失败、事件续传与客户端重�
 
 常见稳定码包括 `idempotency_conflict`、`quota_exceeded`、`join_timeout` 以及由 schema、认证、并发和资源状态映射的 problem code。错误码新增时客户端应安全地归入未知错误，而不是失败解析。
 
+### Steering 相关错误码
+
+| `code` | HTTP | 触发条件 |
+| --- | --- | --- |
+| `run_terminal` | 409 | 对处于终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）的 run 调用 `/steer`；不产生任何 durable 写入 |
+| `run_superseded` | 409 | 对已经被 `resume` 取代的旧 `run_id` 调用 `/steer`；应改用新 run 的 `id`（见 `metadata.resumed_from_run_id`） |
+| `payload_too_large` | 413/422 | `payload` + `metadata` 序列化后超过大小上限；不产生任何 durable 写入 |
+
 ## Run 业务错误
 
 创建 run 成功返回 `202 pending`。之后的节点/schema/provider 错误会使资源变为 `failed`、`timed_out` 或 `dead_letter`，并写入：
@@ -66,6 +74,40 @@ data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{}
 - 客户端按 `(run_id, sequence)` 去重，处理重复交付；
 - 以 `: heartbeat` 开头的行是保活注释，应忽略；
 - run 到达 terminal 或 `paused` 后，服务端关闭流。
+
+### Steering 生命周期事件
+
+除了图执行过程中产生的普通事件（`node_completed` 等），运行中输入（steering）在其生命周期
+中会产生两类专门的 SSE 事件：
+
+| `kind` | 何时产生 | 关键字段 |
+| --- | --- | --- |
+| `run.steer.accepted` | `/steer` 调用被 durably 接受时（202） | `steering_event_id`、`source_event_id`（若来自 resume 迁移）、`sequence`、`kind` |
+| `run.steer.consumed` | 图代码调用 `drain_steering()` 消费该事件，且这次消费被 `commit_steering_consumptions()` durably 提交后 | `steering_event_id`、`source_event_id`、`sequence`、`kind`、`queue_latency_seconds`、`node`、`namespace`、`task_id` |
+
+字段说明：
+
+- `steering_event_id`：被消费的 steering 事件在**当前** run 下的 id（如果该事件是从旧 run
+  迁移过来的，这是迁移后的新 id，不是客户端最初收到的 id）；
+- `source_event_id`：客户端最初 `/steer` 调用收到的**根** id。同一根 steering 即使经过多次
+  pause/resume 迁移，该字段在每一跳都保持一致，客户端可用它把最终 `run.steer.consumed`
+  与自己最初发出的请求关联起来；仅当事件来自迁移时出现，直接在原 run 上消费的事件没有此字段；
+- `sequence`：该 steering 事件在其所属 run 的 steering 序列里的序号（与 run 事件流的
+  `sequence` 是两个独立计数器）；
+- `kind`：透传自 `/steer` 请求体的 `kind`；
+- `queue_latency_seconds`：从该 steering **最初** durably accepted（包括跨 resume 累积的
+  等待时间）到被消费的秒数；
+- `node`：消费该事件的节点名；
+- `namespace`：该节点所在的 subgraph 命名空间路径（数组）；
+- `task_id`：区分同一 superstep 内并行/`Send` 任务的具体 task。
+
+**durable source 是 PostgreSQL，Redis 只是可选加速器。** `run.steer.accepted` 和
+`run.steer.consumed` 都是先 durably 写入 PostgreSQL 再对外可见的；Redis pub/sub 只用于
+提示 worker "可能有新 steering 了"，从而降低轮询延迟。即使 Redis 通知丢失（连接断开、
+Redis 重启等），worker 仍会在下一个安全点检查/轮询 PostgreSQL 并最终消费——不会因为
+Redis 通知丢失而永久遗漏一条 steering。同理，`commit_steering_consumptions()` 是幂等的：
+worker 因瞬时故障重试同一批 consumption 时，只有真正发生状态转换的事件才会产生新的
+`run.steer.consumed`，不会为已经消费过的事件重复生成。
 
 ## 重试策略
 

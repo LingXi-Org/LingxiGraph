@@ -29,6 +29,14 @@ Non-2xx responses use `application/problem+json`:
 
 Common stable codes include `idempotency_conflict`, `quota_exceeded`, and `join_timeout`, plus problem codes mapped from schema, authentication, concurrency, and resource-state failures. Treat new codes as an unknown error rather than failing to parse them.
 
+### Steering-specific error codes
+
+| `code` | HTTP | Triggered when |
+| --- | --- | --- |
+| `run_terminal` | 409 | `/steer` is called against a run in a terminal status (`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`); no durable write is created |
+| `run_superseded` | 409 | `/steer` is called against an old `run_id` already superseded by a `resume`; call it against the new run's `id` instead (see `metadata.resumed_from_run_id`) |
+| `payload_too_large` | 413/422 | Serialized `payload` + `metadata` exceed the size cap; no durable write is created |
+
 ## Run business errors
 
 Successful creation returns `202 pending`. A later node/schema/provider error moves the resource to `failed`, `timed_out`, or `dead_letter` and populates:
@@ -66,6 +74,47 @@ data: {"id":"...","run_id":"...","sequence":18,"kind":"node_completed","data":{}
 - Deduplicate on `(run_id, sequence)` to handle repeated delivery.
 - Lines beginning `: heartbeat` are keep-alive comments and should be ignored.
 - The server closes the stream when the run becomes terminal or `paused`.
+
+### Steering lifecycle events
+
+Besides ordinary execution events (`node_completed`, etc.), mid-run input (steering)
+produces two dedicated SSE event kinds across its lifecycle:
+
+| `kind` | Emitted when | Key fields |
+| --- | --- | --- |
+| `run.steer.accepted` | A `/steer` call is durably accepted (202) | `steering_event_id`, `source_event_id` (if from a resume migration), `sequence`, `kind` |
+| `run.steer.consumed` | Graph code calls `drain_steering()` and that consumption is durably committed by `commit_steering_consumptions()` | `steering_event_id`, `source_event_id`, `sequence`, `kind`, `queue_latency_seconds`, `node`, `namespace`, `task_id` |
+
+Field meanings:
+
+- `steering_event_id`: the id of the steering event under the **current** run (if the event
+  was migrated from an older run, this is the fresh id it got after migration, not the id
+  the client originally received);
+- `source_event_id`: the **root** id the client originally received from its `/steer` call.
+  Even across repeated pause/resume migrations of the same underlying steering, this field
+  stays consistent at every hop, letting a client correlate the eventual
+  `run.steer.consumed` back to its original request. It is present only for events that
+  arrived via a migration — an event consumed directly on the run it was submitted to has no
+  `source_event_id`;
+- `sequence`: this event's position in its run's steering sequence (a separate counter from
+  the run's overall event-stream `sequence`);
+- `kind`: passed through from the `/steer` request body's `kind`;
+- `queue_latency_seconds`: seconds from the steering event's **original** durably-accepted
+  time (including time accumulated across every resume) to when it was consumed;
+- `node`: the name of the node that consumed the event;
+- `namespace`: the subgraph namespace path (array) the consuming node belongs to;
+- `task_id`: distinguishes the specific task among parallel/`Send` tasks in the same
+  superstep.
+
+**PostgreSQL is the durable source of truth; Redis is only an optional accelerator.** Both
+`run.steer.accepted` and `run.steer.consumed` are durably written to PostgreSQL before
+becoming visible anywhere else. Redis pub/sub is used only to hint workers that "steering may
+be waiting," reducing polling latency. Even if that Redis notification is lost (a dropped
+connection, a Redis restart), a worker still checks/polls PostgreSQL at its next safe point
+and eventually consumes the event — a lost Redis notification never permanently drops
+steering. Similarly, `commit_steering_consumptions()` is idempotent: when a worker retries
+the same consumption batch after a transient failure, only events that actually transition
+status produce a new `run.steer.consumed` — already-consumed events are never re-emitted.
 
 ## Retry policy
 
