@@ -681,13 +681,13 @@ class DurableAckOrderingTests(unittest.TestCase):
             calls = {"n": 0}
             real_commit = repo.commit_steering_consumptions
 
-            async def flaky_commit(tenant_id, run_id, consumptions):
+            async def flaky_commit(tenant_id, run_id, worker_id, attempt, consumptions):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise ConnectionError("transient database hiccup")
                 return await real_commit(tenant_id, run_id, consumptions)
 
-            repo.commit_steering_consumptions = flaky_commit  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = flaky_commit  # type: ignore[method-assign]
 
             # First sync hits the injected transient failure: nothing may
             # be lost -- the DB row must still read pending and the
@@ -769,15 +769,14 @@ class DurableAckOrderingTests(unittest.TestCase):
 
             worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
 
-            async def always_fails(tenant_id, run_id, consumptions):
+            async def always_fails(tenant_id, run_id, worker_id, attempt, consumptions):
                 # Simulate the worker starting to drain mid-retry so the
                 # flush's otherwise-unbounded retry loop bails immediately
                 # instead of looping (and sleeping) forever in this test.
                 worker._stop.set()
                 raise ConnectionError("transient database hiccup on final flush")
 
-            real_commit = repo.commit_steering_consumptions
-            repo.commit_steering_consumptions = always_fails  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = always_fails  # type: ignore[method-assign]
 
             claimed = await worker.run_once()
             self.assertTrue(claimed)
@@ -806,7 +805,7 @@ class DurableAckOrderingTests(unittest.TestCase):
             # not duplicated -- confirming the still-``pending`` DB row
             # (not any in-process channel state) is what a fresh delivery
             # attempt's brand new graph/channel actually recovers from.
-            repo.commit_steering_consumptions = real_commit  # type: ignore[method-assign]
+            del repo.commit_steering_consumptions_if_owned  # type: ignore[attr-defined]
             worker._stop = asyncio.Event()
             claimed_again = await worker.run_once()
             self.assertTrue(claimed_again)
@@ -869,12 +868,12 @@ class DurableAckOrderingTests(unittest.TestCase):
             flush_entered = asyncio.Event()
             real_commit = repo.commit_steering_consumptions
 
-            async def gated_commit(tenant_id, run_id, consumptions):
+            async def gated_commit(tenant_id, run_id, worker_id, attempt, consumptions):
                 flush_entered.set()
                 await gate.wait()
                 return await real_commit(tenant_id, run_id, consumptions)
 
-            repo.commit_steering_consumptions = gated_commit  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = gated_commit  # type: ignore[method-assign]
 
             observed_statuses: list[str] = []
             stop_observing = asyncio.Event()
@@ -984,14 +983,14 @@ class DurableAckOrderingTests(unittest.TestCase):
             real_commit = repo.commit_steering_consumptions
             fail_once = {"done": False}
 
-            async def fail_first_attempt_only(tenant_id, run_id, consumptions):
+            async def fail_first_attempt_only(tenant_id, run_id, worker_id, attempt, consumptions):
                 if not fail_once["done"]:
                     fail_once["done"] = True
                     worker._stop.set()
                     raise ConnectionError("transient database hiccup on final flush")
                 return await real_commit(tenant_id, run_id, consumptions)
 
-            repo.commit_steering_consumptions = fail_first_attempt_only  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = fail_first_attempt_only  # type: ignore[method-assign]
 
             claimed = await worker.run_once()
             self.assertTrue(claimed)
@@ -1075,12 +1074,12 @@ class FinalizationFencingTests(unittest.TestCase):
             flush_entered = asyncio.Event()
             real_commit = repo.commit_steering_consumptions
 
-            async def gated_commit(tenant_id, run_id, consumptions):
+            async def gated_commit(tenant_id, run_id, worker_id, attempt, consumptions):
                 flush_entered.set()
                 await gate.wait()
                 return await real_commit(tenant_id, run_id, consumptions)
 
-            repo.commit_steering_consumptions = gated_commit  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = gated_commit  # type: ignore[method-assign]
 
             execute_task = asyncio.ensure_future(worker_a.run_once())
             await asyncio.wait_for(flush_entered.wait(), timeout=5)
@@ -1145,12 +1144,12 @@ class FinalizationFencingTests(unittest.TestCase):
             entered = asyncio.Event()
             release = asyncio.Event()
 
-            async def always_fails(tenant_id, run_id, consumptions):
+            async def always_fails(tenant_id, run_id, worker_id, attempt, consumptions):
                 entered.set()
                 await release.wait()
                 raise ConnectionError("simulated persistent database outage")
 
-            repo.commit_steering_consumptions = always_fails  # type: ignore[method-assign]
+            repo.commit_steering_consumptions_if_owned = always_fails  # type: ignore[method-assign]
 
             execute_task = asyncio.ensure_future(worker_a.run_once())
             await asyncio.wait_for(entered.wait(), timeout=5)
@@ -1237,6 +1236,89 @@ class FinalizationFencingTests(unittest.TestCase):
             )
             self.assertEqual(final_status, "cancelled")
             self.assertNotEqual(final_status, "succeeded")
+
+        asyncio.run(scenario())
+
+    def test_stale_worker_cannot_commit_steering_consumptions_after_lease_takeover(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 7, point 2 (BLOCKER).
+
+        Worker A drains steering event E during attempt N and blocks
+        inside the durable consumption commit. Its lease expires; worker B
+        claims the same run (attempt N+1). Releasing A's blocked commit
+        must be rejected outright -- A's commit must never touch E's
+        durable status or emit ``run.steer.consumed`` once it no longer
+        owns the lease/attempt, exactly like the already-fenced
+        ``finish_run_if_owned``/``retry_run_if_owned`` writes.
+        """
+
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            accepted, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            claimed_a = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed_a is not None
+            self.assertEqual(claimed_a.attempt, 1)
+
+            steering_event = SteeringEvent(
+                id=accepted.id,
+                run_id=run.id,
+                sequence=accepted.sequence,
+                kind=accepted.kind,
+                payload=accepted.payload,
+                metadata=accepted.metadata,
+                created_at=accepted.created_at,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t-0",
+            )
+
+            # A's lease expires without renewal; B claims the same run at
+            # a new attempt while A is (conceptually) still "blocked" --
+            # this test drives the two calls sequentially, which exercises
+            # the exact same fencing check the concurrent version would.
+            await asyncio.sleep(1.2)
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertEqual(claimed_b.attempt, 2)
+
+            # A's stale, now-recovering commit must be rejected entirely --
+            # nothing written, nothing acked.
+            result = await repo.commit_steering_consumptions_if_owned(
+                "acme", run.id, "worker-a", claimed_a.attempt, [consumption]
+            )
+            self.assertIsNone(result)
+
+            # E's durable status must be untouched -- still pending, no
+            # ``run.steer.consumed`` lifecycle event.
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual([event.id for event in still_pending], [accepted.id])
+            consumed_events = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(consumed_events, [])
+
+            # B, the actual current owner, can commit it normally.
+            stored = await repo.commit_steering_consumptions_if_owned(
+                "acme", run.id, "worker-b", claimed_b.attempt, [consumption]
+            )
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
 
         asyncio.run(scenario())
 
@@ -1343,6 +1425,107 @@ class SteeringClosedGateTests(unittest.TestCase):
             )
             self.assertTrue(created)
             self.assertEqual(accepted.status, "pending")
+
+        asyncio.run(scenario())
+
+    def test_steer_that_wins_the_lock_race_before_gate_close_gets_a_real_rerun_chance(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 7, point 1 (BLOCKER, TOCTOU).
+
+        A ``/steer`` call can win the run row's lock *before*
+        ``close_steering()`` does, even though the graph has already
+        finished and the heartbeat has already stopped -- "landed before
+        the gate closed" is not the same as "landed before the graph's
+        last safe point". This artificially blocks ``close_steering()``,
+        completes a ``submit_steering()`` while it is blocked (simulating
+        the race winner), then releases the block. The final outcome must
+        never be "succeeded" with the steering row stuck ``pending``
+        forever -- it must instead not go terminal, with a pending-rerun
+        scheduled so a fresh delivery attempt gives the event a real
+        chance to be consumed.
+        """
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0})
+            )
+
+            worker = Worker(make_registry_double(), repo, worker_id="worker-a")
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            gate = asyncio.Event()
+            entered = asyncio.Event()
+            real_close = repo.close_steering
+
+            async def blocked_close(tenant_id, run_id, worker_id, attempt):
+                entered.set()
+                await gate.wait()
+                return await real_close(tenant_id, run_id, worker_id, attempt)
+
+            repo.close_steering = blocked_close  # type: ignore[method-assign]
+
+            execute_task = asyncio.ensure_future(worker.run_once())
+            await asyncio.wait_for(entered.wait(), timeout=5)
+
+            # The graph has already reached END and the heartbeat is
+            # already cancelled -- there is no safe point left -- but the
+            # gate has not closed yet. A concurrent ``/steer`` wins the
+            # run lock first and durably commits.
+            accepted, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "too late"}
+            )
+            self.assertTrue(created)
+
+            gate.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+
+            final = await repo.get_run("acme", run.id)
+            final_status = (
+                final.status.value if hasattr(final.status, "value") else final.status
+            )
+            # Never "succeeded" with a permanently-pending steering row.
+            self.assertNotEqual(final_status, "succeeded")
+            self.assertEqual(final_status, "pending")
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual([event.id for event in still_pending], [accepted.id])
+
+            # A fresh delivery attempt claims the run and syncs the
+            # still-pending row into a brand new channel, exactly the
+            # "real chance to be consumed" the fix guarantees -- proven
+            # here by the steering row actually being ingested (its
+            # ``status`` moves to ``delivered``) rather than being
+            # silently stranded ``pending`` behind a closed gate. (The
+            # ``double`` graph used here never calls ``drain_steering()``,
+            # so it does not itself consume the event -- that half of the
+            # contract is covered end-to-end by ``make_registry``'s
+            # ``steerable`` graph elsewhere in this module; what matters
+            # here is that the event is no longer permanently stuck behind
+            # a gate that was closed out from under it.)
+            worker_b = Worker(make_registry_double(), repo, worker_id="worker-b")
+            claimed = await worker_b.run_once()
+            self.assertTrue(claimed)
+            final_after_rerun = await repo.get_run("acme", run.id)
+            final_after_rerun_status = (
+                final_after_rerun.status.value
+                if hasattr(final_after_rerun.status, "value")
+                else final_after_rerun.status
+            )
+            # Still not falsely reported succeeded/terminal while the
+            # event remains genuinely undrained -- the graph itself never
+            # calls ``drain_steering()`` here, so it keeps retrying rather
+            # than ever silently dropping the event.
+            self.assertNotEqual(final_after_rerun_status, "succeeded")
 
         asyncio.run(scenario())
 
@@ -1457,6 +1640,85 @@ class AtomicSteerAcceptedEventTests(unittest.TestCase):
             self.assertEqual(accepted[0].data["steering_event_id"], transferred[0].id)
             self.assertEqual(accepted[0].data["transferred_from_run_id"], old_run.id)
             self.assertEqual(accepted[0].data["source_event_id"], original.id)
+
+        asyncio.run(scenario())
+
+
+class IdempotencyKeyReplaySafeAcrossAdmissionGatesTests(unittest.TestCase):
+    """Issue #16 PR #17 review round 7, point 3.
+
+    A same-Idempotency-Key replay must return the already-existing event
+    (id/sequence unchanged), never a fresh 409, regardless of whether the
+    run has since gone finalizing/terminal/superseded -- that is the
+    entire point of an idempotency key: safely retrying exactly this kind
+    of uncertain-outcome window. Only a genuinely *new* key against a
+    finalizing/terminal run should still get 409.
+    """
+
+    def test_replay_after_finalizing_returns_same_event_not_409(self) -> None:
+        from lingxigraph.errors import RunFinalizingError
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+
+            original, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertTrue(created)
+
+            gate_closed = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(gate_closed)
+
+            # Same key, replayed after the run started finalizing: must
+            # return the same event, not a 409.
+            replayed, replayed_created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertFalse(replayed_created)
+            self.assertEqual(replayed.id, original.id)
+            self.assertEqual(replayed.sequence, original.sequence)
+
+            # A genuinely new key against the still-finalizing run must
+            # still be rejected -- this is a real new-admission decision.
+            with self.assertRaises(RunFinalizingError):
+                await repo.submit_steering(
+                    "acme", run.id, kind="user_input", payload={"m": 2}, idempotency_key="key-2"
+                )
+
+        asyncio.run(scenario())
+
+    def test_replay_after_terminal_returns_same_event_not_409(self) -> None:
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("double"), graph_version="1"
+            )
+            run = await repo.create_run("acme", None, assistant, _run_create(assistant.id))
+
+            original, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertTrue(created)
+
+            await repo.finish_run("acme", run.id, "succeeded", output={})
+
+            replayed, replayed_created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertFalse(replayed_created)
+            self.assertEqual(replayed.id, original.id)
+            self.assertEqual(replayed.sequence, original.sequence)
+
+            with self.assertRaises(RunTerminalError):
+                await repo.submit_steering(
+                    "acme", run.id, kind="user_input", payload={"m": 2}, idempotency_key="key-2"
+                )
 
         asyncio.run(scenario())
 

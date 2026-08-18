@@ -36,8 +36,21 @@ async def _wait_cancellation_safe(awaitable: Awaitable[_T], timeout: float) -> _
     ``RedisEventBus.wait()`` must return just as promptly as one blocked
     in ``InMemoryEventBus.wait()``.
 
-    Returns the awaitable's result, or ``None`` on timeout or if it
-    raised (callers here treat both as "nothing arrived in time").
+    Returns the awaitable's result, or ``None`` on a genuine timeout.
+
+    Issue #16 PR #17 review round 7, point 4 (Redis robustness): this used
+    to also swallow any exception the awaitable itself raised into
+    ``None``, indistinguishable from a timeout. ``RedisEventBus.wait()``'s
+    deadline loop treats a ``None`` result as "no message yet, keep
+    looping" -- so if Redis disconnects right after ``subscribe()``
+    succeeds and every subsequent ``get_message()`` call raises
+    immediately, that used to turn into a tight busy-loop for the rest of
+    the heartbeat timeout window (rapidly creating new waiter/timer tasks
+    with no backoff), never reaching ``RedisEventBus.wait()``'s own outer
+    ``except Exception: return``. Only a real timeout (the timer won the
+    race, the waiter never completed) is folded into ``None`` now; an
+    exception raised by the awaitable itself propagates to the caller, so
+    it reaches that outer handler and returns promptly instead of spinning.
     """
 
     waiter = asyncio.ensure_future(awaitable)
@@ -49,9 +62,14 @@ async def _wait_cancellation_safe(awaitable: Awaitable[_T], timeout: float) -> _
             if not pending.done():
                 pending.cancel()
         await asyncio.gather(waiter, timer, return_exceptions=True)
-    if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
-        return waiter.result()
-    return None
+    if not waiter.done() or waiter.cancelled():
+        # Timed out (or the waiter was cancelled alongside us) -- nothing
+        # arrived in time.
+        return None
+    exc = waiter.exception()
+    if exc is not None:
+        raise exc
+    return waiter.result()
 
 
 class EventBus(Protocol):

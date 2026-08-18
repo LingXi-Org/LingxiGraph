@@ -132,7 +132,10 @@ idempotency_key)` 三元组只会创建一条 steering 事件——重复调用�
 状态可能已经变化（例如首次调用时是 `pending`，而图已经在这之后消费了它，重放时读到
 的就是 `consumed`）。这与 `POST /runs` 创建接口的 `Idempotency-Key` 语义一致，都是
 "同 key 同请求安全重放"而不是"报错"——但重放返回的始终是同一个底层资源的最新状态，
-而不是首次响应的静态快照。
+而不是首次响应的静态快照。关键的一点是：这次重放查找发生在下面所有"按 run 状态"的
+准入检查**之前**，而不是之后——同一个 key 的重试永远返回已存在的事件，即使该 run
+此后已经进入 `run_finalizing`、走到终止态、或已被 superseded。只有一个真正全新的 key
+才会受这些检查约束。
 
 ### 各 Run 状态下的行为
 
@@ -141,8 +144,9 @@ idempotency_key)` 三元组只会创建一条 steering 事件——重复调用�
 | `pending`（已入队，worker 未 claim） | 202，durably 写入，worker claim 后立即可见 |
 | `running` | 202，durably 写入，下一个安全点可读到 |
 | `cancelling` | 202，仍然接受（cancel 优先级见下，但接受写入本身不受影响） |
+| `running`/`cancelling`，但正在 finalizing（`runs.steering_closed`） | 对一个真正全新的事件返回 `409 run_finalizing`；同一 key 的重放仍然返回已存在的事件，而不是 409——此时该 run 的图已经执行完毕、这次投递尝试里已经没有更多安全点了，但 run 行还没翻转为终止态/暂停态 |
 | `paused`（等待 `interrupt`/`resume`） | 202，durably 写入；见下方"paused steering 迁移" |
-| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter`（终止态） | `409 run_terminal`，不产生任何事件 |
+| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter`（终止态） | 对一个新 key 返回 `409 run_terminal`，不产生任何事件 |
 | 已被 `resume` 取代的旧 `run_id` | `409 run_superseded`，见下 |
 
 ### cancel 优先于 steer

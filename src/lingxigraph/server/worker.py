@@ -295,9 +295,50 @@ class Worker:
             # attempts (issue #16 PR #17 review round 5, point 2).
             flushed = await self._final_steering_flush(run, graph)
             if flushed:
-                committed = await self._commit_intent(run, intent)
-                if committed:
-                    graph.forget_steering(run.id)
+                # Issue #16 PR #17 review round 7, point 1 (BLOCKER): the
+                # flush above commits everything this attempt's channel
+                # actually drained -- but it cannot know about a steering
+                # row that was durably accepted (by a concurrent ``/steer``
+                # racing ``close_steering``'s lock, or simply too late for
+                # any safe point this attempt reached) and therefore was
+                # never ingested into the channel at all. Checking for any
+                # still-``pending``/``delivered`` row *after* the flush has
+                # already run is what actually distinguishes "genuinely
+                # never drained" from "drained but not yet committed" (the
+                # latter no longer applies once the flush above has run).
+                # Only relevant when we actually closed admission -- a
+                # ``paused`` outcome intentionally leaves steering open for
+                # the eventual ``/resume`` transfer instead.
+                undrained_steering = (
+                    closing_steering
+                    and bool(
+                        await self.repository.list_pending_steering(run.tenant_id, run.id)
+                    )
+                )
+                if not undrained_steering:
+                    committed = await self._commit_intent(run, intent)
+                    if committed:
+                        graph.forget_steering(run.id)
+                    return
+
+                # A steering event is still durably pending with no safe
+                # point left in this attempt to ever consume it. Never
+                # commit the terminal/paused intent computed above --
+                # instead route the run through the same retry/dead-letter
+                # path a flush failure uses, so a fresh delivery attempt
+                # claims the run, ``_sync_steering_in`` ingests the
+                # still-pending row into a brand new channel, and it gets
+                # one real chance to be observed by the graph.
+                pending_error = {
+                    "code": "steering_pending_rerun",
+                    "message": (
+                        "steering input was durably accepted with no safe point left in this "
+                        "delivery attempt to consume it; scheduling a rerun so it gets a real "
+                        "chance to be consumed instead of finalizing with a permanently-pending "
+                        "event"
+                    ),
+                }
+                await self._retry_or_dead_letter(run, pending_error)
                 return
 
             # The flush never durably succeeded (the worker is draining, or
@@ -321,56 +362,7 @@ class Worker:
                     "reporting a false status or losing the consumption"
                 ),
             }
-            if run.attempt < self.max_delivery_attempts:
-                updated = await self.repository.retry_run_if_owned(
-                    run.tenant_id, run.id, self.worker_id, run.attempt, error=flush_error
-                )
-                if updated is None:
-                    logger.warning(
-                        "run finalization abandoned: lease lost during flush-failed retry",
-                        extra={"run_id": run.id, "tenant_id": run.tenant_id},
-                    )
-                    return
-                stored = await self.repository.append_event(
-                    run.tenant_id,
-                    run.id,
-                    "worker_retrying",
-                    {
-                        "attempt": run.attempt,
-                        "max_attempts": self.max_delivery_attempts,
-                        "error": flush_error,
-                    },
-                )
-                await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-                logger.warning(
-                    "run finalization retried: final steering flush failed",
-                    extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
-                )
-            else:
-                updated = await self.repository.finish_run_if_owned(
-                    run.tenant_id,
-                    run.id,
-                    self.worker_id,
-                    run.attempt,
-                    RunStatus.DEAD_LETTER,
-                    error=flush_error,
-                )
-                if updated is None:
-                    logger.warning(
-                        "run finalization abandoned: lease lost before dead-lettering",
-                        extra={"run_id": run.id, "tenant_id": run.tenant_id},
-                    )
-                    return
-                logger.error(
-                    "run dead-lettered: final steering flush failed after max attempts",
-                    extra={
-                        "run_id": run.id,
-                        "tenant_id": run.tenant_id,
-                        "status": updated.status
-                        if isinstance(updated.status, str)
-                        else updated.status.value,
-                    },
-                )
+            await self._retry_or_dead_letter(run, flush_error)
             # Do NOT forget_steering here. Not because this channel's local
             # consumption log will be reused later -- ``with_runtime()``
             # builds a brand new graph/channel on every delivery attempt
@@ -481,6 +473,70 @@ class Worker:
             )
         return True
 
+    async def _retry_or_dead_letter(self, run: Run, error: dict[str, Any]) -> None:
+        """Route a run that could not safely finalize into the ordinary
+        retry/dead-letter path, fenced on ``(lease_owner, attempt)``.
+
+        Factored out of the two call sites that need it -- a final flush
+        that never durably succeeded, and (issue #16 PR #17 review round
+        7, point 1, BLOCKER) a flush that succeeded but left a steering
+        event durably accepted after the last safe point closed. Both are
+        "this attempt cannot safely finalize" situations that must resolve
+        the same way: retry while attempts remain, dead-letter once they
+        are exhausted, never write the intended terminal/paused status.
+        """
+
+        if run.attempt < self.max_delivery_attempts:
+            updated = await self.repository.retry_run_if_owned(
+                run.tenant_id, run.id, self.worker_id, run.attempt, error=error
+            )
+            if updated is None:
+                logger.warning(
+                    "run finalization abandoned: lease lost during retry",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                )
+                return
+            stored = await self.repository.append_event(
+                run.tenant_id,
+                run.id,
+                "worker_retrying",
+                {
+                    "attempt": run.attempt,
+                    "max_attempts": self.max_delivery_attempts,
+                    "error": error,
+                },
+            )
+            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+            logger.warning(
+                "run finalization retried",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+            )
+        else:
+            updated = await self.repository.finish_run_if_owned(
+                run.tenant_id,
+                run.id,
+                self.worker_id,
+                run.attempt,
+                RunStatus.DEAD_LETTER,
+                error=error,
+            )
+            if updated is None:
+                logger.warning(
+                    "run finalization abandoned: lease lost before dead-lettering",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                )
+                return
+            logger.error(
+                "run dead-lettered: could not safely finalize after max attempts",
+                extra={
+                    "run_id": run.id,
+                    "tenant_id": run.tenant_id,
+                    "status": updated.status
+                    if isinstance(updated.status, str)
+                    else updated.status.value,
+                },
+            )
+
     async def _lease_renewal_loop(self, run: Run) -> None:
         """Keep the run's lease alive through the whole finalization window.
 
@@ -553,8 +609,15 @@ class Worker:
                 return True
             attempt += 1
             try:
-                stored_events = await self.repository.commit_steering_consumptions(
-                    run.tenant_id, run.id, consumed
+                # Issue #16 PR #17 review round 7, point 2 (BLOCKER): fenced
+                # on our own (lease_owner, attempt) -- see
+                # ``commit_steering_consumptions_if_owned``'s docstring. A
+                # ``None`` result means our lease has already been reclaimed
+                # by a new owner; nothing was written, so we must not ack
+                # locally either -- fall through to the "lost the lease"
+                # exit below, same as an exhausted retry.
+                stored_events = await self.repository.commit_steering_consumptions_if_owned(
+                    run.tenant_id, run.id, self.worker_id, run.attempt, consumed
                 )
             except Exception:
                 logger.warning(
@@ -576,6 +639,12 @@ class Worker:
                 if not alive:
                     return False
                 continue
+            if stored_events is None:
+                logger.warning(
+                    "final steering flush abandoned: lease no longer owned",
+                    extra={"run_id": run.id, "tenant_id": run.tenant_id},
+                )
+                return False
             channel.ack_consumed(consumption.event.id for consumption in consumed)
             for stored in stored_events:
                 await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
@@ -662,14 +731,28 @@ class Worker:
         if not consumed:
             return
         try:
-            stored_events = await self.repository.commit_steering_consumptions(
-                run.tenant_id, run.id, consumed
+            # Issue #16 PR #17 review round 7, point 2 (BLOCKER): fenced on
+            # our own (lease_owner, attempt) -- a lease takeover mid-
+            # heartbeat has the identical hole the final flush did. A
+            # ``None`` result means a new worker already claimed this run
+            # (attempt+1); nothing was written, and we must not ack this
+            # batch locally -- it stays in the channel's consumption log,
+            # which is about to be discarded anyway once this delivery
+            # attempt's ``_execute`` notices the lost lease.
+            stored_events = await self.repository.commit_steering_consumptions_if_owned(
+                run.tenant_id, run.id, self.worker_id, run.attempt, consumed
             )
         except Exception:
             logger.warning(
                 "steering consumption commit failed; will retry at the next safe point",
                 extra={"run_id": run.id, "tenant_id": run.tenant_id},
                 exc_info=True,
+            )
+            return
+        if stored_events is None:
+            logger.warning(
+                "steering consumption commit skipped: lease no longer owned",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id},
             )
             return
         # Only ack the ids we actually just committed -- a concurrent

@@ -136,7 +136,10 @@ have moved on between calls (e.g. `pending` on the first call, `consumed` on a l
 after the graph has since drained it). This mirrors the `Idempotency-Key` semantics on
 `POST /runs`: same key + same request is a safe replay, not an error — but a replay always
 returns the live state of the one underlying resource, not a frozen snapshot of the first
-response.
+response. Crucially, this replay lookup happens **before** any of the run-status admission
+checks below, not after: a same-key retry always returns the existing event, even if the run
+has since moved into `run_finalizing`, gone terminal, or been superseded. Only a genuinely new
+key is subject to those checks.
 
 ### Behavior by run status
 
@@ -145,8 +148,9 @@ response.
 | `pending` (queued, not yet claimed) | 202, durably written; visible as soon as a worker claims the run |
 | `running` | 202, durably written; visible at the next safe point |
 | `cancelling` | 202, still accepted (cancel still wins overall — see below — but accepting the write itself is unaffected) |
+| `running`/`cancelling`, but finalizing (`runs.steering_closed`) | `409 run_finalizing` for a genuinely new event; a same-key replay still returns the existing event, not a 409 — the graph has already finished executing and there is no further safe point in this delivery attempt, but the run row has not yet flipped to a terminal/paused status |
 | `paused` (waiting on `interrupt`/`resume`) | 202, durably written; see "paused steering transfer" below |
-| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter` (terminal) | `409 run_terminal`, no event is created |
+| `succeeded` / `failed` / `cancelled` / `timed_out` / `dead_letter` (terminal) | `409 run_terminal`, no event is created for a new key |
 | An old `run_id` already superseded by a `resume` | `409 run_superseded`, see below |
 
 ### Cancel always wins over steer

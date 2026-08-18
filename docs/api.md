@@ -70,10 +70,20 @@ JWT claim 派生，绝不信任调用方自报 header。
   但它不是事件流中的具名事件（不存在 `run.steer.available` 事件），也从不作为唯一来源——
   worker 自身的周期性 PostgreSQL 安全点检查始终是最终保证。
 - `running`/`queued`/`cancelling` 均可接受；`paused` run 也接受durable写入。
-- 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）返回 HTTP 409
-  `run_terminal`，不会静默生成一条永远不会被消费的事件。
+- 终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）对一个**新**事件
+  返回 HTTP 409 `run_terminal`，不会静默生成一条永远不会被消费的事件。
+- **finalization 闸门（`run_finalizing`）：** 一旦某个 worker 的图执行到达终态/暂停
+  结果，该 worker 会立即（在 durably flush 最终 steering 消费、提交最终状态**之前**）
+  关闭这次投递尝试的新 steering 准入——此时 Run 行可能仍读作 `running`/`cancelling`，
+  但已经没有更多图安全点可以消费任何新输入了。在这个窗口内提交一个**新**事件（尚无
+  匹配 idempotency key）会返回 HTTP 409 `run_finalizing`，而不是被静默接受进一个再也
+  没人会 drain 的 channel。`paused` 不受此闸门影响——它是刻意设计支持继续接受 steering
+  的（迁移到 resume 后的新 run，见下）。
 - `Idempotency-Key` header 或 body 的 `idempotency_key` 二选一；同一 `(tenant, run, key)`
-  只会创建一条事件。
+  只会创建一条事件——**且这条幂等重放检查发生在上面所有准入判断之前，而不是之后**：
+  同一个 key 的重试永远返回已存在事件的当前持久化状态（`id`/`sequence` 不变），即使该
+  Run 此后已经进入 `run_finalizing`、终止态、或被 superseded，也绝不会返回一个新的
+  409。只有真正全新的 key 才会受终止态/`run_finalizing`/superseded 这些准入检查约束。
 - cancel 优先于 steer：先 steer 后 cancel，cancel 依然立即生效，steer 从不撤销/延迟取消。
 - payload+metadata 序列化后大小受限（默认约 32KB / 服务端事件字节上限，先到者生效）。
 

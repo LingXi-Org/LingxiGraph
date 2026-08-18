@@ -542,11 +542,27 @@ class InMemoryRepository:
         flush is in flight. The owning worker calls this the instant
         execution ends (before the final flush starts) so a concurrent
         ``/steer`` either lands before this gate closes (and gets synced
-        in as usual) or after it closes (and is rejected with a stable
-        error) -- never durably accepted into a channel nobody will ever
-        drain again. Fenced the same way as ``finish_run_if_owned``: a
-        stale worker that has already lost its lease cannot close the
-        gate on the new owner's behalf.
+        in as usual, or -- round 7, point 1 -- durably lands but is
+        detected as still-pending by the caller's post-flush check, see
+        below) or after it closes (and is rejected with a stable error) --
+        never durably accepted into a channel nobody will ever drain
+        again. Fenced the same way as ``finish_run_if_owned``: a stale
+        worker that has already lost its lease cannot close the gate on
+        the new owner's behalf.
+
+        Issue #16 PR #17 review round 7, point 1 (BLOCKER): this alone is
+        *not* sufficient to prevent a permanently-pending steering row --
+        see ``Worker._execute``'s post-flush ``list_pending_steering``
+        check, which is what actually catches a row that was durably
+        accepted a moment before this call locked the run (and therefore
+        was never, and can never be, ingested by this attempt's channel).
+        Deliberately *not* checked here: at the instant this call runs,
+        the graph may have already drained events into the channel's local
+        consumption log without those rows having been committed
+        (``status='consumed'``) yet -- that only happens moments later, in
+        the final flush this call precedes. Checking "any pending row
+        exists" here would misidentify perfectly ordinary, about-to-be-
+        flushed consumptions as a permanent race every single time.
         """
 
         async with self._lock:
@@ -665,6 +681,33 @@ class InMemoryRepository:
             run = self._runs.get((tenant_id, run_id))
             if run is None:
                 raise KeyError(f"run {run_id!r} not found")
+            # Issue #16 PR #17 review round 7, point 3 (BLOCKER): the
+            # idempotency-key replay check must run *before* the terminal/
+            # finalizing/superseded admission gates, not after. A client
+            # that durably submitted this exact event, then lost the 202
+            # response and retried with the same Idempotency-Key after the
+            # run raced ahead to finalizing/terminal/superseded, must still
+            # get back the same event -- that is the entire point of an
+            # idempotency key. Gating replay on "the run is still active"
+            # turns every uncertain-outcome retry into a spurious 409.
+            if idempotency_key is not None:
+                existing_id = self._steering_keys.get((tenant_id, run_id, idempotency_key))
+                if existing_id is not None:
+                    existing = next(
+                        event
+                        for event in self._steering[(tenant_id, run_id)]
+                        if event.id == existing_id
+                    )
+                    # A prior attempt with this idempotency key may have
+                    # committed the steering row but then failed before its
+                    # ``run.steer.accepted`` event was recorded (review
+                    # round 4, point 2) -- repair that gap on the retry
+                    # instead of permanently skipping it.
+                    self._ensure_steer_accepted_event_locked(tenant_id, run_id, existing)
+                    return existing.model_copy(deep=True), False
+            # Only a genuinely new admission decision (no existing row for
+            # this idempotency key -- or none was given) is subject to the
+            # terminal/finalizing/superseded gates.
             if enum_value(run.status) in TERMINAL:
                 raise RunTerminalError(
                     f"run {run_id!r} is in terminal state "
@@ -681,21 +724,6 @@ class InMemoryRepository:
                     f"run {run_id!r} was resumed as {superseded_by!r}; "
                     f"steer the new run instead"
                 )
-            if idempotency_key is not None:
-                existing_id = self._steering_keys.get((tenant_id, run_id, idempotency_key))
-                if existing_id is not None:
-                    existing = next(
-                        event
-                        for event in self._steering[(tenant_id, run_id)]
-                        if event.id == existing_id
-                    )
-                    # A prior attempt with this idempotency key may have
-                    # committed the steering row but then failed before its
-                    # ``run.steer.accepted`` event was recorded (review
-                    # round 4, point 2) -- repair that gap on the retry
-                    # instead of permanently skipping it.
-                    self._ensure_steer_accepted_event_locked(tenant_id, run_id, existing)
-                    return existing.model_copy(deep=True), False
             events = self._steering.setdefault((tenant_id, run_id), [])
             event = RunSteeringEvent(
                 tenant_id=tenant_id,
@@ -818,48 +846,102 @@ class InMemoryRepository:
         if not consumptions:
             return []
         async with self._lock:
-            ids = {consumption.event.id for consumption in consumptions}
-            events = self._steering.get((tenant_id, run_id), [])
-            transitioned: set[str] = set()
-            for index, event in enumerate(events):
-                if event.id in ids and event.status != "consumed":
-                    events[index] = event.model_copy(
-                        update={"status": "consumed", "consumed_at": utcnow()}
-                    )
-                    transitioned.add(event.id)
-            run_events = self._events.setdefault((tenant_id, run_id), [])
-            stored: list[RunEvent] = []
-            for consumption in consumptions:
-                steering_event = consumption.event
-                if steering_event.id not in transitioned:
-                    # Already consumed by a previous call (idempotent
-                    # retry, e.g. a worker that re-sends the same batch
-                    # after an ack it never observed) -- do not emit a
-                    # second, semantically duplicate ``run.steer.consumed``
-                    # lifecycle event for it (issue #16 PR #17 review
-                    # point 3).
-                    continue
-                data: dict[str, Any] = {
-                    "steering_event_id": steering_event.id,
-                    "sequence": steering_event.sequence,
-                    "kind": steering_event.kind,
-                    "queue_latency_seconds": consumption.queue_latency_seconds,
-                    "node": consumption.node,
-                    "namespace": list(consumption.namespace),
-                    "task_id": consumption.task_id,
-                }
-                if steering_event.source_event_id is not None:
-                    data["source_event_id"] = steering_event.source_event_id
-                stored_event = RunEvent(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    sequence=len(run_events) + 1,
-                    kind="run.steer.consumed",
-                    data=data,
-                )
-                run_events.append(stored_event)
-                stored.append(stored_event.model_copy(deep=True))
+            stored = self._commit_steering_consumptions_locked(tenant_id, run_id, consumptions)
         await self._notify()
+        return stored
+
+    async def commit_steering_consumptions_if_owned(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent] | None:
+        """Fenced counterpart of :meth:`commit_steering_consumptions`.
+
+        Issue #16 PR #17 review round 7, point 2 (BLOCKER): the unfenced
+        version only keys on ``(tenant_id, run_id, steering_ids)`` -- it
+        never checks ``lease_owner``/``attempt``. A worker whose lease has
+        already been reclaimed by a new owner (attempt N+1) can still
+        durably commit a stale consumption from attempt N *after* the new
+        owner has already re-ingested the same still-pending row into its
+        own channel and started processing it, corrupting the steering
+        inbox/lifecycle even though the stale worker's later
+        ``finish_run_if_owned``/``retry_run_if_owned`` call is correctly
+        rejected.
+
+        This checks ``lease_owner == worker_id``, ``attempt == attempt``,
+        and the run is still active, inside the *same* lock acquisition as
+        the actual status/event writes -- on any mismatch it returns
+        ``None`` and touches nothing, so the caller must not locally ack
+        either.
+        """
+
+        if not consumptions:
+            return []
+        async with self._lock:
+            run = self._runs.get((tenant_id, run_id))
+            if (
+                run is None
+                or run.lease_owner != worker_id
+                or run.attempt != attempt
+                or enum_value(run.status) not in ACTIVE
+            ):
+                return None
+            stored = self._commit_steering_consumptions_locked(tenant_id, run_id, consumptions)
+        await self._notify()
+        return stored
+
+    def _commit_steering_consumptions_locked(
+        self,
+        tenant_id: str,
+        run_id: str,
+        consumptions: Sequence[SteeringConsumption],
+    ) -> list[RunEvent]:
+        """Body of the consumption commit; assumes ``self._lock`` is held."""
+
+        ids = {consumption.event.id for consumption in consumptions}
+        events = self._steering.get((tenant_id, run_id), [])
+        transitioned: set[str] = set()
+        for index, event in enumerate(events):
+            if event.id in ids and event.status != "consumed":
+                events[index] = event.model_copy(
+                    update={"status": "consumed", "consumed_at": utcnow()}
+                )
+                transitioned.add(event.id)
+        run_events = self._events.setdefault((tenant_id, run_id), [])
+        stored: list[RunEvent] = []
+        for consumption in consumptions:
+            steering_event = consumption.event
+            if steering_event.id not in transitioned:
+                # Already consumed by a previous call (idempotent
+                # retry, e.g. a worker that re-sends the same batch
+                # after an ack it never observed) -- do not emit a
+                # second, semantically duplicate ``run.steer.consumed``
+                # lifecycle event for it (issue #16 PR #17 review
+                # point 3).
+                continue
+            data: dict[str, Any] = {
+                "steering_event_id": steering_event.id,
+                "sequence": steering_event.sequence,
+                "kind": steering_event.kind,
+                "queue_latency_seconds": consumption.queue_latency_seconds,
+                "node": consumption.node,
+                "namespace": list(consumption.namespace),
+                "task_id": consumption.task_id,
+            }
+            if steering_event.source_event_id is not None:
+                data["source_event_id"] = steering_event.source_event_id
+            stored_event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=len(run_events) + 1,
+                kind="run.steer.consumed",
+                data=data,
+            )
+            run_events.append(stored_event)
+            stored.append(stored_event.model_copy(deep=True))
         return stored
 
     async def list_steering(self, tenant_id: str, run_id: str) -> list[RunSteeringEvent]:
@@ -1593,6 +1675,13 @@ class PostgresRepository(InMemoryRepository):
         )
 
     def _close_steering_sync(self, tenant_id, run_id, worker_id, attempt) -> bool:
+        """SQL counterpart of
+        :meth:`InMemoryRepository.close_steering` -- see its docstring for
+        why no "undrained" check happens here (issue #16 PR #17 review
+        round 7, point 1, BLOCKER; the real check is the caller's
+        post-flush ``list_pending_steering`` in ``Worker._execute``).
+        """
+
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
             cursor.execute(
@@ -1734,23 +1823,10 @@ class PostgresRepository(InMemoryRepository):
             run_row = cursor.fetchone()
             if run_row is None:
                 raise KeyError(f"run {run_id!r} not found")
-            if run_row["status"] in TERMINAL:
-                raise RunTerminalError(
-                    f"run {run_id!r} is in terminal state {run_row['status']!r} "
-                    "and cannot accept new steering input"
-                )
-            if run_row.get("steering_closed"):
-                raise RunFinalizingError(
-                    f"run {run_id!r} has finished executing and is finalizing; "
-                    "no further steering input can be safely consumed"
-                )
-            run_metadata = run_row.get("metadata") or {}
-            superseded_by = run_metadata.get("superseded_by_run_id")
-            if superseded_by is not None:
-                raise RunSupersededError(
-                    f"run {run_id!r} was resumed as {superseded_by!r}; "
-                    f"steer the new run instead"
-                )
+            # Issue #16 PR #17 review round 7, point 3 (BLOCKER): check the
+            # idempotency key for an existing row *before* the terminal/
+            # finalizing/superseded admission gates below -- see the
+            # matching comment in ``InMemoryRepository.submit_steering``.
             if idempotency_key is not None:
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -1773,6 +1849,26 @@ class PostgresRepository(InMemoryRepository):
                         cursor, tenant_id, run_id, existing_event
                     )
                     return existing_event, False
+            # Only a genuinely new admission decision (no existing row for
+            # this idempotency key -- or none was given) is subject to the
+            # terminal/finalizing/superseded gates.
+            if run_row["status"] in TERMINAL:
+                raise RunTerminalError(
+                    f"run {run_id!r} is in terminal state {run_row['status']!r} "
+                    "and cannot accept new steering input"
+                )
+            if run_row.get("steering_closed"):
+                raise RunFinalizingError(
+                    f"run {run_id!r} has finished executing and is finalizing; "
+                    "no further steering input can be safely consumed"
+                )
+            run_metadata = run_row.get("metadata") or {}
+            superseded_by = run_metadata.get("superseded_by_run_id")
+            if superseded_by is not None:
+                raise RunSupersededError(
+                    f"run {run_id!r} was resumed as {superseded_by!r}; "
+                    f"steer the new run instead"
+                )
             cursor.execute(
                 f"""SELECT COALESCE(MAX(sequence),0)+1 AS next
                 FROM {self._schema}.run_steering_events WHERE tenant_id=%s AND run_id=%s""",
@@ -1933,24 +2029,8 @@ class PostgresRepository(InMemoryRepository):
         local consumption log.
         """
 
-        ids = [consumption.event.id for consumption in consumptions]
         with self._connect() as conn, conn.cursor() as cursor:
             self._tenant(cursor, tenant_id)
-            cursor.execute(
-                f"""UPDATE {self._schema}.run_steering_events
-                SET status='consumed', consumed_at=NOW()
-                WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'
-                RETURNING id""",
-                (tenant_id, run_id, ids),
-            )
-            # Only ids that *actually* transitioned pending/delivered ->
-            # consumed in this call. A retried batch (e.g. a worker that
-            # re-sends consumptions after a commit whose ack it never saw)
-            # must not emit a second, semantically duplicate
-            # ``run.steer.consumed`` lifecycle event for a row some
-            # earlier call already consumed (issue #16 PR #17 review
-            # point 3).
-            transitioned = {row["id"] for row in cursor.fetchall()}
             # Same locking discipline as ``_append_event_sync``: lock the
             # run row first so concurrent event appenders for this run
             # serialize their sequence assignment instead of racing.
@@ -1958,52 +2038,134 @@ class PostgresRepository(InMemoryRepository):
                 f"SELECT id FROM {self._schema}.runs WHERE tenant_id=%s AND id=%s FOR UPDATE",
                 (tenant_id, run_id),
             )
-            cursor.execute(
-                f"""SELECT COALESCE(MAX(sequence),0) AS next
-                FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
-                (tenant_id, run_id),
+            return self._commit_steering_consumptions_body_sync(
+                cursor, tenant_id, run_id, consumptions
             )
-            next_sequence = int(cursor.fetchone()["next"])
-            stored: list[RunEvent] = []
-            for consumption in consumptions:
-                event = consumption.event
-                if event.id not in transitioned:
-                    continue
-                next_sequence += 1
-                data: dict[str, Any] = {
-                    "steering_event_id": event.id,
-                    "sequence": event.sequence,
-                    "kind": event.kind,
-                    "queue_latency_seconds": consumption.queue_latency_seconds,
-                    "node": consumption.node,
-                    "namespace": list(consumption.namespace),
-                    "task_id": consumption.task_id,
-                }
-                if event.source_event_id is not None:
-                    data["source_event_id"] = event.source_event_id
-                run_event = RunEvent(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    sequence=next_sequence,
-                    kind="run.steer.consumed",
-                    data=data,
-                )
-                cursor.execute(
-                    f"""INSERT INTO {self._schema}.run_events
-                    (id,tenant_id,run_id,sequence,kind,data,created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                    (
-                        run_event.id,
-                        tenant_id,
-                        run_id,
-                        run_event.sequence,
-                        run_event.kind,
-                        self._jsonb(run_event.data),
-                        run_event.created_at,
-                    ),
-                )
-                stored.append(run_event)
-            return stored
+
+    async def commit_steering_consumptions_if_owned(
+        self, tenant_id, run_id, worker_id, attempt, consumptions
+    ) -> list[RunEvent] | None:
+        if not consumptions:
+            return []
+        return await asyncio.to_thread(
+            self._commit_steering_consumptions_if_owned_sync,
+            tenant_id,
+            run_id,
+            worker_id,
+            attempt,
+            list(consumptions),
+        )
+
+    def _commit_steering_consumptions_if_owned_sync(
+        self,
+        tenant_id: str,
+        run_id: str,
+        worker_id: str,
+        attempt: int,
+        consumptions: list[SteeringConsumption],
+    ) -> list[RunEvent] | None:
+        """Fenced counterpart of ``_commit_steering_consumptions_sync``.
+
+        Issue #16 PR #17 review round 7, point 2 (BLOCKER): see the
+        matching docstring on
+        :meth:`InMemoryRepository.commit_steering_consumptions_if_owned`.
+        The run row is locked ``FOR UPDATE`` first, filtered on
+        ``lease_owner``/``attempt``/active status -- exactly the same
+        pattern as ``_finish_run_if_owned_sync``/``_close_steering_sync`` --
+        *before* any steering row is touched, so a concurrent
+        ``claim_run()`` (which updates ``lease_owner``/``attempt`` under
+        its own ``FOR UPDATE`` on the same row) fully serializes against
+        this fencing check: a worker that has already lost its lease can
+        never observe a stale "still owned" result here.
+        """
+
+        with self._connect() as conn, conn.cursor() as cursor:
+            self._tenant(cursor, tenant_id)
+            cursor.execute(
+                f"""SELECT status FROM {self._schema}.runs
+                WHERE tenant_id=%s AND id=%s AND lease_owner=%s AND attempt=%s
+                  AND status IN ('running','cancelling') FOR UPDATE""",
+                (tenant_id, run_id, worker_id, attempt),
+            )
+            if cursor.fetchone() is None:
+                return None
+            return self._commit_steering_consumptions_body_sync(
+                cursor, tenant_id, run_id, consumptions
+            )
+
+    def _commit_steering_consumptions_body_sync(
+        self,
+        cursor,
+        tenant_id: str,
+        run_id: str,
+        consumptions: list[SteeringConsumption],
+    ) -> list[RunEvent]:
+        """Shared body; assumes the run row is already locked ``FOR UPDATE``
+        on ``cursor``'s transaction (by the caller, with or without lease
+        fencing applied first)."""
+
+        ids = [consumption.event.id for consumption in consumptions]
+        cursor.execute(
+            f"""UPDATE {self._schema}.run_steering_events
+            SET status='consumed', consumed_at=NOW()
+            WHERE tenant_id=%s AND run_id=%s AND id=ANY(%s) AND status!='consumed'
+            RETURNING id""",
+            (tenant_id, run_id, ids),
+        )
+        # Only ids that *actually* transitioned pending/delivered ->
+        # consumed in this call. A retried batch (e.g. a worker that
+        # re-sends consumptions after a commit whose ack it never saw)
+        # must not emit a second, semantically duplicate
+        # ``run.steer.consumed`` lifecycle event for a row some
+        # earlier call already consumed (issue #16 PR #17 review
+        # point 3).
+        transitioned = {row["id"] for row in cursor.fetchall()}
+        cursor.execute(
+            f"""SELECT COALESCE(MAX(sequence),0) AS next
+            FROM {self._schema}.run_events WHERE tenant_id=%s AND run_id=%s""",
+            (tenant_id, run_id),
+        )
+        next_sequence = int(cursor.fetchone()["next"])
+        stored: list[RunEvent] = []
+        for consumption in consumptions:
+            event = consumption.event
+            if event.id not in transitioned:
+                continue
+            next_sequence += 1
+            data: dict[str, Any] = {
+                "steering_event_id": event.id,
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "queue_latency_seconds": consumption.queue_latency_seconds,
+                "node": consumption.node,
+                "namespace": list(consumption.namespace),
+                "task_id": consumption.task_id,
+            }
+            if event.source_event_id is not None:
+                data["source_event_id"] = event.source_event_id
+            run_event = RunEvent(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=next_sequence,
+                kind="run.steer.consumed",
+                data=data,
+            )
+            cursor.execute(
+                f"""INSERT INTO {self._schema}.run_events
+                (id,tenant_id,run_id,sequence,kind,data,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    run_event.id,
+                    tenant_id,
+                    run_id,
+                    run_event.sequence,
+                    run_event.kind,
+                    self._jsonb(run_event.data),
+                    run_event.created_at,
+                ),
+            )
+            stored.append(run_event)
+        return stored
 
     async def resume_run_with_pending_steering(
         self, tenant_id, thread_id, assistant, request, old_run_id

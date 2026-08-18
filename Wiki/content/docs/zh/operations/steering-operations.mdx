@@ -5,12 +5,13 @@ description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重�
 
 ## 迁移上线顺序
 
-运行中输入（issue #16）在基础 schema 之上新增了两个 forward-only 的 Alembic revision：
+运行中输入（issue #16）在基础 schema 之上新增了三个 forward-only 的 Alembic revision：
 
 | Revision | 新增内容 |
 | --- | --- |
 | `0002_steering` | `run_steering_events` 表及其索引，以及读写它的 worker/server 代码路径 |
 | `0003_steering_source_event` | `run_steering_events` 上的 `source_event_id` 列 + 局部索引，用于跨多次 pause/resume 迁移关联同一条 steering |
+| `0004_steering_closed` | `runs.steering_closed`——finalization 准入闸门（review round 6/7）；详见下方"`steering_closed` finalization 闸门" |
 
 按标准 Alembic 路径应用：
 
@@ -18,23 +19,66 @@ description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重�
 alembic upgrade head
 ```
 
-两者都是纯新增（`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`），可以在部署新的
-server/worker 二进制之前先对存活数据库执行——旧二进制根本不会读取新列。零停机上线顺序：
+三者都是纯新增（`ADD COLUMN IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS`、一个
+`NOT NULL DEFAULT FALSE` 列），可以在部署新的 server/worker 二进制之前先对存活数据库
+执行——早于 `0004` 的旧二进制根本不会读写 `steering_closed`，行为与该列不存在时完全一致。
+零停机上线顺序：
 
 1. 在旧的 server/worker 二进制仍在提供服务时执行 `alembic upgrade head`
-   （新增 `run_steering_events` 与 `source_event_id`）；
+   （新增 `run_steering_events`、`source_event_id` 与 `steering_closed`）；
 2. 再滚动发布新的 server 与 worker 二进制。
 
-不要颠倒这个顺序：在列存在之前就尝试写入 `source_event_id` 的二进制会插入失败。因为本
-项目的迁移是 forward-only 的（`downgrade()` 会直接抛错），schema 层面没有自动回滚路径——
-见下方"升级与回滚边界"。
+不要颠倒这个顺序：在列存在之前就尝试写入 `source_event_id`/`steering_closed` 的二进制会
+插入/更新失败。因为本项目的迁移是 forward-only 的（`downgrade()` 会直接抛错），schema
+层面没有自动回滚路径——见下方"升级与回滚边界"。
 
 <Callout type="warn">
 `PostgresRepository.setup()` 也会直接应用同一批 SQL 文件（测试和嵌入式/开发环境会用到）。
 这条路径**不能**替代在真实部署中驱动 Alembic revision 链：生产上线应该且只应该执行
-`alembic upgrade head`，并且必须走到 `0003_steering_source_event`，而不是停在
-`0002_steering`。
+`alembic upgrade head`，并且必须走到 `0004_steering_closed`，而不是停在
+`0002_steering` 或 `0003_steering_source_event`。
 </Callout>
+
+## `steering_closed` finalization 闸门
+
+一旦 worker 的图执行到达终态/暂停结果，该 run 可能还会短暂地继续读作
+`running`/`cancelling`，同时 worker 把图已经消费掉的 steering durably flush 出去、
+提交最终状态——此时已经没有更多图安全点可以消费任何新输入了。`runs.steering_closed`
+是持有该 run 的 worker（与状态写入一样，基于自己的 `lease_owner`/`attempt` 加锁）在执行
+结束的瞬间、final flush 开始之前设置的一个布尔值。
+
+- 当 `steering_closed` 为 `false` 时，`POST /steer` 会像 `0004` 之前一样被正常接受；
+- 一旦当前 attempt 的 `steering_closed` 变为 `true`，一个**全新**的 `POST /steer`
+  （尚无匹配 Idempotency-Key 记录）会被拒绝，返回 `409 run_finalizing`——这是一个稳定的、
+  与终态 run 的 `409` 不同的独立错误，方便客户端区分"这个 run 正在收尾"和"这个 run
+  已经彻底结束了"；
+- 一次**重放**的 `POST /steer`——即 `(tenant_id, run_id, Idempotency-Key)` 与某个已经
+  durably 接受过的事件完全相同——永远返回该已存在事件的当前状态，绝不会返回新的
+  `409`，无论 `steering_closed`/终态/superseded 状态如何。见下方"幂等重放在所有准入闸门
+  前都是安全的"；
+- `paused` 结果永远不会关闭闸门：暂停并不像终态那样"没有安全点剩下"——对一个 paused
+  run 调用 `/steer` 是设计中刻意支持的行为（其 pending steering 会在 `/resume` 时迁移到
+  新 run 上）；
+- 一次被放弃的投递尝试关闭的闸门不会泄漏到下一次尝试：`claim_run` 在每次新的 claim 上
+  都会把 `steering_closed` 重置为 `false`，所以被重试的 run 会重新正常接受 steering。
+
+仅仅关闭闸门本身并不足以防止一条永久 pending 的 steering 行：`/steer` 请求有可能在
+`close_steering()` 之前赢得该 run 行的锁——即使此时图早已执行完毕。真正能捕获这种情况的
+是 worker 在 flush 之后的检查（`list_pending_steering()`，见 `Worker._execute`）——如果
+final flush 已经提交了它能提交的一切之后，仍然存在 `pending`/`delivered` 的行，该 run
+就**不会**被最终确定为终态/暂停状态；而是走常规的 retry/dead-letter 路径（错误码
+`steering_pending_rerun`），让一次新的投递尝试给这条事件一次真正被消费的机会。
+**一个终态 run 绝不能携带一条永久 pending 的 steering 行。**
+
+## 幂等重放在所有准入闸门前都是安全的
+
+`submit_steering()`（内存版和 PostgreSQL 版仓库都一样）会先检查是否已经存在匹配
+`(tenant_id, run_id, Idempotency-Key)` 的事件，**然后**才走终态/`steering_closed`/
+superseded 这些准入闸门，而不是反过来。如果客户端的 `POST /steer` 已经 durably
+提交，但 202 响应从未真正送达（连接中断、代理超时），使用相同 key 的标准幂等重试会
+返回该事件当前的持久化状态——id 和 sequence 都不变——即使该 run 此后已经进入
+finalizing、terminal 或 superseded 状态。只有一个真正**全新**的 key（这个 run 从未见过
+的 key）才会受这些闸门约束；那才是一次真正的准入决策，仍然会得到相应的 `409`。
 
 ## PostgreSQL 是真相来源，Redis 只是加速器
 
@@ -69,8 +113,19 @@ resume 之后）去拉取该 run 新产生的 steering。因此投递延迟主�
 3. 直接查询 `run_steering_events` 该行的 `status`、`created_at`、`source_event_id`，
    看它是否是从更早、曾经 paused 的 run 迁移过来的——最终 `run.steer.consumed` 事件上的
    `queue_latency_seconds` 会包含所有累积的暂停等待时间，这是预期行为，不是 bug；
-4. 检查 worker 日志/指标中是否有反复的 `commit_steering_consumptions()` 失败——该操作
-   重试是安全的（幂等），但持续失败说明存在值得告警的数据库连通性问题。
+4. 检查 worker 日志/指标中是否有反复的 `commit_steering_consumptions_if_owned()`
+   失败——该操作重试是安全的（幂等，并且基于 worker 自己的 `lease_owner`/`attempt`
+   加锁，见"`steering_closed` finalization 闸门"），但持续失败说明存在值得告警的数据库
+   连通性问题；
+5. 如果客户端在 `/steer` 上收到 `409 run_finalizing`，说明请求到达时该 run 的图已经
+   执行完毕——检查当前 attempt 的 `runs.steering_closed`（`true` 表示闸门已关闭），并对
+   一个全新的 run 重试，而不是同一个 run。这里用相同 Idempotency-Key 重放永远是安全的，
+   即使在闸门关闭之后也一样——见"幂等重放在所有准入闸门前都是安全的"；
+6. 如果 worker 日志出现 `steering_pending_rerun`，这正是 round 7 TOCTOU 修复按预期
+   工作：某条 steering 事件已经 durably 被接受，但该投递尝试已经没有安全点可以消费它了，
+   所以该 run 被刻意保持在非终态并重新调度，而不是带着一条永久 pending 的行走向终态。
+   预期下一次投递尝试会正常拿到这条事件；这本身不是 bug，但如果同一个 run 反复出现这种
+   模式，就值得在应用/图层面排查为什么 steering 总是在图到达终止节点之后才到达。
 
 ## 正常的 `run.steer.accepted → consumed` 生命周期
 
@@ -79,8 +134,11 @@ resume 之后）去拉取该 run 新产生的 steering。因此投递延迟主�
 2. 持有该 run 租约的 worker 发现这条行（通过 Redis 提示或 PostgreSQL 轮询），把它摄入
    该 run 的内存 `SteeringChannel`；
 3. 图代码在某个安全点调用 `drain_steering()` 并收到它；
-4. worker durably 提交这次消费（`commit_steering_consumptions()`），在**同一事务**中
-   把该行原子地转为 `consumed` 并产生 `run.steer.consumed`。
+4. worker durably 提交这次消费（`commit_steering_consumptions_if_owned()`，基于 worker
+   自己的 `lease_owner`/`attempt` 加锁），在**同一事务**中把该行原子地转为 `consumed`
+   并产生 `run.steer.consumed`。一个已经不再持有该 lease/attempt 的 worker（比如在
+   heartbeat 或 final flush 期间发生了 lease 被接管）什么都不会写入——从这一刻起该行
+   完全由新的持有者负责。
 
 这条链路中没有任何一步是可选或可打乱顺序的；客户端应该只把第 4 步的
 `run.steer.consumed` 事件当作"确实被处理"的证据。
@@ -89,10 +147,11 @@ resume 之后）去拉取该 run 新产生的 steering。因此投递延迟主�
 
 状态更新与 `run.steer.consumed` 事件的插入发生在同一个 PostgreSQL 事务内。如果事务已经
 提交，但连接在 worker 看到确认之前断开，worker 的重试逻辑会重新发送同一批 consumption。
-因为 `commit_steering_consumptions()` 是幂等的——只为这次调用中真正发生状态转换的行
-产生 lifecycle 事件——针对已经 consumed 的行重放同一批次是安全的空操作：状态保持
+因为 `commit_steering_consumptions_if_owned()` 是幂等的——只为这次调用中真正发生状态
+转换的行产生 lifecycle 事件，并且只有在调用方仍然持有该 run 当前 lease/attempt 时才会
+写入任何东西——针对已经 consumed 的行重放同一批次是安全的空操作：状态保持
 `consumed`，也不会产生第二条 `run.steer.consumed`。运维可以在 worker 日志里观察到这种
-模式：同一批 steering id 反复出现 `commit_steering_consumptions` 调用，但
+模式：同一批 steering id 反复出现 `commit_steering_consumptions_if_owned` 调用，但
 `run_events` 里对应的 `run.steer.consumed` 数量并没有增长——只要重试最终会停止，这就是
 预期行为，而不是卡住的重试循环。
 
@@ -105,8 +164,8 @@ durable 的 steering 历史，要么需要把正在进行的 run 与新二进制
 
 - 永远不要把"回滚 schema"当作回滚策略的一部分。如果确实需要回滚一次部署，应该回滚
   **二进制**、保持 schema 停在当前（更靠前）的 revision——`0002_steering`/
-  `0003_steering_source_event` 都是纯新增，早于 steering 特性的旧二进制会直接忽略
-  多出来的表/列；
-- 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event` 应该先在
-  staging 环境（或 CI 的 `test_postgres_integration.py` Postgres job）中验证过，
-  再应用到生产环境，而不是依赖"出问题了还能撤销"。
+  `0003_steering_source_event`/`0004_steering_closed` 都是纯新增，早于对应特性的旧
+  二进制会直接忽略多出来的表/列；
+- 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event`/
+  `0004_steering_closed` 应该先在 staging 环境（或 CI 的 `test_postgres_integration.py`
+  Postgres job）中验证过，再应用到生产环境，而不是依赖"出问题了还能撤销"。

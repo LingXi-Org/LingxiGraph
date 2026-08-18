@@ -609,6 +609,160 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_stale_worker_cannot_commit_steering_consumptions_after_lease_takeover(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 7, point 2 (BLOCKER), PostgreSQL
+        path: a worker whose lease has been reclaimed by a new owner must
+        never be able to durably commit a steering consumption -- its
+        write must be rejected atomically, touching nothing."""
+
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+        from lingxigraph.steering import SteeringConsumption, SteeringEvent
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            event, _ = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}
+            )
+
+            claimed_a = await repo.claim_run("worker-a", lease_seconds=1)
+            assert claimed_a is not None
+            self.assertEqual(claimed_a.attempt, 1)
+
+            steering_event = SteeringEvent(
+                id=event.id,
+                run_id=run.id,
+                sequence=event.sequence,
+                kind=event.kind,
+                payload=event.payload,
+                metadata=event.metadata,
+                created_at=event.created_at,
+            )
+            consumption = SteeringConsumption(
+                event=steering_event,
+                consumed_at=steering_event.created_at,
+                node="n",
+                namespace=(),
+                task_id="t",
+            )
+
+            # A's lease expires; B claims the same run at a new attempt.
+            await asyncio.sleep(1.2)
+            claimed_b = await repo.claim_run("worker-b", lease_seconds=30)
+            assert claimed_b is not None
+            self.assertEqual(claimed_b.attempt, 2)
+
+            # A's now-stale commit must be rejected outright.
+            result = await repo.commit_steering_consumptions_if_owned(
+                "acme", run.id, "worker-a", claimed_a.attempt, [consumption]
+            )
+            self.assertIsNone(result)
+
+            still_pending = await repo.list_pending_steering("acme", run.id)
+            self.assertEqual([row.id for row in still_pending], [event.id])
+            consumed_events = [
+                e for e in await repo.list_events("acme", run.id) if e.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(consumed_events, [])
+
+            # B, the current owner, commits it normally.
+            stored = await repo.commit_steering_consumptions_if_owned(
+                "acme", run.id, "worker-b", claimed_b.attempt, [consumption]
+            )
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+
+        asyncio.run(scenario())
+
+    def test_idempotency_key_replay_safe_across_finalizing_and_terminal_gates(self) -> None:
+        """Issue #16 PR #17 review round 7, point 3, PostgreSQL path: a
+        same-Idempotency-Key replay must return the existing event, never
+        a fresh 409, even after the run has gone finalizing or terminal --
+        only a genuinely new key against such a run still gets 409."""
+
+        from lingxigraph.errors import RunFinalizingError, RunTerminalError
+        from lingxigraph.server.models import AssistantCreate, RunCreate, ThreadCreate
+        from lingxigraph.server.repository import PostgresRepository
+
+        async def scenario() -> None:
+            repo = PostgresRepository(POSTGRES_URL, schema=self.schema)
+            await repo.setup()
+            assistant = await repo.create_assistant(
+                "acme", AssistantCreate(graph_id="graph", name="a"), "1.0.0"
+            )
+            thread = await repo.create_thread("acme", ThreadCreate())
+
+            # --- finalizing gate ---
+            run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            claimed = await repo.claim_run("worker-a", lease_seconds=30)
+            assert claimed is not None
+            original, created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertTrue(created)
+            gate_closed = await repo.close_steering("acme", run.id, "worker-a", claimed.attempt)
+            self.assertTrue(gate_closed)
+
+            replayed, replayed_created = await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"m": 1}, idempotency_key="key-1"
+            )
+            self.assertFalse(replayed_created)
+            self.assertEqual(replayed.id, original.id)
+            self.assertEqual(replayed.sequence, original.sequence)
+
+            with self.assertRaises(RunFinalizingError):
+                await repo.submit_steering(
+                    "acme", run.id, kind="user_input", payload={"m": 2}, idempotency_key="key-2"
+                )
+
+            # --- terminal gate ---
+            terminal_run = await repo.create_run(
+                "acme", thread.id, assistant, RunCreate(assistant_id=assistant.id, input={})
+            )
+            terminal_original, terminal_created = await repo.submit_steering(
+                "acme",
+                terminal_run.id,
+                kind="user_input",
+                payload={"m": 1},
+                idempotency_key="key-3",
+            )
+            self.assertTrue(terminal_created)
+            await repo.finish_run("acme", terminal_run.id, "succeeded", output={})
+
+            terminal_replayed, terminal_replayed_created = await repo.submit_steering(
+                "acme",
+                terminal_run.id,
+                kind="user_input",
+                payload={"m": 1},
+                idempotency_key="key-3",
+            )
+            self.assertFalse(terminal_replayed_created)
+            self.assertEqual(terminal_replayed.id, terminal_original.id)
+            self.assertEqual(terminal_replayed.sequence, terminal_original.sequence)
+
+            with self.assertRaises(RunTerminalError):
+                await repo.submit_steering(
+                    "acme",
+                    terminal_run.id,
+                    kind="user_input",
+                    payload={"m": 2},
+                    idempotency_key="key-4",
+                )
+
+        asyncio.run(scenario())
+
     @unittest.skipUnless(REDIS_URL, "Redis integration URL not configured")
     def test_redis_cache_pubsub_and_recovery_contract(self) -> None:
         from lingxigraph.cache_redis import RedisCache

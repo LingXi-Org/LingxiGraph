@@ -5,13 +5,14 @@ description: "Migration rollout order, PostgreSQL-as-source-of-truth, latency, r
 
 ## Migration rollout order
 
-Mid-run steering (issue #16) ships as two forward-only Alembic revisions on top of the base
+Mid-run steering (issue #16) ships as three forward-only Alembic revisions on top of the base
 schema:
 
 | Revision | Adds |
 | --- | --- |
 | `0002_steering` | `run_steering_events` table, its indexes, and the worker/server code paths that read/write it |
 | `0003_steering_source_event` | `source_event_id` column + partial index on `run_steering_events`, used to correlate a steering event across repeated pause/resume migrations |
+| `0004_steering_closed` | `runs.steering_closed` — the atomic finalization admission gate (review round 6/7); see "The `steering_closed` finalization gate" below |
 
 Apply them with the standard Alembic path:
 
@@ -19,24 +20,75 @@ Apply them with the standard Alembic path:
 alembic upgrade head
 ```
 
-Both are additive (`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`) and safe to run
-against a live database before deploying the new server/worker binaries — the old binaries
-simply do not read the new column. Deploy order for a zero-downtime rollout:
+All three are additive (`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, a `NOT NULL
+DEFAULT FALSE` column) and safe to run against a live database before deploying the new
+server/worker binaries — an old binary that predates `0004` simply never reads or writes
+`steering_closed`; it keeps behaving exactly as it did before the column existed. Deploy order
+for a zero-downtime rollout:
 
-1. Run `alembic upgrade head` (adds `run_steering_events` and `source_event_id`) while the
-   old server/worker binaries are still serving traffic.
+1. Run `alembic upgrade head` (adds `run_steering_events`, `source_event_id`, and
+   `steering_closed`) while the old server/worker binaries are still serving traffic.
 2. Roll out the new server and worker binaries.
 
-Do not reverse this order: a binary that writes `source_event_id` before the column exists
-will fail its inserts. Because migrations in this project are forward-only (`downgrade()`
-raises), there is no automated rollback path for the schema — see "Rollback boundaries" below.
+Do not reverse this order: a binary that writes `source_event_id`/`steering_closed` before the
+column exists will fail its inserts/updates. Because migrations in this project are
+forward-only (`downgrade()` raises), there is no automated rollback path for the schema — see
+"Rollback boundaries" below.
 
 <Callout type="warn">
 `PostgresRepository.setup()` also applies the same SQL files directly (used by tests and by
 embedded/dev setups). That code path is **not** a substitute for driving the Alembic revision
 chain in a real deployment: only `alembic upgrade head` is what a production rollout should
-run, and it must reach `0003_steering_source_event`, not stop at `0002_steering`.
+run, and it must reach `0004_steering_closed`, not stop at `0002_steering` or
+`0003_steering_source_event`.
 </Callout>
+
+## The `steering_closed` finalization gate
+
+Once a worker's graph execution reaches its terminal/paused outcome, the run may still read
+`running`/`cancelling` for a little while longer while the worker durably flushes whatever
+steering the graph already drained and commits the final status — there is no more graph safe
+point left to consume anything new. `runs.steering_closed` is a boolean the owning worker sets
+(fenced on its own `lease_owner`/`attempt`, just like the status write itself) the instant
+execution ends, before that final flush starts.
+
+- While `steering_closed` is `false`, `POST /steer` is admitted normally, exactly as it always
+  was before `0004`.
+- Once `steering_closed` is `true` for the run's current attempt, a **new** `POST /steer`
+  (no matching Idempotency-Key on file yet) is rejected with `409 run_finalizing` — a stable,
+  documented error distinct from the terminal-run `409`, so a client can tell "this run is
+  momentarily busy finishing up" apart from "this run is permanently done".
+- A **replayed** `POST /steer` — same `(tenant_id, run_id, Idempotency-Key)` as an event that
+  was already durably accepted — always returns that existing event's current state, never a
+  fresh `409`, regardless of `steering_closed`/terminal/superseded status. See "Idempotent
+  replay is safe across every admission gate" below.
+- A `paused` outcome never closes the gate: pausing is not "no safe point left" the way a
+  terminal outcome is — `/steer` against a paused run is an intentional, documented part of the
+  design (the pending steering is transferred to the resumed run at `/resume` time).
+- A gate closed by an abandoned delivery attempt does not leak into the next one: `claim_run`
+  resets `steering_closed` to `false` on every fresh claim, so a retried run accepts steering
+  normally again.
+
+A closed gate on its own is not sufficient to prevent a permanently-pending steering row: a
+`/steer` call can win the run row's lock a moment *before* `close_steering()` does, even though
+the graph has already finished. The worker's post-flush check (`list_pending_steering()`,
+`Worker._execute`) is what actually catches that case — if anything is still `pending`/
+`delivered` after the final flush has committed everything it could, the run is **not**
+finalized to a terminal/paused status; instead it is routed through the ordinary
+retry/dead-letter path (error code `steering_pending_rerun`) so a fresh delivery attempt gives
+the event a real chance to be consumed. **A terminal run must never carry a permanently-pending
+steering row.**
+
+## Idempotent replay is safe across every admission gate
+
+`submit_steering()` (both the in-memory and PostgreSQL repositories) checks for an existing
+event matching `(tenant_id, run_id, Idempotency-Key)` **before** any terminal/`steering_closed`/
+superseded admission gate, not after. If a client's `POST /steer` durably committed but the 202
+response never reached it (a dropped connection, a proxy timeout), a standard idempotent retry
+with the same key returns that event's current persisted state — id and sequence unchanged —
+even if the run has since gone finalizing, terminal, or superseded. Only a genuinely *new* key
+(one this run has never seen) is subject to those gates; that is a real admission decision, and
+still gets the appropriate `409`.
 
 ## PostgreSQL is the source of truth; Redis is only an accelerator
 
@@ -75,9 +127,22 @@ If a steering event stays `pending` far longer than expected:
    `source_event_id` to see whether it was migrated from an earlier, paused run — the
    `queue_latency_seconds` on the eventual `run.steer.consumed` event will include all
    accumulated pause time, which is expected, not a bug.
-4. Check worker logs/metrics for repeated `commit_steering_consumptions()` failures — those
-   retry safely (the operation is idempotent) but repeated failures indicate a database
-   connectivity problem worth alerting on.
+4. Check worker logs/metrics for repeated `commit_steering_consumptions_if_owned()` failures —
+   those retry safely (the operation is idempotent, and fenced on the worker's own
+   `lease_owner`/`attempt` — see "The `steering_closed` finalization gate") but repeated
+   failures indicate a database connectivity problem worth alerting on.
+5. If a client got `409 run_finalizing` on `/steer`, the run's graph had already finished
+   executing at the moment the request landed — check `runs.steering_closed` for the run's
+   current attempt (`true` means the gate is shut) and retry against a fresh run instead of the
+   same one. A replay with the same Idempotency-Key is always safe here, even after the gate
+   closes — see "Idempotent replay is safe across every admission gate".
+6. If worker logs show `steering_pending_rerun`, that is the round 7 TOCTOU fix working as
+   intended: a steering event was durably accepted with no safe point left in that delivery
+   attempt to consume it, so the run was deliberately kept non-terminal and rescheduled instead
+   of finalizing with a permanently-pending row. Expect the next delivery attempt to pick the
+   event up normally; this is not itself a bug, but a repeating pattern for the same run
+   suggests steering is consistently arriving after the graph already reaches its terminal
+   node, which is worth investigating at the application/graph level.
 
 ## The normal `run.steer.accepted → consumed` lifecycle
 
@@ -85,9 +150,11 @@ If a steering event stays `pending` far longer than expected:
 2. A worker holding the run's lease discovers the row (via Redis hint or PostgreSQL poll) and
    ingests it into the run's in-memory `SteeringChannel`.
 3. Graph code calls `drain_steering()` at some safe point and receives it.
-4. The worker durably commits the consumption (`commit_steering_consumptions()`), which
-   atomically transitions the row to `consumed` and emits `run.steer.consumed` in the same
-   transaction.
+4. The worker durably commits the consumption (`commit_steering_consumptions_if_owned()`,
+   fenced on the worker's own `lease_owner`/`attempt`), which atomically transitions the row to
+   `consumed` and emits `run.steer.consumed` in the same transaction. A worker that no longer
+   owns the lease/attempt (a takeover mid-heartbeat or mid-final-flush) gets nothing written at
+   all — the new owner is solely responsible for the row from that point on.
 
 No step in this chain is optional or reorderable; a client should treat only step 4's
 `run.steer.consumed` event as proof of actual processing.
@@ -97,13 +164,14 @@ No step in this chain is optional or reorderable; a client should treat only ste
 The status update and the `run.steer.consumed` event insert happen inside one PostgreSQL
 transaction. If the connection drops after the transaction commits but before the worker
 observes the acknowledgment, the worker's retry logic re-sends the same consumption batch.
-Because `commit_steering_consumptions()` is idempotent — it only emits a lifecycle event for
-rows that transition status in that specific call — a retried batch against already-consumed
-rows is a safe no-op: the status stays `consumed` and no second `run.steer.consumed` event is
-created. Operators can observe this pattern in worker logs as a repeated
-`commit_steering_consumptions` call for the same steering ids with no corresponding growth in
-`run.steer.consumed` events in `run_events` — that is expected behavior, not a stuck retry
-loop, as long as it eventually stops retrying.
+Because `commit_steering_consumptions_if_owned()` is idempotent — it only emits a lifecycle
+event for rows that transition status in that specific call, and only writes anything at all
+when the caller still owns the run's current lease/attempt — a retried batch against
+already-consumed rows is a safe no-op: the status stays `consumed` and no second
+`run.steer.consumed` event is created. Operators can observe this pattern in worker logs as a
+repeated `commit_steering_consumptions_if_owned` call for the same steering ids with no
+corresponding growth in `run.steer.consumed` events in `run_events` — that is expected
+behavior, not a stuck retry loop, as long as it eventually stops retrying.
 
 ## Upgrade and rollback boundaries
 
@@ -114,8 +182,10 @@ runs against a schema the new binaries no longer expect. Practical implications:
 
 - Never plan a rollback strategy that downgrades the schema. If a deployment needs to be
   rolled back, roll back the **binaries** while leaving the schema at its current (forward)
-  revision — the additive nature of `0002_steering`/`0003_steering_source_event` means older
-  binaries that predate steering simply ignore the extra table/column.
-- Because there is no schema downgrade path, validate `0002_steering`/`0003_steering_source_
-  event` against a staging database (or the CI `test_postgres_integration.py` Postgres job)
-  before applying to production, rather than relying on the ability to undo it.
+  revision — the additive nature of `0002_steering`/`0003_steering_source_event`/
+  `0004_steering_closed` means older binaries that predate a given revision simply ignore the
+  extra table/columns.
+- Because there is no schema downgrade path, validate `0002_steering`/
+  `0003_steering_source_event`/`0004_steering_closed` against a staging database (or the CI
+  `test_postgres_integration.py` Postgres job) before applying to production, rather than
+  relying on the ability to undo it.
