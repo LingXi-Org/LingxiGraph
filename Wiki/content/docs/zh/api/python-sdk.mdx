@@ -31,13 +31,8 @@ with LingxiGraphClient(
         max_model_calls=8,
     )
 
-    for event in client.runs.stream(run["id"]):
-        print(event["sequence"], event["kind"])
-
-    completed = client.runs.join(run["id"], timeout=120)
-    print(completed["output"])
-
-    # Durably 注入一条运行中输入；成功只代表已 durably 写入，不代表已被图消费。
+    # Run 创建后即可提交 steering；无论它仍在排队还是已经 running，
+    # 成功都只代表已 durably 写入，不代表图已经消费。
     accepted = client.runs.steer(
         run["id"],
         kind="user_input",
@@ -45,6 +40,12 @@ with LingxiGraphClient(
         idempotency_key="msg-123",
     )
     print(accepted["id"], accepted["status"])  # "pending"
+
+    for event in client.runs.stream(run["id"]):
+        print(event["sequence"], event["kind"])
+
+    completed = client.runs.join(run["id"], timeout=120)
+    print(completed["output"])
 ```
 
 可用资源方法：
@@ -93,8 +94,6 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
         thread_id=thread["id"],
         input={"request": "hello"},
     )
-    async for event in client.runs.stream(run["id"]):
-        print(event)
 
     accepted = await client.runs.steer(
         run["id"],
@@ -103,6 +102,9 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
         idempotency_key="msg-123",
     )
     print(accepted["id"], accepted["status"])
+
+    async for event in client.runs.stream(run["id"]):
+        print(event)
 ```
 
 异步资源与同步资源一一对应。不要在 async 事件循环中使用同步客户端。
