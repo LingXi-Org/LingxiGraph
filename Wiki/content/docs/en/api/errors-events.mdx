@@ -35,7 +35,8 @@ Common stable codes include `idempotency_conflict`, `quota_exceeded`, and `join_
 | --- | --- | --- |
 | `run_terminal` | 409 | `/steer` is called against a run in a terminal status (`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`); no durable write is created |
 | `run_superseded` | 409 | `/steer` is called against an old `run_id` already superseded by a `resume`; call it against the new run's `id` instead (see `metadata.resumed_from_run_id`) |
-| `payload_too_large` | 413/422 | Serialized `payload` + `metadata` exceed the size cap; no durable write is created |
+| `payload_too_large` | 413/422 | Serialized `payload` + `metadata` exceed the size cap (32KB, or the server's event size cap, whichever is smaller); no durable write is created |
+| `run_resume_conflict` | 409 | Concurrent resume calls raced against the same paused run; exactly one wins and creates the new run, every other caller gets this instead |
 
 ## Run business errors
 

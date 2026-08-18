@@ -63,8 +63,11 @@ sequenceDiagram
   W->>PG: commit_steering_consumptions()（状态更新 + run.steer.consumed，同一事务）
 ```
 
-PostgreSQL 的 `run_steering_events` 表是每一条 steering 事件是否存在及其状态
-（`pending` → `delivered` → `consumed`，迁移时为 `superseded`）的唯一真相来源。Redis
+PostgreSQL 的 `run_steering_events` 表是每一条 steering 事件是否存在及其状态的唯一真相
+来源。schema 保留了 `delivered` 这个状态值以便将来扩展，但目前实现的流程从不会写入
+它——真实的状态转换是 `pending` → `consumed`（通过一次原子的 `commit_steering_
+consumptions()` 调用直接完成），迁移时为 `superseded`。请把 `delivered` 当作代码里
+可能需要读取/放行的一个状态值，而不是当前任何路径会产生的状态。Redis
 通知只是为了降低轮询延迟的优化手段；丢失它从不会丢失一条 steering 事件——worker 在每个
 安全点的周期性检查会退化为直接读 PostgreSQL。`SteeringChannel` 是 worker 用来把已取到的
 事件以原子 drain-once 语义交给图代码的进程内、按 run 划分的结构；它本身不是 durable 的，

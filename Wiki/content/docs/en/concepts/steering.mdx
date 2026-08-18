@@ -69,8 +69,12 @@ sequenceDiagram
 ```
 
 PostgreSQL's `run_steering_events` table is the single source of truth for every steering
-event's existence and status (`pending` → `delivered` → `consumed`, or `superseded` on
-transfer). The Redis notification is purely an optimization to reduce polling latency; losing
+event's existence and status. The schema reserves a `delivered` value for forward
+compatibility, but the currently implemented flow never writes it — the real transition is
+`pending` → `consumed` directly (via a single atomic `commit_steering_consumptions()` call),
+or `superseded` on transfer. Treat `delivered` as a status your code may need to read/allow
+today, not one anything currently produces. The Redis notification is purely an optimization
+to reduce polling latency; losing
 it never loses a steering event — the worker's periodic safe-point checks fall back to reading
 PostgreSQL directly. `SteeringChannel` is the in-process, per-run structure the worker uses to
 hand already-fetched events to graph code with atomic drain-once semantics; it is not itself

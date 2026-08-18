@@ -35,7 +35,8 @@ description: "处理 problem details、run 失败、事件续传与客户端重�
 | --- | --- | --- |
 | `run_terminal` | 409 | 对处于终止态（`succeeded`/`failed`/`cancelled`/`timed_out`/`dead_letter`）的 run 调用 `/steer`；不产生任何 durable 写入 |
 | `run_superseded` | 409 | 对已经被 `resume` 取代的旧 `run_id` 调用 `/steer`；应改用新 run 的 `id`（见 `metadata.resumed_from_run_id`） |
-| `payload_too_large` | 413/422 | `payload` + `metadata` 序列化后超过大小上限；不产生任何 durable 写入 |
+| `payload_too_large` | 413/422 | `payload` + `metadata` 序列化后超过大小上限（32KB，或服务端事件大小上限，取两者较小值）；不产生任何 durable 写入 |
+| `run_resume_conflict` | 409 | 并发 `resume` 调用同一个已暂停的 run；只有一个调用会成功创建新 run，其余调用都会收到该错误 |
 
 ## Run 业务错误
 

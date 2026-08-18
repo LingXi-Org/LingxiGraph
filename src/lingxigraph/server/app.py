@@ -28,7 +28,7 @@ from ..errors import (
     RunSupersededError,
     RunTerminalError,
 )
-from ..steering import SteeringPayloadTooLarge
+from ..steering import MAX_STEERING_PAYLOAD_BYTES, SteeringPayloadTooLarge
 from ..store import BaseStore, InMemoryStore, StoreOperation
 from ..types import RunStatus
 from ..version import __version__
@@ -590,7 +590,17 @@ def create_app(
                 payload=body.payload,
                 metadata=body.metadata,
                 idempotency_key=key,
-                max_payload_bytes=repository.limits.max_event_bytes,
+                # Issue #16 PR #17 review round 5, point 3: the public docs
+                # and the ``steering`` module both promise a ~32KB payload
+                # cap (``MAX_STEERING_PAYLOAD_BYTES``); using the much
+                # larger generic event cap here let payloads up to 256KB
+                # through, contradicting that documented contract. Enforce
+                # whichever limit is smaller so the HTTP endpoint never
+                # accepts more than the documented steering limit, even if
+                # a deployment raises the generic event size cap.
+                max_payload_bytes=min(
+                    MAX_STEERING_PAYLOAD_BYTES, repository.limits.max_event_bytes
+                ),
             )
         except KeyError as exc:
             raise HTTPException(404, "run not found") from exc

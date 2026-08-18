@@ -80,6 +80,7 @@ POST /v1/runs/{run_id}/redrive
 
 - Cancellation is cooperative and usually returns `cancelling` first; nodes and providers should honor the cancellation token.
 - Only a `paused` run can resume. The response is a new run whose `metadata.resumed_from_run_id` points to the original.
+- Concurrent resume calls against the same paused run have exactly one winner: it creates the new run as above, and every other concurrent caller gets `409 run_resume_conflict` instead of a duplicate run.
 - Only `failed` or `dead_letter` runs can redrive. Redrive preserves input/config/version and re-enqueues the run.
 
 <Callout type="warn">
@@ -128,9 +129,14 @@ Request body fields:
 **`Idempotency-Key` header vs. body field.** Both express the same logical key and either
 may be used; when both are present the `Idempotency-Key` header wins. The same
 `(tenant_id, run_id, idempotency_key)` triple creates at most one steering event — a repeat
-call returns the **original** event (not a `409`), with a response body identical to the
-first call and no `sequence` bump. This mirrors the `Idempotency-Key` semantics on
-`POST /runs`: same key + same request is a safe replay, not an error.
+call returns the **same** event (`id` and `sequence` unchanged, no new row created and no
+`sequence` bump), not a `409`. The response body is *not* guaranteed to be byte-identical to
+the first call's, though: it reflects that event's **current persisted status**, which can
+have moved on between calls (e.g. `pending` on the first call, `consumed` on a later replay
+after the graph has since drained it). This mirrors the `Idempotency-Key` semantics on
+`POST /runs`: same key + same request is a safe replay, not an error — but a replay always
+returns the live state of the one underlying resource, not a frozen snapshot of the first
+response.
 
 ### Behavior by run status
 

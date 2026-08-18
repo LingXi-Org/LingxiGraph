@@ -158,6 +158,21 @@ class Worker:
         await self._sync_steering_in(run, graph)
         heartbeat = asyncio.create_task(self._heartbeat(run, token, graph))
         output: dict[str, Any] | None = None
+
+        # Issue #16 PR #17 review round 5, point 1: the *intended* outcome
+        # is computed here, purely in memory -- it is deliberately NOT
+        # written to the repository yet. Writing ``finish_run``/
+        # ``retry_run`` here (as round <=4 did) makes a terminal or paused
+        # status externally observable via GET/join/SSE *before* we know
+        # whether the run's final steering consumptions actually made it
+        # to durable storage below. If that flush then failed, overriding
+        # the already-visible status back to pending/retrying breaks the
+        # single most important Run state-machine invariant: once a
+        # terminal/paused status is externally observed, the run must
+        # never appear non-terminal again. So instead we settle on
+        # ``_Intent`` here, stop the heartbeat, durably flush steering, and
+        # only then -- once -- commit the outcome to the repository.
+        intent: Worker._Intent
         try:
             config = {
                 **run.config,
@@ -195,36 +210,27 @@ class Worker:
                     **dict(snapshot.values),
                     "__interrupt__": [dataclasses.asdict(item) for item in snapshot.interrupts],
                 }
-                await self.repository.finish_run(
-                    run.tenant_id, run.id, RunStatus.PAUSED, output=output
-                )
+                intent = Worker._Intent(kind="finish", status=RunStatus.PAUSED, output=output)
             else:
-                await self.repository.finish_run(
-                    run.tenant_id, run.id, RunStatus.SUCCEEDED, output=output or {}
-                )
-                logger.info(
-                    "run succeeded",
-                    extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "succeeded"},
+                intent = Worker._Intent(
+                    kind="finish", status=RunStatus.SUCCEEDED, output=output or {}
                 )
         except GraphCancelledError as exc:
-            await self.repository.finish_run(
-                run.tenant_id,
-                run.id,
-                RunStatus.CANCELLED,
+            intent = Worker._Intent(
+                kind="finish",
+                status=RunStatus.CANCELLED,
                 error={"code": "run_cancelled", "message": str(exc)},
             )
         except GraphTimeoutError as exc:
-            await self.repository.finish_run(
-                run.tenant_id,
-                run.id,
-                RunStatus.TIMED_OUT,
+            intent = Worker._Intent(
+                kind="finish",
+                status=RunStatus.TIMED_OUT,
                 error={"code": "run_timed_out", "message": str(exc)},
             )
         except BudgetExceededError as exc:
-            await self.repository.finish_run(
-                run.tenant_id,
-                run.id,
-                RunStatus.FAILED,
+            intent = Worker._Intent(
+                kind="finish",
+                status=RunStatus.FAILED,
                 error={"code": "budget_exceeded", "message": str(exc)},
             )
         except Exception as exc:
@@ -232,149 +238,202 @@ class Worker:
             retryable = self._is_retryable(exc)
             if retryable and run.attempt < self.max_delivery_attempts:
                 error["code"] = "delivery_retry"
-                await self.repository.retry_run(run.tenant_id, run.id, error=error)
-                stored = await self.repository.append_event(
-                    run.tenant_id,
-                    run.id,
-                    "worker_retrying",
-                    {
-                        "attempt": run.attempt,
-                        "max_attempts": self.max_delivery_attempts,
-                        "error": error,
-                    },
-                )
-                await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-                logger.warning(
-                    "run delivery scheduled for retry",
-                    extra={
-                        "run_id": run.id,
-                        "tenant_id": run.tenant_id,
-                        "status": "pending",
-                        "error_type": type(exc).__name__,
-                    },
-                )
+                intent = Worker._Intent(kind="retry", status=RunStatus.PENDING, error=error)
             else:
                 status = RunStatus.DEAD_LETTER if retryable else RunStatus.FAILED
                 error["code"] = "dead_letter" if retryable else "run_failed"
-                await self.repository.finish_run(
-                    run.tenant_id,
-                    run.id,
-                    status,
-                    error=error,
-                )
-                logger.error(
-                    "run delivery failed",
-                    extra={
-                        "run_id": run.id,
-                        "tenant_id": run.tenant_id,
-                        "status": status.value,
-                        "error_type": type(exc).__name__,
-                    },
-                )
+                intent = Worker._Intent(kind="finish", status=status, error=error)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-            # Final flush: anything drained between the last heartbeat tick
-            # and run completion must still be recorded as consumed.
-            #
-            # Issue #16 PR #17 review round 4, point 3: at this point
-            # ``finish_run``/``retry_run`` above has *already* reported the
-            # run as terminal (or pending-for-retry) -- there is no "next
-            # safe point" left for a swallowed transient failure here the
-            # way there is at a heartbeat tick. A bounded-retry durable
-            # flush that still fails after all attempts must not be
-            # followed by ``forget_steering`` (which would permanently
-            # destroy the only remaining record of what was consumed) or by
-            # leaving the run's already-written terminal status standing --
-            # instead, override it and route the run into the same
-            # retry/dead-letter path an ordinary delivery failure uses, so
-            # a later attempt resyncs and retries the commit.
-            flushed = await self._final_steering_flush(run, graph)
-            if not flushed:
-                flush_error = {
-                    "code": "steering_flush_failed",
-                    "message": (
-                        "durable steering consumption commit failed on final flush; "
-                        "run finalization was overridden to avoid losing it"
-                    ),
-                }
-                if run.attempt < self.max_delivery_attempts:
-                    await self.repository.retry_run(run.tenant_id, run.id, error=flush_error)
-                    stored = await self.repository.append_event(
-                        run.tenant_id,
-                        run.id,
-                        "worker_retrying",
-                        {
-                            "attempt": run.attempt,
-                            "max_attempts": self.max_delivery_attempts,
-                            "error": flush_error,
-                        },
-                    )
-                    await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-                    logger.warning(
-                        "run finalization retried: final steering flush failed",
-                        extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
-                    )
-                else:
-                    await self.repository.finish_run(
-                        run.tenant_id, run.id, RunStatus.DEAD_LETTER, error=flush_error
-                    )
-                    logger.error(
-                        "run dead-lettered: final steering flush failed after max attempts",
-                        extra={
-                            "run_id": run.id,
-                            "tenant_id": run.tenant_id,
-                            "status": RunStatus.DEAD_LETTER.value,
-                        },
-                    )
-                # Do NOT forget_steering here: the channel's local
-                # consumption log is the only surviving record of what was
-                # drained, and must stay intact for the redelivery above to
-                # resync and retry the commit instead of silently losing it.
-            else:
-                graph.forget_steering(run.id)
+
+        # Final flush: anything drained between the last heartbeat tick and
+        # run completion must still be recorded as consumed, durably,
+        # before the run's outcome above is committed. See
+        # ``_final_steering_flush`` for why this retries for as long as it
+        # holds the lease rather than giving up after a handful of
+        # attempts (issue #16 PR #17 review round 5, point 2).
+        flushed = await self._final_steering_flush(run, graph)
+        if flushed:
+            await self._commit_intent(run, intent)
+            graph.forget_steering(run.id)
+            return
+
+        # The flush never durably succeeded (the worker is draining, or
+        # this run's lease was lost to another worker) -- the intended
+        # outcome computed above must NEVER be written; doing so would
+        # either expose a false terminal/paused status or silently strand
+        # the drained-but-uncommitted steering consumptions. Route the run
+        # into the same retry/dead-letter path an ordinary delivery
+        # failure uses, so a later delivery attempt resyncs and retries
+        # the commit from the still-``pending`` DB row.
+        flush_error = {
+            "code": "steering_flush_failed",
+            "message": (
+                "durable steering consumption commit could not complete before this "
+                "worker gave up its lease; run finalization was withheld to avoid "
+                "reporting a false status or losing the consumption"
+            ),
+        }
+        if run.attempt < self.max_delivery_attempts:
+            await self.repository.retry_run(run.tenant_id, run.id, error=flush_error)
+            stored = await self.repository.append_event(
+                run.tenant_id,
+                run.id,
+                "worker_retrying",
+                {
+                    "attempt": run.attempt,
+                    "max_attempts": self.max_delivery_attempts,
+                    "error": flush_error,
+                },
+            )
+            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+            logger.warning(
+                "run finalization retried: final steering flush failed",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+            )
+        else:
+            await self.repository.finish_run(
+                run.tenant_id, run.id, RunStatus.DEAD_LETTER, error=flush_error
+            )
+            logger.error(
+                "run dead-lettered: final steering flush failed after max attempts",
+                extra={
+                    "run_id": run.id,
+                    "tenant_id": run.tenant_id,
+                    "status": RunStatus.DEAD_LETTER.value,
+                },
+            )
+        # Do NOT forget_steering here: the channel's local consumption log
+        # is the only surviving record of what was drained, and must stay
+        # intact for the redelivery above to resync and retry the commit
+        # instead of silently losing it.
+
+    @dataclasses.dataclass
+    class _Intent:
+        """The finalization outcome ``_execute`` intends to commit.
+
+        Held purely in memory until the final steering flush durably
+        succeeds -- see the long comment in ``_execute`` for why.
+        """
+
+        kind: str  # "finish" or "retry"
+        status: RunStatus
+        output: dict[str, Any] | None = None
+        error: dict[str, Any] | None = None
+
+    async def _commit_intent(self, run: Run, intent: "Worker._Intent") -> None:
+        """Write the previously-computed intended outcome, exactly once.
+
+        Only ever called after the final steering flush has durably
+        succeeded, so this is the single point where a terminal/paused
+        status first becomes externally observable.
+        """
+
+        if intent.kind == "retry":
+            await self.repository.retry_run(run.tenant_id, run.id, error=intent.error)
+            stored = await self.repository.append_event(
+                run.tenant_id,
+                run.id,
+                "worker_retrying",
+                {
+                    "attempt": run.attempt,
+                    "max_attempts": self.max_delivery_attempts,
+                    "error": intent.error,
+                },
+            )
+            await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
+            logger.warning(
+                "run delivery scheduled for retry",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "pending"},
+            )
+            return
+
+        await self.repository.finish_run(
+            run.tenant_id, run.id, intent.status, output=intent.output, error=intent.error
+        )
+        if intent.status is RunStatus.SUCCEEDED:
+            logger.info(
+                "run succeeded",
+                extra={"run_id": run.id, "tenant_id": run.tenant_id, "status": "succeeded"},
+            )
+        elif intent.status in (RunStatus.DEAD_LETTER, RunStatus.FAILED) and intent.error:
+            logger.error(
+                "run delivery failed",
+                extra={
+                    "run_id": run.id,
+                    "tenant_id": run.tenant_id,
+                    "status": intent.status.value,
+                },
+            )
 
     async def _final_steering_flush(
-        self, run: Run, graph: Any, *, attempts: int = 3, base_delay: float = 0.5
+        self, run: Run, graph: Any, *, base_delay: float = 0.5, max_delay: float = 10.0
     ) -> bool:
-        """Bounded-retry durable flush of drained steering before finalizing.
+        """Durable flush of drained steering before finalizing.
 
         Unlike :meth:`_sync_steering_out` (used at heartbeat ticks, where a
         transient failure can simply be retried at the next tick), this is
-        called once, after the run has already reached a terminal or
-        paused outcome and the heartbeat has been cancelled -- there is no
-        later safe point. Returns ``True`` once nothing remains pending (or
-        the commit succeeded); returns ``False`` only after every retry has
-        been exhausted, in which case the caller MUST NOT report the run as
-        successfully finished/paused, and MUST NOT call
-        ``graph.forget_steering`` (see ``_execute``'s ``finally`` block).
+        called once the graph has already reached its terminal/paused
+        outcome and the heartbeat loop has stopped -- there is no later
+        safe point *within this delivery attempt*. Critically, there is
+        also no safe "next delivery attempt" to fall back on the way an
+        ordinary mid-run failure has: ``_execute`` returning discards this
+        locally-bound ``graph`` (and therefore its steering channel and
+        local consumption log) entirely, because ``with_runtime`` builds a
+        brand new ``CompiledStateGraph`` -- with a brand new, empty
+        ``_run_steering`` map -- on every call (issue #16 PR #17 review
+        round 5, point 2). A future redelivery would construct a fresh
+        channel with no memory of what this attempt already drained,
+        risking double-execution or a permanently stuck ``pending`` row.
+
+        So instead of a small bounded number of attempts, this retries
+        with capped exponential backoff for as long as it continues to
+        hold the run's lease and the worker is not draining, renewing the
+        lease between attempts so another worker does not reclaim the run
+        (and construct its own competing channel) out from under it mid
+        retry. It only gives up -- returning ``False`` -- if the worker
+        itself is shutting down, or the lease is confirmed lost to another
+        worker; both are cases where holding on any longer would be
+        pointless or actively harmful, and the caller falls back to the
+        ordinary retry/dead-letter path.
         """
 
         channel = graph.get_steering_channel(run.id)
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while True:
             consumed = channel.peek_consumed()
             if not consumed:
                 return True
+            attempt += 1
             try:
                 stored_events = await self.repository.commit_steering_consumptions(
                     run.tenant_id, run.id, consumed
                 )
             except Exception:
                 logger.warning(
-                    "final steering flush attempt %d/%d failed",
+                    "final steering flush attempt %d failed",
                     attempt,
-                    attempts,
                     extra={"run_id": run.id, "tenant_id": run.tenant_id},
                     exc_info=True,
                 )
-                if attempt < attempts:
-                    await asyncio.sleep(base_delay * attempt)
-                    continue
-                return False
+                if self._stop.is_set():
+                    return False
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                await asyncio.sleep(delay)
+                # Keep the lease alive while we keep retrying so another
+                # worker does not reclaim this run mid-flush and construct
+                # a competing graph/channel of its own.
+                alive = await self.repository.heartbeat(
+                    run.tenant_id, run.id, self.worker_id, lease_seconds=self.lease_seconds
+                )
+                if not alive:
+                    return False
+                continue
             channel.ack_consumed(consumption.event.id for consumption in consumed)
             for stored in stored_events:
                 await self.event_bus.publish(run.tenant_id, run.id, stored.sequence)
-        return True
+            return True
 
     async def _heartbeat(self, run: Run, token: CancellationToken, graph: Any) -> None:
         while True:

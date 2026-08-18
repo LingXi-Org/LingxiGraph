@@ -723,13 +723,22 @@ class DurableAckOrderingTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_final_flush_failure_never_reports_success_with_steering_lost(self) -> None:
-        """Issue #16 PR #17 review round 4, point 3: a transient failure on
-        the *final* flush (after ``finish_run``, heartbeat cancelled, no
-        further safe point) must not leave the run reported
-        succeeded/paused while the DB steering row is silently stranded
-        ``pending`` forever. This goes through the real
+        """Issue #16 PR #17 review round 4, point 3 (round 5, point 1/2): a
+        durable-commit failure on the *final* flush -- with the heartbeat
+        already cancelled and no further safe point within this delivery
+        attempt -- must not leave the run reported succeeded/paused while
+        the DB steering row is silently stranded ``pending`` forever, and
+        must not discard the run's intended outcome before the flush is
+        known to have succeeded. This goes through the real
         ``Worker._execute()`` finalization path (not an isolated call to
-        ``_sync_steering_out``)."""
+        ``_sync_steering_out``).
+
+        ``_final_steering_flush`` now retries for as long as it holds the
+        lease rather than giving up after a fixed number of attempts (see
+        its docstring), so this simulates the one case it does give up in
+        -- the worker itself starting to drain mid-retry -- by setting
+        ``worker._stop`` as a side effect of the first failed commit.
+        """
 
         from lingxigraph.server.worker import Worker
 
@@ -746,18 +755,28 @@ class DurableAckOrderingTests(unittest.TestCase):
             )
 
             worker = Worker(make_registry(), repo)
-            # Keep the bounded final-flush retry window short for the test.
-            worker._final_steering_flush = (
-                lambda run, graph, attempts=3, base_delay=0.01: Worker._final_steering_flush(
-                    worker, run, graph, attempts=attempts, base_delay=0.01
-                )
-            )
 
-            real_commit = repo.commit_steering_consumptions
+            # The heartbeat loop is irrelevant to what this test is
+            # checking (it only needs the steering that was already
+            # durably accepted *before* the run was claimed, which
+            # ``_execute`` syncs in up front, before the heartbeat task is
+            # even created) -- replace it with an inert coroutine so the
+            # test isn't also exercising unrelated heartbeat/event-bus
+            # concurrency while it deliberately holds the flush retry loop
+            # open.
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
 
             async def always_fails(tenant_id, run_id, consumptions):
+                # Simulate the worker starting to drain mid-retry so the
+                # flush's otherwise-unbounded retry loop bails immediately
+                # instead of looping (and sleeping) forever in this test.
+                worker._stop.set()
                 raise ConnectionError("transient database hiccup on final flush")
 
+            real_commit = repo.commit_steering_consumptions
             repo.commit_steering_consumptions = always_fails  # type: ignore[method-assign]
 
             claimed = await worker.run_once()
@@ -781,10 +800,14 @@ class DurableAckOrderingTests(unittest.TestCase):
             ]
             self.assertEqual(consumed_events, [])
 
-            # Recovery: restore the durable commit and let the run be
-            # redelivered. It must eventually succeed with exactly one
-            # ``run.steer.consumed`` event -- not lost, not duplicated.
+            # Recovery: restore the durable commit, un-drain the worker,
+            # and let the run be redelivered. It must eventually succeed
+            # with exactly one ``run.steer.consumed`` event -- not lost,
+            # not duplicated -- confirming the still-``pending`` DB row
+            # (not any in-process channel state) is what a fresh delivery
+            # attempt's brand new graph/channel actually recovers from.
             repo.commit_steering_consumptions = real_commit  # type: ignore[method-assign]
+            worker._stop = asyncio.Event()
             claimed_again = await worker.run_once()
             self.assertTrue(claimed_again)
 
@@ -801,6 +824,207 @@ class DurableAckOrderingTests(unittest.TestCase):
                 if event.kind == "run.steer.consumed"
             ]
             self.assertEqual(len(consumed_events_after), 1)
+
+        asyncio.run(scenario())
+
+    def test_concurrent_observers_never_see_a_transient_terminal_status_during_final_flush(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 5, point 1 (BLOCKER): a run's
+        terminal/paused status must never become externally observable
+        (via ``GET``/``join``/SSE) before the final steering flush has
+        durably succeeded -- and, symmetrically, once it *does* become
+        observable it must never move back to non-terminal.
+
+        This holds the final flush open with a gate the test controls,
+        continuously polls ``repository.get_run`` (the same read path
+        ``GET``/``join``/SSE all resolve to) throughout, and asserts:
+        (1) while the flush is blocked, the status is never
+        ``succeeded``/``paused``; (2) once ``succeeded`` is first
+        observed, every subsequent poll is also ``succeeded`` -- it never
+        reverts to ``pending``/``running``."""
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            worker = Worker(make_registry(), repo)
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            gate = asyncio.Event()
+            flush_entered = asyncio.Event()
+            real_commit = repo.commit_steering_consumptions
+
+            async def gated_commit(tenant_id, run_id, consumptions):
+                flush_entered.set()
+                await gate.wait()
+                return await real_commit(tenant_id, run_id, consumptions)
+
+            repo.commit_steering_consumptions = gated_commit  # type: ignore[method-assign]
+
+            observed_statuses: list[str] = []
+            stop_observing = asyncio.Event()
+
+            async def observer() -> None:
+                while not stop_observing.is_set():
+                    current = await repo.get_run("acme", run.id)
+                    status = current.status.value if hasattr(current.status, "value") else current.status
+                    observed_statuses.append(status)
+                    await asyncio.sleep(0.005)
+
+            observer_task = asyncio.ensure_future(observer())
+            execute_task = asyncio.ensure_future(worker.run_once())
+
+            # Let the run reach and block inside the final flush before
+            # releasing it -- this is the exact window the round 5 review
+            # identified as unsafe in the pre-fix code.
+            await asyncio.wait_for(flush_entered.wait(), timeout=5)
+            # A few more observer ticks while still gated shut.
+            await asyncio.sleep(0.05)
+            self.assertNotIn("succeeded", observed_statuses)
+            self.assertNotIn("paused", observed_statuses)
+
+            gate.set()
+            await asyncio.wait_for(execute_task, timeout=5)
+            # A few more polls after completion to catch any regression
+            # back out of the terminal state.
+            await asyncio.sleep(0.05)
+            stop_observing.set()
+            await observer_task
+
+            self.assertIn("succeeded", observed_statuses)
+            first_succeeded = observed_statuses.index("succeeded")
+            # Monotonic: nothing after the first "succeeded" observation
+            # is ever anything else.
+            self.assertTrue(all(s == "succeeded" for s in observed_statuses[first_succeeded:]))
+            self.assertNotIn("paused", observed_statuses)
+
+            final = await repo.get_run("acme", run.id)
+            final_status = final.status.value if hasattr(final.status, "value") else final.status
+            self.assertEqual(final_status, "succeeded")
+            self.assertIn("stop", final.output["drained"])
+
+        asyncio.run(scenario())
+
+    def test_redelivery_after_flush_failure_uses_a_genuinely_new_graph_instance(
+        self,
+    ) -> None:
+        """Issue #16 PR #17 review round 5, point 2: the previous claim that
+        "not calling ``forget_steering()`` leaves the consumption log
+        available for the next delivery" does not hold, because
+        ``with_runtime()`` builds a *brand new* ``CompiledStateGraph`` (and
+        therefore a brand new, empty ``_run_steering`` channel map) on
+        every call -- the locally-bound ``graph``/channel object from a
+        failed delivery attempt is never retained across attempts.
+
+        This test proves recovery does NOT depend on graph/channel object
+        identity surviving across attempts: it instruments
+        ``GraphRegistry.get`` to hand back a distinct, individually
+        identifiable ``CompiledStateGraph`` on each call, confirms the
+        second ``run_once()`` really did receive a different graph object
+        (not a hand-rolled second flush call on the first attempt's
+        object), and confirms the run still recovers correctly -- because
+        recovery is driven entirely by the still-``pending`` PostgreSQL
+        row, not by anything held in memory across the attempt boundary.
+        """
+
+        from lingxigraph.server.worker import Worker
+
+        async def scenario() -> None:
+            repo = InMemoryRepository()
+            assistant = await repo.create_assistant(
+                "acme", _assistant_create_named("steerable"), graph_version="1"
+            )
+            run = await repo.create_run(
+                "acme", None, assistant, _run_create(assistant.id, {"ticks": 0, "drained": []})
+            )
+            await repo.submit_steering(
+                "acme", run.id, kind="user_input", payload={"message": "stop"}
+            )
+
+            registry = make_registry()
+            seen_graph_ids: list[int] = []
+            compiled = registry.get("steerable")
+            real_with_runtime = compiled.with_runtime
+
+            def tracking_with_runtime(*args: Any, **kwargs: Any):
+                bound = real_with_runtime(*args, **kwargs)
+                seen_graph_ids.append(id(bound))
+                return bound
+
+            compiled.with_runtime = tracking_with_runtime  # type: ignore[method-assign]
+
+            worker = Worker(registry, repo)
+
+            async def inert_heartbeat(run, token, graph):
+                await asyncio.Event().wait()
+
+            worker._heartbeat = inert_heartbeat  # type: ignore[method-assign]
+
+            real_commit = repo.commit_steering_consumptions
+            fail_once = {"done": False}
+
+            async def fail_first_attempt_only(tenant_id, run_id, consumptions):
+                if not fail_once["done"]:
+                    fail_once["done"] = True
+                    worker._stop.set()
+                    raise ConnectionError("transient database hiccup on final flush")
+                return await real_commit(tenant_id, run_id, consumptions)
+
+            repo.commit_steering_consumptions = fail_first_attempt_only  # type: ignore[method-assign]
+
+            claimed = await worker.run_once()
+            self.assertTrue(claimed)
+            after_first_attempt = await repo.get_run("acme", run.id)
+            status = (
+                after_first_attempt.status.value
+                if hasattr(after_first_attempt.status, "value")
+                else after_first_attempt.status
+            )
+            self.assertEqual(status, "pending")
+            self.assertEqual(len(seen_graph_ids), 1)
+
+            worker._stop = asyncio.Event()
+            claimed_again = await worker.run_once()
+            self.assertTrue(claimed_again)
+
+            # The critical assertion: recovery went through a *second*,
+            # distinct ``with_runtime()`` call -- a genuinely new graph
+            # instance, exactly as a real redelivery (by this worker or a
+            # different one entirely) would -- and it still worked,
+            # because the recovery source of truth is the ``pending`` DB
+            # row, never anything held on the first attempt's discarded
+            # graph/channel.
+            self.assertEqual(len(seen_graph_ids), 2)
+            self.assertNotEqual(seen_graph_ids[0], seen_graph_ids[1])
+
+            finished = await repo.get_run("acme", run.id)
+            finished_status = (
+                finished.status.value if hasattr(finished.status, "value") else finished.status
+            )
+            self.assertEqual(finished_status, "succeeded")
+            self.assertIn("stop", finished.output["drained"])
+            self.assertEqual(await repo.list_pending_steering("acme", run.id), [])
+            consumed_events = [
+                event
+                for event in await repo.list_events("acme", run.id)
+                if event.kind == "run.steer.consumed"
+            ]
+            self.assertEqual(len(consumed_events), 1)
 
         asyncio.run(scenario())
 
@@ -1344,6 +1568,38 @@ class ServerSteeringTests(unittest.TestCase):
                 f"/v1/runs/{run['id']}/steer",
                 headers=headers,
                 json={"kind": "user_input", "payload": {"message": "x" * 500_000}},
+            )
+            self.assertEqual(response.status_code, 413)
+
+    def test_payload_between_32kb_and_generic_event_cap_still_rejected(self) -> None:
+        """Issue #16 PR #17 review round 5, point 3 (CONTRACT): the public
+        docs and ``steering.MAX_STEERING_PAYLOAD_BYTES`` both promise a
+        ~32KB cap, but the HTTP endpoint used to pass
+        ``repository.limits.max_event_bytes`` (262,144 bytes) as the
+        payload ceiling instead, silently accepting payloads up to 8x the
+        documented limit. A ~500KB payload (comfortably over *both*
+        numbers) couldn't have caught this ~40KB-sized contract mismatch;
+        this uses a payload sized specifically between the two limits."""
+
+        from lingxigraph.steering import MAX_STEERING_PAYLOAD_BYTES
+
+        app = create_app(registry=make_registry(), authenticator=Authenticator.insecure_dev())
+        headers = {"x-tenant-id": "acme"}
+        with TestClient(app) as client:
+            assistant = client.post(
+                "/v1/assistants", headers=headers, json={"graph_id": "steerable"}
+            ).json()
+            run = client.post(
+                "/v1/runs",
+                headers=headers,
+                json={"assistant_id": assistant["id"], "input": {"ticks": 0, "drained": []}},
+            ).json()
+            oversized_message = "x" * (MAX_STEERING_PAYLOAD_BYTES + 8_000)
+            self.assertLess(len(oversized_message), 262_144)
+            response = client.post(
+                f"/v1/runs/{run['id']}/steer",
+                headers=headers,
+                json={"kind": "user_input", "payload": {"message": oversized_message}},
             )
             self.assertEqual(response.status_code, 413)
 

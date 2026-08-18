@@ -80,6 +80,7 @@ POST /v1/runs/{run_id}/redrive
 
 - cancel 是协作式请求，通常先返回 `cancelling`；节点和 provider 应响应 cancellation token；
 - 只有 `paused` run 可 resume；响应是新 run，`metadata.resumed_from_run_id` 指向原 run；
+- 并发对同一个已 `paused` 的 run 调用 resume 时只有一个会成功：它创建上述新 run，其余并发调用都会收到 `409 run_resume_conflict`，而不是各自创建重复的新 run；
 - 只有 `failed` 或 `dead_letter` 可 redrive；保留原 input/config/version 并重新入队。
 
 <Callout type="warn">
@@ -125,9 +126,13 @@ curl -X POST https://agents.example.com/v1/runs/$RUN_ID/steer \
 
 **`Idempotency-Key` header 与 body 字段的优先级：** 两者语义相同（同一个逻辑 key），
 可以二选一传递；同时传递时以 `Idempotency-Key` header 为准。同一 `(tenant_id, run_id,
-idempotency_key)` 三元组只会创建一条 steering 事件——重复调用返回**原**事件（不是
-409），响应体与首次调用完全一致，`sequence` 也不会递增。这与 `POST /runs` 创建接口的
-`Idempotency-Key` 语义一致，都是"同 key 同请求安全重放"，而不是"报错"。
+idempotency_key)` 三元组只会创建一条 steering 事件——重复调用返回**同一条**事件
+（`id`、`sequence` 不变，不会新建行，也不会递增 `sequence`），而不是 409。但响应体
+**不保证**与首次调用逐字节一致：它反映的是该事件**当前持久化的状态**，两次调用之间
+状态可能已经变化（例如首次调用时是 `pending`，而图已经在这之后消费了它，重放时读到
+的就是 `consumed`）。这与 `POST /runs` 创建接口的 `Idempotency-Key` 语义一致，都是
+"同 key 同请求安全重放"而不是"报错"——但重放返回的始终是同一个底层资源的最新状态，
+而不是首次响应的静态快照。
 
 ### 各 Run 状态下的行为
 
