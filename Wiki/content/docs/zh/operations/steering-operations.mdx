@@ -5,14 +5,14 @@ description: "迁移上线顺序、PostgreSQL 作为真相来源、延迟、重�
 
 ## 迁移上线顺序
 
-运行中输入（issue #16）在基础 schema 之上新增了四个 forward-only 的 Alembic revision：
+运行中输入在基础 schema 之上新增了四个 forward-only 的 Alembic revision：
 
 | Revision | 新增内容 |
 | --- | --- |
 | `0002_steering` | `run_steering_events` 表及其索引，以及读写它的 worker/server 代码路径 |
 | `0003_steering_source_event` | `run_steering_events` 上的 `source_event_id` 列 + 局部索引，用于跨多次 pause/resume 迁移关联同一条 steering |
-| `0004_steering_closed` | `runs.steering_closed`——finalization 准入闸门（review round 6/7）；详见下方"`steering_closed` finalization 闸门" |
-| `0005_superseded_by_run_id` | `runs.superseded_by_run_id`——被 resume 覆盖的类型化控制面血缘标记（review round 14，BLOCKER）；把它从可被用户写入的 `metadata` 中移出，使其无法被伪造。详见下方"`superseded_by_run_id` 血缘标记" |
+| `0004_steering_closed` | `runs.steering_closed`——finalization 准入闸门；详见下方"`steering_closed` finalization 闸门" |
+| `0005_superseded_by_run_id` | `runs.superseded_by_run_id`——被 resume 覆盖的类型化控制面血缘标记；把它从可被用户写入的 `metadata` 中移出，使其无法被伪造。详见下方"`superseded_by_run_id` 血缘标记" |
 
 按标准 Alembic 路径应用：
 
@@ -43,7 +43,7 @@ alembic upgrade head
 
 ## `steering_closed` finalization 闸门
 
-一旦 worker 的图执行到达终态/暂停结果，该 run 可能还会短暂地继续读作
+一旦 worker 的图执行到达真正的终态结果，该 run 可能还会短暂地继续读作
 `running`/`cancelling`，同时 worker 把图已经消费掉的 steering durably flush 出去、
 提交最终状态——此时已经没有更多图安全点可以消费任何新输入了。`runs.steering_closed`
 是持有该 run 的 worker（与状态写入一样，基于自己的 `lease_owner`/`attempt` 加锁）在执行
@@ -91,12 +91,11 @@ steering 准入边界"一节。
 ## `superseded_by_run_id` 血缘标记
 
 当 `/resume` 从一个 `paused` 的 run 创建出后继 run 时，旧 run 需要一种可靠的方式来表示
-"我已经被取代了——请对新 run 执行 steer/cancel/resume"。在 `0005` 之前，这个标记存放在
+"我已经被取代了——请对新 run 执行 steer/cancel/resume"。早期实现曾把这个标记存放在
 `metadata.superseded_by_run_id` 中——普通的、用户可写的 `Run` metadata。由于 `/steer`、
 `/cancel` 以及并发 resume 的冲突闸门都把这个 key 当作权威状态来读取，调用方可以在创建 run
 时伪造它（`POST /v1/runs` 携带 `metadata: {"superseded_by_run_id": "..."}`），从而在一个从未
-真正被 resume 过的 run 上错误触发 `409 run_superseded` / `409 run_resume_conflict`
-（issue #16 PR #17 review round 14，BLOCKER）。
+真正被 resume 过的 run 上错误触发 `409 run_superseded` / `409 run_resume_conflict`。
 
 `runs.superseded_by_run_id`（由 `0005_superseded_by_run_id` 新增）是一个类型化、可为空的列，
 取代该 key 成为唯一的真相来源：
@@ -108,7 +107,7 @@ steering 准入边界"一节。
   `run.superseded_by_run_id`；它们都不再为此决策查询 `metadata`。
 - 调用方在普通 `RunCreate` 上提交 `metadata.superseded_by_run_id` 现在对控制流完全没有
   影响——这个 key 是惰性的，最多作为普通用户 metadata 存储，永远不会被拷贝进类型化列。
-- 升级兼容性：升级到本 PR 之后，一个升级前就存在、恰好携带同名用户 metadata key 的历史
+- 升级兼容性：升级到当前版本之后，一个升级前就存在、恰好携带同名用户 metadata key 的历史
   run，不会被重新解释为系统血缘状态——类型化列对每一条既有记录都从 `NULL` 开始，只有未来
   真正发生的 resume 才会填充它。
 
@@ -209,11 +208,10 @@ durable 的 steering 历史，要么需要把正在进行的 run 与新二进制
 - 永远不要把"回滚 schema"当作回滚策略的一部分。如果确实需要回滚一次部署，应该回滚
   **二进制**、保持 schema 停在当前（更靠前）的 revision——`0002_steering`/
   `0003_steering_source_event`/`0004_steering_closed`/`0005_superseded_by_run_id` 都是纯
-  新增，早于对应特性的旧
-  二进制会直接忽略多出来的表/列，不会因此启动失败；
+  新增，早于对应特性的旧二进制会直接忽略多出来的表/列，不会因此启动失败；
 - **schema 兼容不等于语义兼容。** 旧二进制在新 schema 上不会崩溃，但它并不理解
   `steering_closed` 或 `superseded_by_run_id`——它不会执行 finalization 的 steering
-  admission 门控，也不会执行本 PR 新增的 resume-lineage cancel/steer 拒绝逻辑。应该把
+  admission 门控，也不会执行当前版本的 resume-lineage cancel/steer 拒绝逻辑。应该把
   新的 steering/lineage 控制语义视为"只有当所有控制面实例都升级到新二进制后才可用"，
   而不是 schema 迁移一落地就生效。如果一个二进制已经真正执行过这些语义（例如某次
   resume 已经写入了 `superseded_by_run_id`），把它回滚成旧版本并不会撤销这次转换——
@@ -221,5 +219,5 @@ durable 的 steering 历史，要么需要把正在进行的 run 与新二进制
   quiesce 或等待 in-flight run 结束，不要假设旧二进制能保留同样的保证；
 - 因为没有 schema 回滚路径，`0002_steering`/`0003_steering_source_event`/
   `0004_steering_closed`/`0005_superseded_by_run_id` 应该先在 staging 环境（或 CI 的
-  `test_postgres_integration.py`
-  Postgres job）中验证过，再应用到生产环境，而不是依赖"出问题了还能撤销"。
+  `test_postgres_integration.py` Postgres job）中验证过，再应用到生产环境，而不是依赖
+  "出问题了还能撤销"。

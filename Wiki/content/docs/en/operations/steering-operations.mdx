@@ -5,15 +5,14 @@ description: "Migration rollout order, PostgreSQL-as-source-of-truth, latency, r
 
 ## Migration rollout order
 
-Mid-run steering (issue #16) ships as four forward-only Alembic revisions on top of the base
-schema:
+Mid-run steering ships as four forward-only Alembic revisions on top of the base schema:
 
 | Revision | Adds |
 | --- | --- |
 | `0002_steering` | `run_steering_events` table, its indexes, and the worker/server code paths that read/write it |
 | `0003_steering_source_event` | `source_event_id` column + partial index on `run_steering_events`, used to correlate a steering event across repeated pause/resume migrations |
-| `0004_steering_closed` | `runs.steering_closed` — the atomic finalization admission gate (review round 6/7); see "The `steering_closed` finalization gate" below |
-| `0005_superseded_by_run_id` | `runs.superseded_by_run_id` — the typed control-plane lineage marker for resumed runs (review round 14, BLOCKER); moves this out of user-writable `metadata` so it cannot be forged. See "The `superseded_by_run_id` lineage marker" below |
+| `0004_steering_closed` | `runs.steering_closed` — the atomic finalization admission gate; see "The `steering_closed` finalization gate" below |
+| `0005_superseded_by_run_id` | `runs.superseded_by_run_id` — the typed control-plane lineage marker for resumed runs; moves this out of user-writable `metadata` so it cannot be forged. See "The `superseded_by_run_id` lineage marker" below |
 
 Apply them with the standard Alembic path:
 
@@ -47,7 +46,7 @@ run, and it must reach `0005_superseded_by_run_id`, not stop at `0002_steering`,
 
 ## The `steering_closed` finalization gate
 
-Once a worker's graph execution reaches its terminal/paused outcome, the run may still read
+Once a worker's graph execution reaches a genuinely terminal outcome, the run may still read
 `running`/`cancelling` for a little while longer while the worker durably flushes whatever
 steering the graph already drained and commits the final status — there is no more graph safe
 point left to consume anything new. `runs.steering_closed` is a boolean the owning worker sets
@@ -96,19 +95,18 @@ still carry a `pending` steering row, as deliberate durable history, picked back
 `/redrive` like any other queued steering. `/redrive` only accepts `failed`/`dead_letter` runs,
 though — an ordinary client-initiated **cancel** is not covered by that recovery path, so steering
 left `pending` on a `cancelled` run has no automatic future delivery attempt today. See the
-steering concept page's "Finalization and the steering
-admission boundary" section for the full policy.
+steering concept page's "Finalization and the steering admission boundary" section for the full
+policy.
 
 ## The `superseded_by_run_id` lineage marker
 
 When `/resume` creates a descendant run from a `paused` run, the old run needs a durable way to
-say "I have been superseded — steer/cancel/resume the new run instead". Before `0005`, that
-marker lived in `metadata.superseded_by_run_id` — ordinary, user-writable `Run` metadata.
+say "I have been superseded — steer/cancel/resume the new run instead". An earlier implementation
+stored that marker in `metadata.superseded_by_run_id` — ordinary, user-writable `Run` metadata.
 Because `/steer`, `/cancel`, and the concurrent-resume conflict gate all treated that key as
 authoritative, a caller could forge it at run-creation time (`POST /v1/runs` with
 `metadata: {"superseded_by_run_id": "..."}`) to falsely trigger `409 run_superseded` /
-`409 run_resume_conflict` on a run that was never actually resumed (issue #16 PR #17 review
-round 14, BLOCKER).
+`409 run_resume_conflict` on a run that was never actually resumed.
 
 `runs.superseded_by_run_id` (added by `0005_superseded_by_run_id`) is a typed, nullable column
 that replaces that key as the sole source of truth:
@@ -123,10 +121,10 @@ that replaces that key as the sole source of truth:
 - A caller submitting `metadata.superseded_by_run_id` on an ordinary `RunCreate` now has no
   effect on control flow at all — the key is inert, stored (if at all) as plain user metadata,
   and never copied into the typed column.
-- Upgrade compatibility: a pre-existing run from before this PR that happens to carry a user
-  metadata key with this exact name is never reinterpreted as system lineage after upgrading —
-  the typed column starts `NULL` for every existing row and is populated only by a future
-  resume.
+- Upgrade compatibility: a pre-existing run from before the current version that happens to
+  carry a user metadata key with this exact name is never reinterpreted as system lineage after
+  upgrading — the typed column starts `NULL` for every existing row and is populated only by a
+  future resume.
 
 ## Idempotent replay is safe across every admission gate
 
@@ -238,11 +236,11 @@ runs against a schema the new binaries no longer expect. Practical implications:
   revision simply ignore the extra table/columns and do not fail to start.
 - **Schema compatibility is not the same as semantic compatibility.** An older binary running
   against the new schema will not crash, but it also does not understand `steering_closed` or
-  `superseded_by_run_id` — it will not enforce the finalization admission gate or the
-  resume-lineage cancel/steer rejection this PR adds. Treat the new steering/lineage control
-  semantics as available only once every control-plane instance is running the new binary, not
-  the moment the schema migration lands. Rolling a binary back after it has already exercised
-  these semantics (e.g. after a resume has set `superseded_by_run_id`) does not un-happen that
+  `superseded_by_run_id` — it will not enforce the finalization admission gate or the current
+  resume-lineage cancel/steer rejection. Treat the new steering/lineage control semantics as
+  available only once every control-plane instance is running the new binary, not the moment
+  the schema migration lands. Rolling a binary back after it has already exercised these
+  semantics (e.g. after a resume has set `superseded_by_run_id`) does not un-happen that
   transition; the old binary simply stops enforcing it going forward. If you must roll back
   binaries while steering is in active use, quiesce or let in-flight runs finish first rather
   than assuming the old binary preserves the same guarantees.

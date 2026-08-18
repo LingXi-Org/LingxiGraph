@@ -31,14 +31,8 @@ with LingxiGraphClient(
         max_model_calls=8,
     )
 
-    for event in client.runs.stream(run["id"]):
-        print(event["sequence"], event["kind"])
-
-    completed = client.runs.join(run["id"], timeout=120)
-    print(completed["output"])
-
-    # Durably inject mid-run input; success only means it was durably
-    # written -- not that the graph has processed it yet.
+    # Steering can be submitted immediately after creation: whether the
+    # run is still queued or already running, success only means durable acceptance.
     accepted = client.runs.steer(
         run["id"],
         kind="user_input",
@@ -46,6 +40,12 @@ with LingxiGraphClient(
         idempotency_key="msg-123",
     )
     print(accepted["id"], accepted["status"])  # "pending"
+
+    for event in client.runs.stream(run["id"]):
+        print(event["sequence"], event["kind"])
+
+    completed = client.runs.join(run["id"], timeout=120)
+    print(completed["output"])
 ```
 
 Available resource methods:
@@ -96,8 +96,6 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
         thread_id=thread["id"],
         input={"request": "hello"},
     )
-    async for event in client.runs.stream(run["id"]):
-        print(event)
 
     accepted = await client.runs.steer(
         run["id"],
@@ -106,6 +104,9 @@ async with AsyncLingxiGraphClient(base_url, token=token) as client:
         idempotency_key="msg-123",
     )
     print(accepted["id"], accepted["status"])
+
+    async for event in client.runs.stream(run["id"]):
+        print(event)
 ```
 
 Async resources mirror sync resources. Do not use the synchronous client inside an async event loop.
